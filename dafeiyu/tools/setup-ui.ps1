@@ -59,8 +59,10 @@ $LOG_DIR = Join-Path $PROJECT 'dafeiyu\state'
 if ($Check) {
     $line = 'PROJECT=' + $PROJECT + "`r`nTOOLS=" + $TOOLS + "`r`nSELF_DIR=" + $SELF_DIR + "`r`nPSScriptRoot=" + $PSScriptRoot
     try { [System.IO.File]::WriteAllText((Join-Path $env:TEMP 'dfy-exe-check.txt'), $line, (New-Object System.Text.UTF8Encoding($true))) } catch { }
-    Write-Output $line
-    exit 0
+    # 这条路不 Write-Output：ps2exe 的 exe 是没有控制台的 WinForms 宿主，
+    # 往不存在的 stdout 写会把进程挂住（实测：文件写出来了，进程一直不退，还把 exe 锁死）。
+    # 退出用 Environment.Exit —— 光写 exit 0 宿主也不退。
+    [System.Environment]::Exit(0)
 }
 
 # ---------- 配色 ----------
@@ -342,6 +344,7 @@ function Show-Status {
 }
 
 function Run-Checks {
+  try {
     $listEnv.Items.Clear()
     $lblEnvHint.Text = '检查中…'
     [System.Windows.Forms.Application]::DoEvents()
@@ -363,10 +366,13 @@ function Run-Checks {
         Add-Check 'Node.js' $false '找不到 node，先装 Node.js 22+'
     }
 
-    $dshCmd = Get-Command dsh -ErrorAction SilentlyContinue
-    if ($dshCmd) {
-        $dv = (& dsh --version) 2>$null
-        Add-Check ('DSH ' + $dv) $true ''
+    # 别直接 `& dsh --version`：npm 装出来的 dsh 是个 .ps1 中间层，
+    # 从 exe（ps2exe 宿主跑在 Restricted）里调它会被挡，弹一个「禁止运行脚本」的模态框 —— 第一屏就卡死（实测）。
+    # 走 cmd /c 用 dsh.cmd 那一份，跟执行策略无关。
+    $dv = ''
+    try { $dv = [string](cmd /c 'dsh --version 2>nul') } catch { }
+    if ($dv -and $dv.Trim()) {
+        Add-Check ('DSH ' + $dv.Trim()) $true ''
     } else {
         Add-Check 'DSH（dsh 命令）' $false 'npm i -g @deepseek-ai/dsh'
     }
@@ -407,7 +413,11 @@ function Run-Checks {
     $kk = Read-KeyFile $cfgNow.keyFile
     Add-Check ('模型 key（' + $cfgNow.label + '）') ($kk.Length -gt 10) $(if ($kk.Length -gt 10) { '已有，点「测一下」确认能真用' } else { '还没有 —— 贴到卡片 ③ 里保存' })
 
-    $lblEnvHint.Text = '检测完了。'
+  } catch {
+    # 某一项检测自己炸了，不该弹模态框把整屏锁住（exe 里真踩过：dsh 那行弹「禁止运行脚本」）
+    try { Add-Check '检测中途出错' $false $_.Exception.Message } catch { }
+  }
+  $lblEnvHint.Text = '检测完了。'
 }
 
 function Save-Machine {
