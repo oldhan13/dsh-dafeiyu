@@ -1,4 +1,4 @@
-﻿<#
+<#
     install.ps1 —— 检查环境、设两个身份、装插件、给 profile 补丁腾个位置。
 
     它**不动**你的记忆、不删任何东西、不覆盖已有的 key。
@@ -72,6 +72,20 @@ if ($SkipPlugins -or -not $dsh) {
     if ($WithQQ)    { & dsh plugin --profile $Profile add dsh-onebot-qq }
     if ($WithVoice) { & dsh plugin --profile $Profile add dsh-voice-chat }
     Say '· 想刷 B站再说一句：dsh plugin --profile web add github:c1overzz/dsh-bili-scroll'
+}
+
+Say ''
+Say '── QQ 补丁 ──────────────────────────────'
+$onebotLib = Join-Path $dshHome "profiles\$Profile\node_modules\dsh-onebot-qq\lib"
+if (Test-Path $onebotLib) {
+    & node (Join-Path $here 'patches\apply-patches.mjs') --profile $Profile
+    if ($LASTEXITCODE -ne 0) {
+        Say '! 补丁没全打上（原因见上）；不影响启动，只是没有「戳一戳」和「分句」'
+    }
+} elseif ($WithQQ) {
+    Say '· 插件还没装上，补丁先跳过 —— 装完再跑一次 install.ps1，或 node patches\apply-patches.mjs'
+} else {
+    Say '· 没装 QQ 通道，补丁跳过'
 }
 
 Say ''
