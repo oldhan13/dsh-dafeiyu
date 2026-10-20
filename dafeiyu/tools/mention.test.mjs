@@ -1,3 +1,4 @@
+// ⚠️ 被测模块来自第三方包 dsh-onebot-qq（mario841859784，BSD-3-Clause），本仓库不包含它的代码。见 CREDITS.md。
 // 群里「这是在跟我说话吗」的判定测试 —— 覆盖 analyzeMention 的六档 + 兼容层。
 // 跑法：node dafeiyu/tools/mention.test.mjs
 // 被测模块在 dsh-onebot-qq 包里，用环境变量指向它的 lib 目录：

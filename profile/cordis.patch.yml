@@ -3,6 +3,7 @@
 # ⚠️ 三处占位符必须换成你自己的：accessToken / adminUsers / botQQ。
 
 # ── QQ 通道（反向 WebSocket，NapCat 拨进来）─────────────────────────
+# ⚠️ dsh-onebot-qq 是第三方插件（mario841859784，BSD-3-Clause），不是本仓库的代码 —— 见 ../CREDITS.md
 - id: dsh-onebot
   name: 'dsh-onebot-qq'
   config:

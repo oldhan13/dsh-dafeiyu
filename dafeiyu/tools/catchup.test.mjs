@@ -1,3 +1,4 @@
+// ⚠️ 被测模块来自第三方包 dsh-onebot-qq（mario841859784，BSD-3-Clause），本仓库不包含它的代码。见 CREDITS.md。
 // 断窗补收的单元测试：不打真实 NapCat，用假的 connection / bridge 跑一遍规则。
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'

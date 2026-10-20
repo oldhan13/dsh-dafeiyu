@@ -96,6 +96,15 @@ setx DAFEIYU_BOT_QQ   "机器人的QQ号"
 zstd 多帧会话日志只解第一帧、Windows 11 拿 VBScript 弹弃用提示、`/api` 的浏览器信任校验。
 照抄这份代码之前先看一眼，能少走两天弯路。
 
+## 别人的东西
+
+这个仓库的代码是自己写的，但**跑起来靠的是别人做的零件**。每一处"用到别人仓库"的地方都列在
+**[CREDITS.md](CREDITS.md)** 里：宿主（DSH）、四个 DSH 插件（`dsh-ledger-memory` / `dsh-onebot-qq` /
+`dsh-voice-chat` / `dsh-im-gateway`）、NapCat、SiliconFlow、QQ、B 站。
+
+一句话：**没有 vendor 任何第三方源码，也没有 fork 后改**。第三方都是"装上去用的"，不是"抄进来的"。
+`dsh-onebot-qq` 是 BSD-3-Clause —— 两个测试文件会直接 import 它的模块，那条保留版权声明的义务对它成立。
+
 ## 许可
 
 MIT。`AGENTS.md` 里的人格文本也是 MIT —— 你可以改成你自己的鱼，但别把它说成是你的原创。

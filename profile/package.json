@@ -2,6 +2,7 @@
   "name": "dsh-profile-dafeiyu",
   "private": true,
   "description": "参考：跑大肥鱼需要的 bundle。真正生效的那份在 ~/.dsh/profiles/<profile>/package.json，由 dsh plugin add 维护。",
+  "//deps": "下面三个都是第三方包，见 ../CREDITS.md：dsh-ledger-memory(陈黛华/MIT)、dsh-onebot-qq(mario841859784/BSD-3-Clause)、dsh-voice-chat(maoyuching/MIT)",
   "dependencies": {
     "dsh-ledger-memory": "^1.2.8",
     "dsh-onebot-qq": "^0.9.3",
