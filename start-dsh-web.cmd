@@ -1,8 +1,15 @@
 @echo off
-rem 启动 DSH Web，并把临时目录挪到工作区之外。
-rem 原因：Windows ACL 沙箱要求 temp root 必须在 workspace 之外；
-rem 而 os.tmpdir() 默认是 <HOME>\AppData\Local\Temp，正落在 workspace=<HOME> 里面。
-set "TMP=C:\dsh-temp"
-set "TEMP=C:\dsh-temp"
-cd /d <HOME>
+rem Start DSH Web from this folder, with TEMP pointed outside the workspace.
+rem Why: the Windows ACL sandbox requires the temp root to be OUTSIDE the
+rem workspace. The default tmpdir sits under <HOME>; if your workspace is also
+rem under <HOME>, a session shell then fails with
+rem "temp root must be outside the workspace".
+rem So TEMP goes to a sibling folder of this repo (..\.dafeiyu-temp).
+setlocal
+for %%I in ("%~dp0.") do set "HERE=%%~fI"
+for %%I in ("%~dp0..") do set "PARENT=%%~fI"
+set "TMP=%PARENT%\.dafeiyu-temp"
+set "TEMP=%TMP%"
+if not exist "%TMP%" mkdir "%TMP%" >nul 2>&1
+cd /d "%HERE%"
 npx @deepseek-ai/dsh web

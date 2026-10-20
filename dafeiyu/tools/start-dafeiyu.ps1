@@ -4,7 +4,7 @@
   四件套：
     1. DSH 宿主（dsh web）——它同时是 QQ 通道的服务端（反向 WS 监听 8643）和网页界面（3080）
     2. NapCat（QQ 客户端 + OneBot）—— 以 <机器人QQ> 登录，反向拨 8643，HTTP 在 3000
-    3. 后台冲动循环 heartbeat.mjs —— 25~40 分钟醒一次，自己决定发不发
+    3. 后台冲动循环 heartbeat.mjs —— 8~13 分钟醒一次，自己决定发不发（间隔在 heartbeat.mjs 里改）
     4. 她的主页 serve.mjs —— http://127.0.0.1:3077/
 
   用法：
@@ -232,21 +232,30 @@ else {
 }
 
 # ---- 台账自动瘦身（计划任务）----
-# 2026-10-20：这条原来每 30 分钟弹一个黑框 —— 是所有窗口来源里**最持续**的一个
-# （启动时才闪的都还好，这个是一整天每隔半小时来一下）。
-# 改成用 wscript 跑一个 vbs 包一层（WScript.Shell.Run 的 0 = 不显示窗口），
-# 任务本身只多一个 wscript 进程，看不到任何东西。
-$tidyVbs = Join-Path $PSScriptRoot 'ledger-tidy-silent.vbs'
-$tidyTr = 'wscript.exe //B //Nologo "' + $tidyVbs + '"'
+# 这条以前是「wscript 跑一个 vbs」：Windows 11 24H2 现在**一启动 wscript.exe 就弹
+# 「VBScript 已弃用」的确认框**，而任务是每 30 分钟一次 ⇒ 他每半小时被弹一下
+# （应用日志 provider VBScriptDeprecationAlert / EventID 4096 里能查到那条 vbs）。
+# 现在改成「任务直接起一个隐藏的 powershell 跑纯 ASCII 的 .ps1」：不经过 wscript，也不建窗口。
+# 别改回 S4U / session 0 —— presence.ps1 靠 GetLastInputInfo 判断他在不在键盘前，session 0 会读错。
+$tidyPs   = Join-Path $PSScriptRoot 'ledger-tidy-hidden.ps1'
+$tidyName = 'DaFeiYu-LedgerTidy'
 $exists = $null
-try { $exists = schtasks /Query /TN DaFeiYu-LedgerTidy 2>$null } catch { }
+try { $exists = schtasks /Query /TN $tidyName 2>$null } catch { }
 if (-not $exists) {
-    schtasks /Create /SC MINUTE /MO 30 /TN DaFeiYu-LedgerTidy /TR $tidyTr /F | Out-Null
-    Say '  [ok] 已注册台账自动瘦身任务（每 30 分钟，不弹窗）'
-} elseif ($exists -and ($exists -join ' ') -notmatch 'ledger-tidy-silent\.vbs') {
-    # 老任务是直接跑 .cmd 的：顺手换成静默版（/F 覆盖，不新增任务）
-    schtasks /Create /SC MINUTE /MO 30 /TN DaFeiYu-LedgerTidy /TR $tidyTr /F | Out-Null
-    Say '  [ok] 台账自动瘦身任务已换成静默版'
+    # 先把「每 30 分钟」这个节奏建出来（动作先给个占位，下面立刻换成真的）
+    schtasks /Create /SC MINUTE /MO 30 /TN $tidyName /TR 'powershell.exe -NoProfile -Command exit' /F | Out-Null
+    Say '  [ok] 已注册台账自动瘦身任务（每 30 分钟）'
+}
+try {
+    # 用 Set-ScheduledTask 设动作：它能正确给参数里的路径加引号，
+    # 而 schtasks /TR 在路径带空格时会被 PowerShell 的引号处理搞散。
+    $act = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $tidyPs + '"')
+    Set-ScheduledTask -TaskName $tidyName -Action $act | Out-Null
+    Say '  [ok] 任务动作 = 隐藏 PowerShell（不经 wscript，不弹窗）'
+} catch {
+    Say '  [!!] 没能自动设置任务动作。手动把 DaFeiYu-LedgerTidy 的动作改成这一行：'
+    Say ('       powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $tidyPs + '"')
 }
 
 # ---- 汇总 ----
