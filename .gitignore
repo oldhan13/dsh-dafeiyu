@@ -6,6 +6,9 @@ node_modules/
 *.bak-*
 .idea/
 
+# 打出来的 exe（build-exe.ps1 的产物，本机自己生成，不进 git）
+dist/
+
 # ── 个人数据：这些东西永远不该进 git ─────────────────────────
 # 记忆与日记（会写进你的生活）
 dafeiyu/memory/brief.md

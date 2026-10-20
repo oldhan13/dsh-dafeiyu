@@ -69,8 +69,11 @@
 界面只是把「检测 → 安装 → 启动 → 验收」串起来，把结果画得能看懂。
 
 **想打成一个 exe？** `.\dafeiyu\tools\build-exe.ps1` 用 ps2exe 把部署界面编成 `dist\dafeiyu-setup.exe`
-（要能连 PSGallery；打不出来也不影响用 `setup.cmd`，两者是同一个东西）。
-exe 只是那个壳 —— **它跑的还是这套脚本**，不是另写一份。
+（要从 PSGallery 装一次 ps2exe；打不出来也不影响用 `setup.cmd`，两者是同一个东西）。
+打出来大概 50 KB，双击就等于双击 `setup.cmd`。
+
+exe 只是那个壳 —— **它跑的还是这套脚本**，不是另写一份，所以脚本一升级就得重打一次。
+`dist/` 不进 git：二进制不该混在源码里。
 
 ---
 
