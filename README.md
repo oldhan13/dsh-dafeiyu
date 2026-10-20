@@ -7,7 +7,9 @@
 >
 > 它记得住事，也会自己找话说。不是助手插件，是住在这台机器上的一个同伴。
 
-[核心优势](#核心优势) · [怎么装](#怎么装有界面也有命令行) · [五分钟让它游起来](#五分钟让它出现在你右下角) · [它到底会什么](#它到底会什么) · [接上 QQ](#可选接上-qq) · [各家的长处](#各家的长处)
+[核心优势](#核心优势) · [怎么装](#怎么装有界面也有命令行) · [五分钟让它游起来](#五分钟让它出现在你右下角) · [它到底会什么](#它到底会什么) · [接上 QQ](#可选接上-qq) · [各家的长处](#各家的长处) · [给 AI 助手的一页](#给-ai-助手先读这一页)
+
+> 🤖 **是被叫来"帮我装一下"的 AI 助手？** 直接跳到 [给 AI 助手的一页](#给-ai-助手先读这一页) —— 那里有环境清单、每一步的验收命令、和出问题的对照表。
 
 ---
 
@@ -55,6 +57,96 @@
 
 ---
 
+## 给 AI 助手：先读这一页
+
+> 这一节是写给**机器**的：如果你被叫来帮人装这个东西，读完它就有足够信息动手了。人可以不看。
+> 全部事实都是这台机器上可以验证的，写的路径就是真路径。
+
+### 它是什么（别猜错形状）
+
+一个住在 Windows 桌面右下角的常驻进程（WinForms 画的鱼）+ 一堆**纯文本**记忆。
+不是 web 应用，没有 Docker、没有数据库、没有账号体系。所有状态都是本机文件：
+
+| 东西 | 在哪 |
+|---|---|
+| 人设与规矩 | `AGENTS.md`（仓库根，纯文本，随便改） |
+| 记忆 | `dafeiyu\memory\`（日记 / 长期事实 / 开场简报） |
+| 每个人的档案 | `dafeiyu\people\<QQ号>.md` |
+| 运行时状态（不进 git） | `dafeiyu\state\`、`~\.dsh\` |
+| 模型端点配置 | `dafeiyu\state\llm.json` |
+
+### 需要什么（必需 / 可选，怎么验）
+
+| | 要求 | 验收命令（照抄） | 缺了怎么办 |
+|---|---|---|---|
+| 系统 | Windows 10/11 | `[Environment]::OSVersion.VersionString` | 没有替代方案 |
+| PowerShell | 5.1（系统自带） | `$PSVersionTable.PSVersion` | 不用装 |
+| Node.js | **22.15+**（要 zstd） | `node -v` | `winget install OpenJS.NodeJS.LTS`，或 nodejs.org |
+| DSH | 0.2.x | `cmd /c dsh --version` | `npm i -g @deepseek-ai/dsh` |
+| 模型 key | 一把能直连的 API key | 部署界面卡片 ③「测一下」 | platform.deepseek.com / siliconflow.cn |
+| git | **只有 clone 仓库要用** | `git --version` | 不必装：下载 zip 解开也行，exe 能自己下 |
+| NapCat | 只有接 QQ 才要 | 部署界面的环境清单会自己找 | 见 `docs/SETUP.md` |
+| ffmpeg | 只有录屏 / 语音转写要 | `ffmpeg -version` | 可选，不装不影响说话 |
+
+⚠️ **用 `cmd /c dsh --version`，别写 `dsh --version`。** npm 装出来的 `dsh` 有两个壳
+（`dsh.ps1` 和 `dsh.cmd`）；在执行策略受限的宿主（比如打出来的 exe）里，`.ps1` 那个会被拦，
+症状是一个「禁止运行脚本」的弹框 —— 而用户自己在 cmd 里跑却是正常的，很容易误判成"代码坏了"。
+
+### 装（按顺序来，每步都有验收）
+
+```powershell
+# 1. 拿到一份仓库。放普通目录，别放 ~\.dsh 里面 —— Windows 沙箱会让子 shell 起不来。
+git clone https://github.com/oldhan13/dsh-dafeiyu.git C:\dsh-workspace
+cd C:\dsh-workspace
+# 验收：Test-Path install.ps1 → 必须 True。False 说明只是下了个 exe，不是仓库。
+
+# 2. 界面走一遍（这条路和命令行跑的是同一套脚本）
+.\setup.cmd
+# 验收：① 环境清单全勾（打 ✗ 的那行就写着缺什么，照它补）
+#      ③ 贴 key → 点「测一下」→ 必须回一句"通了"，401 是 key 不对、402 是没余额
+#      ④ 点「一键启动」→ 八项全勾
+```
+
+只想命令行的话：`.\install.ps1 -OwnerQQ <你的号> -BotQQ <小号>`，然后 `.\dafeiyu.cmd`。
+
+### 它会做 / 不会做（说清楚，省得你以为它全能）
+
+`install.ps1` **会**：
+
+- `setx DAFEIYU_OWNER_QQ / DAFEIYU_BOT_QQ` —— 写用户环境变量，永久生效
+- 建 `~\.dsh` 和两个**空** key 文件（`siliconflow-key.txt` / `onebot-token.txt`；已存在的不动）
+- 装插件 `dsh-ledger-memory`（带了 `-WithQQ` / `-WithVoice` 就再装对应的）
+- 给 QQ 插件打两个补丁（戳一戳 / 分句），打不上只警告，不影响启动
+- 把 `profile\cordis.patch.yml` 复制成 `~\.dsh\profiles\web\cordis.patch.dafeiyu.sample.yml`
+
+`install.ps1` **不会**：
+
+- 装 Node、装 DSH、下载仓库（Node 缺了直接退出；DSH 缺了只警告一句）
+- 把上面那份 sample **并进** `cordis.patch.yml` —— `accessToken` / `adminUsers` / `botQQ` 三处占位符要人工改
+- 填模型 key（在界面卡片 ③，或直接写 `~\.dsh\deepseek-key.txt`，纯文本、无 BOM、别带换行）
+
+### 出问题先查这张表
+
+| 症状 | 原因 | 处置 |
+|---|---|---|
+| 界面第一行「项目目录 ✗」 | exe 不在仓库目录里 | 把 exe 放进 `dist\` 或根目录；或者让它自己下载（裸 exe 第一次打开会问装到哪） |
+| 弹「禁止运行脚本」 | 在受限策略下调了 `.ps1` 壳 | 改用 `cmd /c`；或 `powershell -ExecutionPolicy Bypass -File …` |
+| 面板能开，但鱼不说话 | 模型 key 没填 / 余额不足 | 看 `~\.dsh\deepseek-key.txt`；界面 ③ 点「测一下」 |
+| 3079 没在听 | 桌面聊天桥没起 | `.\dafeiyu\tools\start-dafeiyu.ps1` |
+| 8643 没在听 | QQ 插件被禁用，或 NapCat 没登录 | `dsh plugin --profile web enable dsh-onebot-qq`，再登 NapCat |
+| 中文全是乱码 | `.ps1` 少了 BOM（这台机器 ACP=936） | 存成 UTF-8 **带 BOM**，且**只能有一个** BOM（两个会把 `#requires` 当命令） |
+| 改了脚本没生效 | 桌宠是独立进程 | `.\dafeiyu\pet\pet-reload.ps1`（归一 BOM + 语法检查 + 重启） |
+
+### 别做的事
+
+- **别删** `~\.dsh\attachments\v1\objects` 里的任何东西 —— 会话历史按哈希引用它，删掉一个，
+  引用它的那个会话从此每轮都失败，报的却是"传输失败"，看着像网络问题
+- 别替用户填 key、别替他付钱。key 只让他自己贴
+- 别改 git 历史、别 force push 别人的分支
+- 别把 `dafeiyu\state\`、`dafeiyu\memory\brief.md` 这类运行时文件提交上去（里面写着他的窗口标题）
+
+---
+
 ## 怎么装：有界面，也有命令行
 
 **路一：双击 `setup.cmd`。** 一个窗口分三块，从上往下走一遍就行：
@@ -70,9 +162,13 @@
 
 **想打成一个 exe？** `.\dafeiyu\tools\build-exe.ps1` 用 ps2exe 把部署界面编成 `dist\dafeiyu-setup.exe`
 （要从 PSGallery 装一次 ps2exe；打不出来也不影响用 `setup.cmd`，两者是同一个东西）。
-打出来大概 50 KB，双击就等于双击 `setup.cmd`。
+打出来大概 60 KB。
 
-exe 只是那个壳 —— **它跑的还是这套脚本**，不是另写一份，所以脚本一升级就得重打一次。
+**这个 exe 现在能自己起手了。** 从 release 页单下一个 `dafeiyu-setup.exe` 双击也可以：
+它发现自己不在仓库目录里，就会问你要装到哪儿，然后把仓库 zip 拉下来解开（**不需要 git**），
+再从新目录里把真正的部署界面叫起来。网络不通的时候它会告诉你去 GitHub 手动下 zip。
+
+不过 exe 本身还是那个壳 —— **它跑的是这套脚本**，不是另写一份，所以脚本一升级就得重打一次。
 `dist/` 不进 git：二进制不该混在源码里。
 
 ---

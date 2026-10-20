@@ -81,6 +81,165 @@ $fH     = New-Object System.Drawing.Font('Microsoft YaHei UI', 10, [System.Drawi
 $fBody  = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
 $fMono  = New-Object System.Drawing.Font('Consolas', 9)
 
+# ================================================================
+# 找不到项目时：先把仓库拉下来（2026-10-20 深夜他要的）
+#   单下一个 exe 什么都做不了 —— 它只是界面，脚本、补丁、记忆模板都在仓库里。
+#   所以自己先判断"我在不在一个仓库里"，不在的话先问一句"装到哪"，把 zip 拉下来解开，
+#   再从那个新目录里把真正的部署界面叫起来。**这条路上不需要 git**（zip 下载 + Expand-Archive）。
+# ================================================================
+function Test-ProjectAt([string]$p) {
+    if (-not $p) { return $false }
+    return ((Test-Path (Join-Path $p 'install.ps1')) -and (Test-Path (Join-Path $p 'dafeiyu\tools\start-dafeiyu.ps1')))
+}
+
+$ZIP_URL = 'https://codeload.github.com/oldhan13/dsh-dafeiyu/zip/refs/heads/main'
+
+function Show-Bootstrap {
+    # 这一屏在 New-Label / New-Button 定义之前就跑了（它们在主窗建完之后才定义），
+    # 所以这里自带两个极小的替代，别去调下面那些。
+    function BLabel($p, [string]$t, [int]$x, [int]$y, [int]$w, [int]$h, $f, $c) {
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = $t
+        $l.Location = New-Object System.Drawing.Point($x, $y)
+        $l.Size = New-Object System.Drawing.Size($w, $h)
+        $l.Font = $f
+        $l.ForeColor = $c
+        $l.BackColor = [System.Drawing.Color]::Transparent
+        $p.Controls.Add($l)
+        return $l
+    }
+    function BButton($p, [string]$t, [int]$x, [int]$y, [int]$w, [switch]$Primary) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $t
+        $b.Location = New-Object System.Drawing.Point($x, $y)
+        $b.Size = New-Object System.Drawing.Size($w, 32)
+        $b.FlatStyle = 'Flat'
+        $b.Font = $fBody
+        if ($Primary) {
+            $b.BackColor = $ACCENT
+            $b.ForeColor = [System.Drawing.Color]::White
+            $b.FlatAppearance.BorderSize = 0
+        } else {
+            $b.BackColor = [System.Drawing.Color]::FromArgb(243, 244, 246)
+            $b.ForeColor = $INK
+            $b.FlatAppearance.BorderColor = $LINE
+        }
+        $p.Controls.Add($b)
+        return $b
+    }
+
+    $bf = New-Object System.Windows.Forms.Form
+    $bf.Text = '大肥鱼 · 第一次用'
+    $bf.Size = New-Object System.Drawing.Size(560, 380)
+    $bf.StartPosition = 'CenterScreen'
+    $bf.BackColor = $BG
+    $bf.FormBorderStyle = 'FixedSingle'
+    $bf.MaximizeBox = $false
+    $bf.Font = $fBody
+
+    BLabel $bf '先把它自己拉下来' 24 18 400 30 $fTitle $INK | Out-Null
+    BLabel $bf '你现在手里只有这个 exe。它只是界面 —— 脚本、补丁、记忆模板都在仓库里，得先有一份。' 24 52 500 40 $fSub $MUTED | Out-Null
+    BLabel $bf '装到哪个目录' 24 100 120 18 $fSub $MUTED | Out-Null
+
+    $txDir = New-Object System.Windows.Forms.TextBox
+    $txDir.Location = New-Object System.Drawing.Point(24, 120)
+    $txDir.Size = New-Object System.Drawing.Size(390, 26)
+    $txDir.Font = $fBody
+    $txDir.Text = (Join-Path $env:USERPROFILE 'dafeiyu')
+    $bf.Controls.Add($txDir)
+
+    $btnBrowse = BButton $bf '换个位置…' 424 118 100
+    $txProxy = New-Object System.Windows.Forms.TextBox
+    $txProxy.Location = New-Object System.Drawing.Point(24, 168)
+    $txProxy.Size = New-Object System.Drawing.Size(240, 26)
+    $txProxy.Font = $fMono
+    $bf.Controls.Add($txProxy)
+    BLabel $bf '代理（下载不动时填，例如 http://127.0.0.1:7897；留空 = 直连）' 24 148 480 18 $fSub $MUTED | Out-Null
+
+    $btnGo = BButton $bf '下载并继续' 24 206 130 -Primary
+    $btnGo.Font = $fBody
+
+    $log = New-Object System.Windows.Forms.TextBox
+    $log.Location = New-Object System.Drawing.Point(24, 250)
+    $log.Size = New-Object System.Drawing.Size(500, 76)
+    $log.Multiline = $true
+    $log.ScrollBars = 'Vertical'
+    $log.ReadOnly = $true
+    $log.Font = $fMono
+    $log.BackColor = [System.Drawing.Color]::FromArgb(252, 252, 253)
+    $bf.Controls.Add($log)
+
+    function Say2([string]$m) {
+        $log.AppendText($m + "`r`n")
+        $log.SelectionStart = $log.TextLength
+        $log.ScrollToCaret()
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    $btnBrowse.Add_Click({
+            $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+            $dlg.Description = '选一个空目录（不存在也行，会自动建）'
+            if ($dlg.ShowDialog() -eq 'OK') { $txDir.Text = $dlg.SelectedPath }
+        })
+
+    $btnGo.Add_Click({
+            $btnGo.Enabled = $false
+            try {
+                $dest = $txDir.Text.Trim()
+                if (-not $dest) { Say2 '先选个目录。'; return }
+                # 已经有一份完整的仓库，就别重复下载
+                if (Test-ProjectAt $dest) {
+                    Say2 ('这个目录里已经有一份了，直接接着装：' + $dest)
+                    $entry = Join-Path $dest 'dafeiyu\tools\setup-ui.ps1'
+                    Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $entry
+                    [System.Environment]::Exit(0)
+                }
+                if ((Test-Path $dest) -and @(Get-ChildItem -LiteralPath $dest -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+                    Say2 '这个目录不是空的 —— 换个空的，免得把里面的东西搅乱。'
+                    return
+                }
+                $proxy = $txProxy.Text.Trim()
+                $tmp = Join-Path $env:TEMP ('dfy-repo-' + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+                $zip = Join-Path $tmp 'repo.zip'
+                Say2 '下载中…（约 1 MB，慢的话等一会儿）'
+                $args2 = @{ Uri = $ZIP_URL; OutFile = $zip; UseBasicParsing = $true; TimeoutSec = 180 }
+                if ($proxy) { $args2['Proxy'] = $proxy }
+                $ProgressPreference = 'SilentlyContinue'
+                Invoke-WebRequest @args2
+                Say2 ('下载好了：' + [int]((Get-Item $zip).Length / 1024) + ' KB')
+                $ex = Join-Path $tmp 'x'
+                Expand-Archive -LiteralPath $zip -DestinationPath $ex -Force
+                $inner = Get-ChildItem -LiteralPath $ex -Directory | Select-Object -First 1
+                if (-not $inner) { Say2 '解压出来是空的 —— 下载到的东西不对。'; return }
+                Say2 '解开中…'
+                if (Test-Path $dest) { Remove-Item -LiteralPath $dest -Force -Recurse -ErrorAction SilentlyContinue }
+                $parent = Split-Path -Parent $dest
+                if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+                Move-Item -LiteralPath $inner.FullName -Destination $dest -Force
+                Remove-Item -LiteralPath $tmp -Force -Recurse -ErrorAction SilentlyContinue
+                if (-not (Test-ProjectAt $dest)) { Say2 '装出来的目录不对：里面没有 install.ps1。'; return }
+                Say2 ('好了：' + $dest)
+                Say2 '接着开部署界面…'
+                Start-Sleep -Milliseconds 300
+                $entry = Join-Path $dest 'dafeiyu\tools\setup-ui.ps1'
+                Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $entry
+                [System.Environment]::Exit(0)
+            } catch {
+                Say2 ('没成：' + $_.Exception.Message)
+                Say2 '（也可以自己去 GitHub 下载 zip 解开，再双击里面的 setup.cmd）'
+            } finally {
+                $btnGo.Enabled = $true
+            }
+        })
+
+    [void]$bf.ShowDialog()
+    [System.Environment]::Exit(0)
+}
+
+# 只有"确实不在仓库里"才走这条路；-Check 已经在上头退了，不会再弹窗。
+if (-not (Test-ProjectAt $PROJECT)) { Show-Bootstrap }
+
 # ---------- 窗 ----------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '大肥鱼 · 部署'
