@@ -356,6 +356,15 @@ function Run-Checks {
         [System.Windows.Forms.Application]::DoEvents()
     }
 
+    # 第一项就查「我在不在一个项目里」。单独下载的 exe 会算出离奇的 PROJECT（实测裸跑是 C:\），
+    # 后面每一行都可能是勾，点「开始安装」才失败 —— 那太晚了，也看不出为什么。
+    $okProj = (Test-Path (Join-Path $PROJECT 'install.ps1')) -and (Test-Path (Join-Path $TOOLS 'start-dafeiyu.ps1'))
+    Add-Check '项目目录' $okProj $(if ($okProj) { $PROJECT } else { '这里不是仓库目录：先把这个仓库 clone 下来，再把 exe 放进 dist\ 或根目录（算出来是 ' + $PROJECT + '）' })
+    if ($btnInstall) {
+        $btnInstall.Enabled = $okProj
+        $btnInstall.Text = if ($okProj) { '开始安装' } else { '先放回仓库目录' }
+    }
+
     $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
     if ($nodeCmd) {
         $nv = (& node -v) 2>$null
