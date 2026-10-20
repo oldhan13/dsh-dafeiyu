@@ -50,6 +50,24 @@ $script:popen = $false
 # 她主动发来的话（比如后台 agent 跑完的结果）：bridge 那边排队，面板每两秒取一次。
 # pout 是"已经收到第几条"，打开面板时先对齐一次，免得和读历史重复显示。
 $script:pout = 0
+# ---- 拖进来的文件（2026-10-20 傍晚他要的：「直接上传文件路径，在agent里跑」）----
+# 不复制、不搬走：路径直接递过去 —— 她本来就能 read_file / run，复制一份只会多一个会过期的副本。
+# pAttach 是"这条消息要一起发出去的文件"，发完就清空。
+$script:pAttach = New-Object System.Collections.ArrayList
+$script:pchiprow = $null          # 输入条上方那条附件带
+$script:pfootCtl = $null             # 输入条（Dock=Bottom）——有附件时整条往上抬
+$script:pboxHost = $null
+$script:padd = $null              # 「+」挑文件那个按钮
+$script:pheadCtl = $null
+$script:pfootLift = 0
+$script:pdragHide = $null         # 在子控件之间挪动也会触发 Leave ⇒ 延后收，别闪
+$script:pdropOn = $false
+$script:pdropEdges = $null
+$script:pdropPill = $null
+$script:pdropPulse = $null
+$script:pdropT = 0
+$script:pdropColA = [System.Drawing.Color]::FromArgb(149, 236, 105)
+$script:pdropColB = [System.Drawing.Color]::FromArgb(84, 154, 96)
 $script:pfishForm = $null
 $script:panim = $null
 $script:plastText = $null
@@ -117,13 +135,6 @@ function Speak-PanelText([string]$text) {
   } catch { Trace ('panel speak failed: ' + $_.Exception.Message) }
 }
 
-function Panel-Post([string]$text) {
-  # quiet：面板自己会显示她的回复，别让 bridge 再往 say.txt 写一遍
-  # （写了就会被鱼头顶的气泡那条监听再递进面板 —— 一次发送两遍消息）
-  $body = @{ text = $text; quiet = $true } | ConvertTo-Json -Compress
-  $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-  return (Invoke-RestMethod -Uri "$BRIDGE/say" -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 15).id
-}
 function Panel-Reply([string]$id) { return Invoke-RestMethod -Uri "$BRIDGE/reply?id=$id" -TimeoutSec 15 }
 function Panel-History([int]$n) { return @(Invoke-RestMethod -Uri "$BRIDGE/history?n=$n" -TimeoutSec 15) }
 function Panel-Outbox([int]$since) { return Invoke-RestMethod -Uri "$BRIDGE/outbox?since=$since" -TimeoutSec 8 }
@@ -315,8 +326,12 @@ function Add-PanelTimeSep([datetime]$t) {
 function Add-PanelMsg([string]$who, [string]$text, $at = $null) {
   if (-not $script:pwrap) { return }
   if (-not $text) { return }
-  if (Test-PanelDup $who $text) { return }
-  Register-PanelMsg $who $text
+  # 去重只对"她"的话有意义（同一条回复有 /reply 和 say.txt 两条路进来）。
+  # 他自己发的不能去重：同一批文件发两次，第二条气泡会被前缀判成重复而消失（实测）。
+  if ($who -eq 'her') {
+    if (Test-PanelDup $who $text) { return }
+    Register-PanelMsg $who $text
+  }
   $script:plastText = $text
   $script:plastWho = $who
 
@@ -387,6 +402,8 @@ function Add-PanelMsg([string]$who, [string]$text, $at = $null) {
   [void]$row.Controls.Add($bubble)
   [void]$script:pwrap.Controls.Add($row)
   $script:plist.Add($row)
+  # 新冒出来的行也要能接住拖放 —— 拖到某句话上面是最自然的动作
+  try { Enable-PanelDrop $row } catch { }
 
   # 让布局落定再滚 —— FlowLayoutPanel 自己维护滚动范围，不用我们算。
   # ScrollControlIntoView 只保证"看得见"，最后一行常常只露一半（实测）⇒ 直接顶到底。
@@ -472,7 +489,12 @@ function Load-PanelHistory {
     if ($h.Count -eq 0) { Add-PanelMsg 'her' '我在。' }
     foreach ($m in $h) {
       # at 是 jsonl 里记的毫秒时间戳 —— 打开面板看到的是当时几点说的，不是"刚刚"
-      if ($m.role -eq 'user') { Add-PanelMsg 'me' $m.text $m.at } else { Add-PanelMsg 'her' $m.text $m.at }
+      if ($m.role -eq 'user') {
+        if ($m.text) { Add-PanelMsg 'me' $m.text $m.at }
+        $fl = @()
+        foreach ($f in @($m.files)) { if ($f) { $fl += [string]$f } }
+        if ($fl.Count -gt 0) { Add-PanelMsg 'me' (Format-PanelFileList $fl) $m.at }
+      } else { Add-PanelMsg 'her' $m.text $m.at }
     }
   } catch {
     Trace ('panel history failed: ' + $_.Exception.Message)
@@ -484,14 +506,281 @@ function Load-PanelHistory {
 
 function Set-PanelTip([string]$t) { if ($script:ptip) { $script:ptip.Text = $t } }
 
+# ================================================================ 附件（拖 / 挑）
+function Format-PanelSize($bytes, [bool]$dir) {
+  if ($dir) { return '文件夹' }
+  $b = [double]$bytes
+  if ($b -lt 1024) { return ('{0:0} B' -f $b) }
+  if ($b -lt 1048576) { return ('{0:0.#} KB' -f ($b / 1024)) }
+  if ($b -lt 1073741824) { return ('{0:0.#} MB' -f ($b / 1048576)) }
+  return ('{0:0.#} GB' -f ($b / 1073741824))
+}
+
+# 一行一个：名字 + 大小。历史里也用它，所以只吃路径、现读盘。
+function Format-PanelFileList($paths) {
+  $lines = @()
+  foreach ($p in @($paths)) {
+    if (-not $p) { continue }
+    $nm = ''
+    $sz = ''
+    try {
+      $fi = Get-Item -LiteralPath $p -ErrorAction Stop
+      $nm = $fi.Name
+      $sz = Format-PanelSize ([long]$fi.Length) ($fi -is [System.IO.DirectoryInfo])
+    } catch {
+      try { $nm = [System.IO.Path]::GetFileName($p) } catch { }
+    }
+    if ($nm) { $lines += (($nm + '  ' + $sz).TrimEnd()) }
+  }
+  return ($lines -join "`n")
+}
+
+function Update-PanelAttachTip {
+  if (-not $script:ptip) { return }
+  $n = @($script:pAttach).Count
+  if ($script:pwaiting) { Set-PanelTip '她在想……'; return }
+  if ($n -gt 0) { Set-PanelTip (([string]$n) + ' 个文件跟着这句话发 · 点 × 拿掉 · Enter 发送') }
+  else { Set-PanelTip 'Enter 发送 · Shift+Enter 换行 · 文件直接拖进来' }
+}
+
+# 有附件时把输入条整条往上抬 34px，给芯片让位置（Dock=Bottom 会把消息区自己顶上去）
+function Set-PanelFootLift([int]$d) {
+  if (-not $script:pfootCtl) { return }
+  if ($script:pfootLift -eq $d) { return }
+  $script:pfootLift = $d
+  $script:pfootCtl.Height = $script:pFoot + $d
+  if ($script:pboxHost) { $script:pboxHost.Top = 12 + $d }
+  if ($script:pmic) { $script:pmic.Top = 12 + $d }
+  if ($script:padd) { $script:padd.Top = 12 + $d }
+  if ($script:pbtn) { $script:pbtn.Top = 12 + $d }
+  if ($script:ptip) { $script:ptip.Top = 57 + $d }
+  if ($script:pchiprow) { $script:pchiprow.Visible = ($d -gt 0) }
+}
+
+# 芯片按**宽度预算**摆：装不下就收成 "+N"（写死"最多 3 个"实测会把第三个 chip 切一半，
+# 名字长短差很多，按个数算根本对不上）。× 上带 Tag（索引），别用 script 变量存 ——
+# 处理器里读到的会是最后一个（PS 的 scriptblock 抓脚本作用域，这条踩过好几次）。
+function Sync-PanelAttach {
+  $row = $script:pchiprow
+  if (-not $row) { return }
+  foreach ($c in @($row.Controls)) { try { $row.Controls.Remove($c); $c.Dispose() } catch { } }
+  $n = @($script:pAttach).Count
+  Set-PanelFootLift $(if ($n -gt 0) { 34 } else { 0 })
+  if ($n -le 0) { return }
+  $font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+  $budget = [int]$row.Width - 46          # 给 "+N" 留一格
+  $used = 0
+  $i = 0
+  foreach ($a in @($script:pAttach)) {
+    $tw = [System.Windows.Forms.TextRenderer]::MeasureText([string]$a.name, $font, (New-Object System.Drawing.Size(1000, 0)), [System.Windows.Forms.TextFormatFlags]::NoPadding).Width
+    $cw = [int][Math]::Min(150, [Math]::Max(72, ($tw + 46)))
+    if ($i -ge 1 -and ($used + $cw + 6) -gt $budget) { break }
+    $chip = New-Object System.Windows.Forms.Panel
+    $chip.Size = New-Object System.Drawing.Size($cw, 28)
+    $chip.BackColor = [System.Drawing.Color]::FromArgb(52, 64, 58)
+    $chip.Region = New-Object System.Drawing.Region((New-PanelRoundPath $cw 28 12))
+    $lb = New-Object System.Windows.Forms.Label
+    $lb.AutoSize = $false
+    $lb.Size = New-Object System.Drawing.Size(($cw - 26), 28)
+    $lb.Location = New-Object System.Drawing.Point(10, 0)
+    $lb.TextAlign = 'MiddleLeft'
+    $lb.AutoEllipsis = $true
+    $lb.Font = $font
+    $lb.ForeColor = [System.Drawing.Color]::FromArgb(214, 244, 220)
+    $lb.BackColor = [System.Drawing.Color]::Transparent
+    $lb.Text = [string]$a.name
+    $xx = New-Object System.Windows.Forms.Label
+    $xx.AutoSize = $false
+    $xx.Size = New-Object System.Drawing.Size(24, 28)
+    $xx.Location = New-Object System.Drawing.Point(($cw - 26), 0)
+    $xx.TextAlign = 'MiddleCenter'
+    $xx.Font = $font
+    $xx.ForeColor = [System.Drawing.Color]::FromArgb(150, 200, 160)
+    $xx.BackColor = [System.Drawing.Color]::Transparent
+    $xx.Text = '×'
+    $xx.Cursor = 'Hand'
+    $xx.Tag = $i
+    $xx.Add_Click({ param($s, $e) Remove-PanelAttach ([int]$s.Tag) })
+    $xx.Add_MouseEnter({ param($s, $e) $s.ForeColor = [System.Drawing.Color]::White })
+    $xx.Add_MouseLeave({ param($s, $e) $s.ForeColor = [System.Drawing.Color]::FromArgb(150, 200, 160) })
+    [void]$chip.Controls.Add($lb)
+    [void]$chip.Controls.Add($xx)
+    [void]$row.Controls.Add($chip)
+    $used = $used + $cw + 6
+    $i++
+  }
+  if ($n -gt $i) {
+    $more = New-Object System.Windows.Forms.Label
+    $more.AutoSize = $true
+    $more.Text = ('+' + ($n - $i))
+    $more.Font = $font
+    $more.Margin = New-Object System.Windows.Forms.Padding(8, 7, 0, 0)
+    $more.ForeColor = [System.Drawing.Color]::FromArgb(150, 200, 160)
+    $more.BackColor = [System.Drawing.Color]::Transparent
+    [void]$row.Controls.Add($more)
+  }
+  Trace ('panel: chips ' + $i + '/' + $n + ' used=' + $used)
+}
+
+function Add-PanelFiles($paths) {
+  $added = 0
+  $missed = 0
+  foreach ($p in @($paths)) {
+    if (-not $p) { continue }
+    try { $full = (Resolve-Path -LiteralPath $p -ErrorAction Stop).Path } catch { $missed++; continue }
+    $dup = $false
+    foreach ($a in @($script:pAttach)) { if ($a.path -ieq $full) { $dup = $true; break } }
+    if ($dup) { continue }
+    if (@($script:pAttach).Count -ge 12) { $missed++; continue }
+    try {
+      $fi = Get-Item -LiteralPath $full -ErrorAction Stop
+      $isDir = ($fi -is [System.IO.DirectoryInfo])
+      $len = 0
+      if (-not $isDir) { $len = [long]$fi.Length }
+      [void]$script:pAttach.Add([pscustomobject]@{ path = $full; name = $fi.Name; size = $len; dir = $isDir })
+      $added++
+    } catch { $missed++ }
+  }
+  if ($added -gt 0) {
+    Sync-PanelAttach
+    Trace ('panel: attach +' + $added + ' (now ' + @($script:pAttach).Count + ')')
+  }
+  if ($missed -gt 0) {
+    Add-PanelMsg 'her' ('（有 ' + $missed + ' 个没放进来：一次最多 12 个，或者那个东西已经不在了）')
+  }
+  Update-PanelAttachTip
+  return $added
+}
+
+function Remove-PanelAttach([int]$i) {
+  if ($i -lt 0 -or $i -ge @($script:pAttach).Count) { return }
+  $script:pAttach.RemoveAt($i)
+  Sync-PanelAttach
+  Update-PanelAttachTip
+  Trace ('panel: attach -1 (now ' + @($script:pAttach).Count + ')')
+}
+
+function Clear-PanelAttach {
+  if (@($script:pAttach).Count -gt 0) { Trace 'panel: attach clear' }
+  $script:pAttach.Clear()
+  Sync-PanelAttach
+  Update-PanelAttachTip
+}
+
+# ================================================================ 拖放提示
+# 不拿一块板子把聊天记录盖住：四条细边 + 一张浮签，脉动一下（110ms 换一次色）。
+function Show-PanelDropZone {
+  if (-not $script:pdropPill -or -not $script:pform) { return }
+  if ($script:pdropOn) { return }
+  $headH = 0
+  if ($script:pheadCtl) { $headH = $script:pheadCtl.Bottom }
+  $footTop = $script:pform.ClientSize.Height - $script:pFoot - $script:pfootLift
+  $x = 10
+  $y = $headH + 6
+  $w = $script:pform.ClientSize.Width - 20
+  $h = $footTop - $y - 8
+  if ($w -lt 120 -or $h -lt 90) { return }
+  $script:pdropOn = $true
+  $edges = @($script:pdropEdges)
+  if ($edges.Count -eq 4) {
+    $edges[0].Bounds = New-Object System.Drawing.Rectangle($x, $y, $w, 2)
+    $edges[1].Bounds = New-Object System.Drawing.Rectangle($x, ($y + $h - 2), $w, 2)
+    $edges[2].Bounds = New-Object System.Drawing.Rectangle($x, $y, 2, $h)
+    $edges[3].Bounds = New-Object System.Drawing.Rectangle(($x + $w - 2), $y, 2, $h)
+    foreach ($ed in $edges) { $ed.Visible = $true; $ed.BringToFront() }
+  }
+  $pw = 244
+  $ph = 66
+  $script:pdropPill.Size = New-Object System.Drawing.Size($pw, $ph)
+  $script:pdropPill.Location = New-Object System.Drawing.Point(($x + [int](($w - $pw) / 2)), ($y + [int](($h - $ph) / 2)))
+  $script:pdropPill.Visible = $true
+  $script:pdropPill.BringToFront()
+  $script:pdropT = 0
+  if ($script:pdropPulse) { try { $script:pdropPulse.Start() } catch { } }
+}
+
+function Hide-PanelDropZone {
+  if (-not $script:pdropOn) { return }
+  $script:pdropOn = $false
+  if ($script:pdropPulse) { try { $script:pdropPulse.Stop() } catch { } }
+  foreach ($ed in @($script:pdropEdges)) { try { $ed.Visible = $false } catch { } }
+  if ($script:pdropPill) { try { $script:pdropPill.Visible = $false } catch { } }
+}
+
+# 每个能接到鼠标的控件都得自己 AllowDrop —— WinForms 把拖放事件发给光标下面那个控件，
+# 它没开的话不会往父窗口冒泡（子控件默认 AllowDrop=$false，实测如此）。
+function Enable-PanelDrop($ctrl) {
+  if (-not $ctrl) { return }
+  try { $ctrl.AllowDrop = $true } catch { return }
+  try { $ctrl.Add_DragEnter({ param($s, $e) On-PanelDragEnter $s $e }) } catch { }
+  try { $ctrl.Add_DragOver({ param($s, $e) On-PanelDragOver $s $e }) } catch { }
+  try { $ctrl.Add_DragLeave({ param($s, $e) On-PanelDragLeave $s $e }) } catch { }
+  try { $ctrl.Add_DragDrop({ param($s, $e) On-PanelDragDrop $s $e }) } catch { }
+  foreach ($c in @($ctrl.Controls)) { Enable-PanelDrop $c }
+}
+
+function On-PanelDragEnter($s, $e) {
+  try {
+    if (-not $e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+      $e.Effect = [System.Windows.Forms.DragDropEffects]::None
+      return
+    }
+    $e.Effect = [System.Windows.Forms.DragDropEffects]::Copy
+    if ($script:pdragHide) { try { $script:pdragHide.Stop() } catch { } }
+    Show-PanelDropZone
+  } catch { }
+}
+function On-PanelDragOver($s, $e) {
+  try {
+    if (-not $e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+      $e.Effect = [System.Windows.Forms.DragDropEffects]::None
+      return
+    }
+    $e.Effect = [System.Windows.Forms.DragDropEffects]::Copy
+    if ($script:pdragHide) { try { $script:pdragHide.Stop() } catch { } }
+    if (-not $script:pdropOn) { Show-PanelDropZone }
+  } catch { }
+}
+function On-PanelDragLeave($s, $e) {
+  # 在子控件之间挪一下也会来一次 Leave —— 160ms 后还没回来才收，否则提示会闪成频闪灯
+  if ($script:pdragHide) { try { $script:pdragHide.Stop(); $script:pdragHide.Start() } catch { } }
+}
+function On-PanelDragDrop($s, $e) {
+  if ($script:pdragHide) { try { $script:pdragHide.Stop() } catch { } }
+  Hide-PanelDropZone
+  try {
+    if (-not $e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { return }
+    $items = $e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
+    Add-PanelFiles $items
+  } catch { Trace ('panel drop failed: ' + $_.Exception.Message) }
+}
+
+function Panel-Post([string]$text, $files = $null) {
+  # quiet：面板自己会显示她的回复，别让 bridge 再往 say.txt 写一遍
+  # （写了就会被鱼头顶的气泡那条监听再递进面板 —— 一次发送两遍消息）
+  $o = @{ text = $text; quiet = $true }
+  $fl = @()
+  foreach ($f in @($files)) { if ($f) { $fl += [string]$f } }
+  if ($fl.Count -gt 0) { $o.files = $fl }
+  $body = $o | ConvertTo-Json -Compress -Depth 4
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+  return (Invoke-RestMethod -Uri "$BRIDGE/say" -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 15).id
+}
+
 function Panel-Send {
   if ($script:pwaiting -or $script:precording) { return }
   $t = $script:pbox.Text.Trim()
-  if (-not $t) { return }
+  $files = @()
+  foreach ($a in @($script:pAttach)) { $files += [string]$a.path }
+  if (-not $t -and $files.Count -eq 0) { return }
   $script:pbox.Text = ''
+  if (-not $t) { $t = '看看这个' }
   Add-PanelMsg 'me' $t
+  # 文件单独一条气泡（像 QQ 那样），不把路径塞进正文 —— 正文是给他看的，路径是给她用的
+  if ($files.Count -gt 0) { Add-PanelMsg 'me' (Format-PanelFileList $files) }
+  Clear-PanelAttach
   try {
-    $script:ppending = Panel-Post $t
+    $script:ppending = Panel-Post $t $files
     $script:pwaiting = $true
     $script:pbtn.Enabled = $false
     Add-PanelTyping
@@ -499,7 +788,7 @@ function Panel-Send {
   } catch {
     Trace ('panel say failed: ' + $_.Exception.Message)
     Add-PanelMsg 'her' '（没送出去，看看 bridge 还活着没有）'
-    Set-PanelTip 'Enter 发送 · Shift+Enter 换行'
+    Update-PanelAttachTip
   }
 }
 
@@ -646,7 +935,7 @@ function Poll-PanelWelcome {
     $raw = ''
     try { $raw = [string](Receive-Job $job -ErrorAction SilentlyContinue) } catch { }
     Remove-Job $job -Force -ErrorAction SilentlyContinue
-    Set-PanelTip 'Enter 发送 · Shift+Enter 换行'
+    Update-PanelAttachTip
     if (-not $raw) { return }
     $o = $null
     try { $o = $raw | ConvertFrom-Json } catch { }
@@ -683,6 +972,7 @@ function Initialize-Panel {
   $head.BackColor = $PCOL_BAR
   [void]$f.Controls.Add($head)
   Enable-PanelDoubleBuffer $head
+  $script:pheadCtl = $head
 
   $av = New-Object System.Windows.Forms.PictureBox
   $av.Size = New-Object System.Drawing.Size(34, 34)
@@ -809,14 +1099,29 @@ function Initialize-Panel {
   $foot.BackColor = $PCOL_BAR
   [void]$f.Controls.Add($foot)
   Enable-PanelDoubleBuffer $foot
+  $script:pfootCtl = $foot
+
+  # 附件带：平时收起来（高 0 不占地方），有文件时输入条整条上抬 34px 让它露出来
+  $chips = New-Object System.Windows.Forms.FlowLayoutPanel
+  $chips.Location = New-Object System.Drawing.Point(12, 4)
+  $chips.Size = New-Object System.Drawing.Size(($script:pW - 24), 28)
+  $chips.Anchor = 'Top,Left,Right'
+  $chips.FlowDirection = 'LeftToRight'
+  $chips.WrapContents = $false
+  $chips.AutoScroll = $false
+  $chips.BackColor = $PCOL_BAR
+  $chips.Visible = $false
+  [void]$foot.Controls.Add($chips)
+  $script:pchiprow = $chips
 
   $boxHost = New-Object System.Windows.Forms.Panel
   $boxHost.BackColor = [System.Drawing.Color]::FromArgb(44, 44, 52)
   $boxHost.Location = New-Object System.Drawing.Point(12, 12)
-  $boxHost.Size = New-Object System.Drawing.Size(286, 40)
+  $boxHost.Size = New-Object System.Drawing.Size(244, 40)
   $boxHost.Anchor = 'Left,Top,Right'
-  $boxHost.Region = New-Object System.Drawing.Region((New-PanelRoundPath 286 40 18))
+  $boxHost.Region = New-Object System.Drawing.Region((New-PanelRoundPath 244 40 18))
   [void]$foot.Controls.Add($boxHost)
+  $script:pboxHost = $boxHost
 
   $box = New-Object System.Windows.Forms.TextBox
   $box.BorderStyle = 'None'
@@ -824,10 +1129,26 @@ function Initialize-Panel {
   $box.ForeColor = [System.Drawing.Color]::White
   $box.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5)
   $box.Location = New-Object System.Drawing.Point(14, 9)
-  $box.Width = 258
+  $box.Width = 216
   $box.Anchor = 'Left,Top,Right'
   [void]$boxHost.Controls.Add($box)
   $script:pbox = $box
+
+  # 挑文件（不是所有事都想得起来拖）：多选，直接进附件带
+  $add = New-Object System.Windows.Forms.Button
+  $add.Text = '+'
+  $add.Size = New-Object System.Drawing.Size(36, 40)
+  $add.Location = New-Object System.Drawing.Point(262, 12)
+  $add.Anchor = 'Top,Right'
+  $add.FlatStyle = 'Flat'
+  $add.FlatAppearance.BorderSize = 0
+  $add.BackColor = [System.Drawing.Color]::FromArgb(52, 52, 62)
+  $add.ForeColor = [System.Drawing.Color]::White
+  $add.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 13)
+  $add.Cursor = 'Hand'
+  $add.Region = New-Object System.Drawing.Region((New-PanelRoundPath 36 40 18))
+  [void]$foot.Controls.Add($add)
+  $script:padd = $add
 
   $mic = New-Object System.Windows.Forms.Button
   # '🎤' 在 Microsoft YaHei UI 里没有字形，渲染成豆腐块（实测）。按钮上换汉字，跟"发"配对。
@@ -861,7 +1182,7 @@ function Initialize-Panel {
   $script:pbtn = $btn
 
   $tip = New-Object System.Windows.Forms.Label
-  $tip.Text = 'Enter 发送 · Shift+Enter 换行 · 点「说」开口'
+  $tip.Text = 'Enter 发送 · Shift+Enter 换行 · 文件直接拖进来'
   $tip.ForeColor = $PCOL_DIM
   $tip.AutoSize = $true
   $tip.BackColor = [System.Drawing.Color]::Transparent
@@ -869,6 +1190,61 @@ function Initialize-Panel {
   $tip.Location = New-Object System.Drawing.Point(16, 57)
   [void]$foot.Controls.Add($tip)
   $script:ptip = $tip
+
+  # ---- 拖放提示：四条细边 + 一张浮签 ----
+  # 第一版想拿一块半透明板子盖住消息区，WinForms 没有真透明 —— 会变成一块黑板把聊天记录糊掉。
+  # 现在只加边（2px），中间留空，脉动时像在呼吸，聊天记录还看得见。
+  $edges = New-Object System.Collections.ArrayList
+  for ($i = 0; $i -lt 4; $i++) {
+    $ed = New-Object System.Windows.Forms.Panel
+    $ed.BackColor = $script:pdropColA
+    $ed.Visible = $false
+    [void]$f.Controls.Add($ed)
+    [void]$edges.Add($ed)
+  }
+  $script:pdropEdges = $edges
+
+  $pill = New-Object System.Windows.Forms.Panel
+  $pill.Size = New-Object System.Drawing.Size(244, 66)
+  $pill.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 36)
+  $pill.Visible = $false
+  $pill.Region = New-Object System.Drawing.Region((New-PanelRoundPath 244 66 14))
+  $pt = New-Object System.Windows.Forms.Label
+  $pt.AutoSize = $false
+  $pt.Size = New-Object System.Drawing.Size(224, 30)
+  $pt.Location = New-Object System.Drawing.Point(10, 8)
+  $pt.TextAlign = 'MiddleCenter'
+  $pt.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 12, [System.Drawing.FontStyle]::Bold)
+  $pt.ForeColor = $script:pdropColA
+  $pt.BackColor = [System.Drawing.Color]::Transparent
+  $pt.Text = '松手就给她'
+  $pn = New-Object System.Windows.Forms.Label
+  $pn.AutoSize = $false
+  $pn.Size = New-Object System.Drawing.Size(224, 22)
+  $pn.Location = New-Object System.Drawing.Point(10, 38)
+  $pn.TextAlign = 'MiddleCenter'
+  $pn.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
+  $pn.ForeColor = [System.Drawing.Color]::FromArgb(160, 190, 170)
+  $pn.BackColor = [System.Drawing.Color]::Transparent
+  $pn.Text = '一次可以好几个 · 只把路径递过去'
+  [void]$pill.Controls.Add($pt)
+  [void]$pill.Controls.Add($pn)
+  $pill.Add_Paint({
+      param($s, $e)
+      try {
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $col = $(if ($script:pdropT -eq 1) { $script:pdropColA } else { $script:pdropColB })
+        $pen = New-Object System.Drawing.Pen($col, 2)
+        $path2 = New-PanelRoundPath ($s.Width - 1) ($s.Height - 1) 14
+        $g.DrawPath($pen, $path2)
+        $path2.Dispose()
+        $pen.Dispose()
+      } catch { }
+    })
+  [void]$f.Controls.Add($pill)
+  $script:pdropPill = $pill
+  $script:pdropT = 0
 
   # （消息区移到输入条前面去了，见上）
 
@@ -880,9 +1256,41 @@ function Initialize-Panel {
     })
   $btn.Add_MouseEnter({ $script:pbtn.BackColor = [System.Drawing.Color]::FromArgb(90, 150, 220) })
   $btn.Add_MouseLeave({ $script:pbtn.BackColor = [System.Drawing.Color]::FromArgb(70, 130, 200) })
+  $add.Add_Click({
+      try {
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Title = '挑文件给她'
+        $dlg.Multiselect = $true
+        $dlg.Filter = '所有文件 (*.*)|*.*'
+        $dlg.ShowHelp = $false
+        # 必须给 owner：面板是 TopMost，不传 owner 的话对话框会被压在面板后面（看着像"点了没反应"）
+        if ($dlg.ShowDialog($script:pform) -eq [System.Windows.Forms.DialogResult]::OK) { Add-PanelFiles $dlg.FileNames }
+      } catch { Trace ('panel add files failed: ' + $_.Exception.Message) }
+    })
+  $add.Add_MouseEnter({ $script:padd.BackColor = [System.Drawing.Color]::FromArgb(70, 70, 84) })
+  $add.Add_MouseLeave({ $script:padd.BackColor = [System.Drawing.Color]::FromArgb(52, 52, 62) })
   $mic.Add_MouseEnter({ if (-not $script:precording) { $script:pmic.BackColor = [System.Drawing.Color]::FromArgb(70, 70, 84) } })
   $mic.Add_MouseLeave({ if (-not $script:precording) { $script:pmic.BackColor = [System.Drawing.Color]::FromArgb(52, 52, 62) } })
   $f.Add_KeyDown({ if ($_.KeyCode -eq 'Escape') { Hide-Panel } })
+
+  # ---- 拖放接线 ----
+  # 每个控件自己 AllowDrop（子控件不会往父窗口冒泡，实测）；新加的消息行在 Add-PanelMsg 里补挂。
+  Enable-PanelDrop $f
+
+  # 拖出子控件时延后收提示：控件之间挪一下也会来 Leave，立即收会闪成频闪灯
+  $script:pdragHide = New-Object System.Windows.Forms.Timer
+  $script:pdragHide.Interval = 160
+  $script:pdragHide.Add_Tick({ try { $script:pdragHide.Stop() } catch { }; Hide-PanelDropZone })
+
+  # 脉动：110ms 换一次色，像在吸气 —— 不动的话那块提示看着像贴纸
+  $script:pdropPulse = New-Object System.Windows.Forms.Timer
+  $script:pdropPulse.Interval = 110
+  $script:pdropPulse.Add_Tick({
+      $script:pdropT = 1 - $script:pdropT
+      $col = $(if ($script:pdropT -eq 1) { $script:pdropColA } else { $script:pdropColB })
+      foreach ($ed in @($script:pdropEdges)) { try { $ed.BackColor = $col } catch { } }
+      if ($script:pdropPill) { try { $script:pdropPill.Invalidate() } catch { } }
+    })
 
   # ---- 定时器：每 400ms 问一次回复 ----
   $script:ptick = 0
@@ -901,7 +1309,7 @@ function Initialize-Panel {
         $script:pwaiting = $false
         $script:ppending = $null
         $script:pbtn.Enabled = $true
-        Set-PanelTip 'Enter 发送 · Shift+Enter 换行'
+        Update-PanelAttachTip
         Add-PanelMsg 'her' $r.text
         Update-PanelMood          # 她刚说完话，心情多半也变了
         Speak-PanelText ([string]$r.text)
@@ -910,7 +1318,7 @@ function Initialize-Panel {
         $script:pwaiting = $false
         $script:ppending = $null
         $script:pbtn.Enabled = $true
-        Set-PanelTip 'Enter 发送 · Shift+Enter 换行'
+        Update-PanelAttachTip
         Add-PanelMsg 'her' '（回复断了，重发一次试试）'
         Trace ('panel reply failed: ' + $_.Exception.Message)
       }
@@ -1045,6 +1453,7 @@ function Show-Panel {
 function Hide-Panel {
   Trace 'panel: hide called'
   if (-not $script:pform -or -not $script:popen) { return }
+  Hide-PanelDropZone       # 拖着文件的时候按了 Esc：别把提示留在鱼脸上
   $script:popen = $false
   Save-PanelState          # 面板收了：结果改成走鱼头顶的气泡
   if ($script:panim) { try { $script:panim.Stop(); $script:panim.Dispose() } catch { }; $script:panim = $null }

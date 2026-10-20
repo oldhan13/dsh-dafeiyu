@@ -8,7 +8,7 @@
 // 2026-10-20 11:30：他要求「为和桌宠的聊天界面赋予权限」。
 // 原来这条线在 systemPrompt 里明写「没有工具可用」，只能动嘴。现在给了她一套工具，
 // 她在这个小窗口里也能真的动手 —— 跑命令、开程序、看窗口、读改文件。
-// 实现：OpenAI 兼容的 function calling 循环（SiliconFlow 的 V4-Flash 支持，已实测）。
+// 实现：OpenAI 兼容的 function calling 循环（SiliconFlow 的 DeepSeek 系列支持，已实测）。
 //
 // 接口（只绑 127.0.0.1:3079）：
 //   POST /say    {text}        -> {id}
@@ -68,16 +68,26 @@ function history(n) {
 }
 
 function append(o) { fs.appendFileSync(HIST, JSON.stringify(o) + '\n'); }
+
+/** 拖进来的文件：面板把**路径**递过来，不复制 —— 她本来就摸得到磁盘，复制一份只会多一个会过期的副本。
+ *  ⚠️ 只给路径，不给内容：这条线是纯文本模型，图片看不见；二进制整份 read_file 会把上下文塞满。 */
+function fileBlock(files) {
+  const list = (Array.isArray(files) ? files : []).map(f => String(f || '').trim()).filter(Boolean);
+  if (!list.length) return '';
+  return '\n\n[他顺手递给你这些文件（路径，就在盘上）]\n' +
+    list.map((p, i) => `${i + 1}. ${p}`).join('\n') +
+    '\n（要看就用 run / read_file 自己看；图片这类二进制别整份读 —— 看不见就说看不见，别猜。）';
+}
 function traceAction(line) {
   try { fs.appendFileSync(ACTIONS, new Date().toISOString() + '  ' + line + '\n'); } catch { }
 }
 
 // ---------------------------------------------------------------- 后台 agent
-// 浮窗办不了的事，交给后台那个完整的 agent：走 dsh 自己的 headless 通道，
-// 一次跑完就退出，stdout 就是结果，不用第二个常驻进程。
+// 2026-10-20 他提的：「浮窗遇到解决不了的问题，就后台调用 agent 处理，然后把完成结果发出来。」
+// 走 dsh 自己的 headless 通道：一次跑完就退出，stdout 就是结果，不用第二个常驻进程。
 // ⚠️ headless 的基线层把 authorization / credentials / deepseek-account 三个服务关掉了，
-//    账号登录这条路就认不到凭据（报 ACCOUNT_SIGN_IN_REQUIRED）。所以每次跑都带一份
-//    overlay 把它们打开 —— 不写进你的 profile，只作用于这一次。用 API key 的人不受影响。
+//    账号登录这条路就认不到凭据（实测：日志里 "waiting for service: authorization" + ACCOUNT_SIGN_IN_REQUIRED）。
+//    所以每次跑都带一份 overlay 把它们打开 —— 不写进他的 profile，只作用于这一次。
 const AGENT_OVERLAY_TEXT = [
   '- id: authorization',
   "  name: '@deepseek-ai/dsh-authorization'",
@@ -120,7 +130,7 @@ function emit(text, bubble) {
   if (bubble && !panelOpen()) say(bubble);
 }
 
-/** 把任务交给 headless 的完整 agent：任务走 stdin（用 - 让它从 stdin 读），结果从 stdout 拿。 */
+/** 把任务交给 headless 的完整 agent：任务走 stdin（`-`），结果从 stdout 拿。 */
 function runAgent(task, why) {
   return new Promise((resolve) => {
     try { fs.writeFileSync(AGENT_OVERLAY, AGENT_OVERLAY_TEXT, 'utf8'); } catch { }
@@ -144,7 +154,8 @@ function runAgent(task, why) {
     child.on('error', e => finish({ ok: false, text: '起不来：' + (e?.message || String(e)) }));
     child.on('close', (code) => {
       const clean = s => String(s || '').replace(/\u001b\[[0-9;]*m/g, '').trim();
-      // 插件会往 stdout 打诊断行，那是给日志看的，不该出现在她的回话里。
+      // 插件会往 stdout 打诊断行（[llm-deepseek-account] model listing … / dsh: warning: …），
+      // 那是给日志看的，不该出现在她的回话里。
       const strip = s => s.split('\n')
         .filter(l => !/^\[llm-[a-z-]+\]/.test(l))
         .filter(l => !/^dsh: warning: \d+ entry did not activate/.test(l))
@@ -250,10 +261,10 @@ function systemPrompt() {
     '- 做完简短说一句你做了什么；别说一大段解释。',
     '- 动了别人的东西、或者发现你自己搞错了，直接说，不要遮掩。',
     '',
-    '## 办不了的事，交出去',
+    '## 办不了的事，交出去（2026-10-20 加）',
     '有几件事你在这个小窗口里**办不了**：要查资料、要写或改代码、要装插件、要在好几个文件之间对齐、要跑很久。',
-    '这种时候不要硬编、也不要嘴上说"你去弄一下" —— 调 delegate，把任务交给后台那个完整的 agent。',
-    '它会跑完，结果会自动贴回这个面板上（你不在的时候会攒着，等你打开）。',
+    '这种时候不要硬编、也不要嘴上说"你去弄一下" —— 调 `delegate`，把任务交给后台那个完整的 agent。',
+    '它会跑完，结果会自动贴回这个面板上（你没在的时候会攒着，等你打开）。',
     '交出去之后，你就说一句"交出去了，等它回来"，不用替它猜结果。',
     '',
     '## 记忆索引（摘）',
@@ -470,18 +481,20 @@ async function callModel(messages, forbidTools) {
   return msg;
 }
 
-async function agentLoop(text) {
-  let recent = history(16).map(h => ({ role: h.role, content: h.text }));
+async function agentLoop(text, files) {
+  // 历史里带过文件的那几句，也要把路径再交给她一遍 —— 否则回头问"刚才那个文件"她一脸茫然。
+  let recent = history(16).map(h => ({ role: h.role, content: String(h.text || '') + fileBlock(h.files) }));
+  const userText = String(text) + fileBlock(files);
   // /say 会先把这句写进历史、再调 agentLoop ⇒ 历史最后一条就是这句话本身。
   // 不剥掉的话模型每次都看见两条一样的话（实测：她连着几轮都在问"你怎么发了两次"）。
   if (recent.length) {
     const last = recent[recent.length - 1];
-    if (last.role === 'user' && last.content === text) recent = recent.slice(0, -1);
+    if (last.role === 'user' && last.content === userText) recent = recent.slice(0, -1);
   }
   const messages = [
     { role: 'system', content: systemPrompt() },
     ...recent,
-    { role: 'user', content: text },
+    { role: 'user', content: userText },
   ];
   traceAction('prompt ' + messages[0].content.length + ' chars / ' + recent.length + ' turns');
   const did = [];
@@ -538,6 +551,26 @@ const server = http.createServer((req, res) => {
     return json(200, { items: outbox.filter(m => m.seq > since), max: outseq });
   }
 
+  // 手动把一件事丢给后台（联调也走这条）
+  if (url.pathname === '/delegate' && req.method === 'POST') {
+    let raw = '';
+    req.on('data', c => { raw += c; });
+    req.on('end', async () => {
+      let task = '', why = 'manual';
+      try { const b = JSON.parse(raw || '{}'); task = String(b.task || '').trim(); why = String(b.why || why); } catch { }
+      if (!task) return json(400, { error: 'empty task' });
+      json(200, { ok: true, started: true });
+      activity('acting', '后台 agent');
+      const r = await runAgent(task, why);
+      activity('idle', '');
+      emit(
+        (r.ok ? '（后台回来了）\n' : '（后台没跑成）\n') + clip(r.text, r.ok ? 1400 : 900),
+        r.ok ? '后台弄完了，看面板' : '后台没跑成，看面板',
+      );
+    });
+    return;
+  }
+
   if (url.pathname === '/reply') {
     const id = url.searchParams.get('id');
     const job = jobs.get(id);
@@ -551,20 +584,23 @@ const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', c => { raw += c; });
     req.on('end', async () => {
-      let text = '', quiet = false;
+      let text = '', quiet = false, files = [];
       try {
         const b = JSON.parse(raw || '{}');
         text = String(b.text || '').trim();
         quiet = !!b.quiet;
+        // 文件只收路径字符串：面板那边已经把 Resolve-Path 的结果递过来
+        files = (Array.isArray(b.files) ? b.files : []).map(f => String(f || '').trim()).filter(Boolean).slice(0, 12);
       } catch { }
-      if (!text) return json(400, { error: 'empty' });
+      if (!text && !files.length) return json(400, { error: 'empty' });
+      if (!text) text = '看看这个';
       const id = String(++seq);
       jobs.set(id, { status: 'thinking', text: '' });
       activity('thinking', '');
-      append({ role: 'user', text, at: Date.now() });
+      append({ role: 'user', text, at: Date.now(), ...(files.length ? { files } : {}) });
       json(200, { id });
       try {
-        const { reply, did } = await agentLoop(text);
+        const { reply, did } = await agentLoop(text, files);
         append({ role: 'assistant', text: reply, at: Date.now() });
         traceAction('done (' + (did.length ? did.join(',') : '没动手') + '): ' + reply.slice(0, 120));
         activity('idle', '');
