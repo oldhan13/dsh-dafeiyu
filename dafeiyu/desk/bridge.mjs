@@ -475,7 +475,18 @@ async function callModel(messages, forbidTools) {
     body: JSON.stringify(body),
   });
   const j = await r.json();
-  if (!r.ok) throw new Error('http ' + r.status + ' ' + JSON.stringify(j).slice(0, 300));
+  if (!r.ok) {
+    // 把「后端没钱了」这种事翻成人话。以前这里是原样抛 `http 402 {...}`，
+    // 面板上就只剩一串 JSON —— 看着像程序崩了，其实是账户余额。
+    const code = j && (j.code !== undefined ? j.code : (j.error && j.error.code));
+    const why = String((j && (j.message || (j.error && j.error.message))) || '');
+    if (r.status === 402 || code === 30001 || /balance|insufficient/i.test(why)) {
+      throw new Error('BALANCE');
+    }
+    if (r.status === 401 || r.status === 403) throw new Error('KEY: 这个 key 不对或没权限（http ' + r.status + '）');
+    if (r.status === 429) throw new Error('RATE: 被限流了，等一两分钟再试（http 429）');
+    throw new Error('http ' + r.status + ' ' + JSON.stringify(j).slice(0, 200));
+  }
   const msg = j?.choices?.[0]?.message;
   if (!msg) throw new Error('empty message ' + JSON.stringify(j).slice(0, 300));
   return msg;
@@ -609,9 +620,14 @@ const server = http.createServer((req, res) => {
         if (!quiet) say(reply);
         jobs.set(id, { status: 'done', text: reply });
       } catch (err) {
-        const msg = '（我这边卡住了：' + String(err.message || err).slice(0, 200) + '）';
+        const raw = String(err && err.message ? err.message : err);
+        const msg =
+          raw === 'BALANCE' ? '（我这边账户没钱了 —— 模型余额不足，回不了话。充上就好，别的一句都没丢）' :
+          raw.startsWith('KEY:') ? '（key 不对：' + raw.slice(4).trim() + '）' :
+          raw.startsWith('RATE:') ? '（被限流了：' + raw.slice(5).trim() + '）' :
+          '（我这边卡住了：' + raw.slice(0, 200) + '）';
         traceAction('error: ' + msg);
-        activity('error', String(err.message || err).slice(0, 60));
+        activity('error', raw === 'BALANCE' ? '余额不足' : raw.slice(0, 60));
         jobs.set(id, { status: 'error', text: msg });
       }
     });

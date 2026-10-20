@@ -123,3 +123,38 @@ dsh --profile headless --patch .\agent-overlay.yml "把这件事办掉"   # 任�
 ⚠️ 还有两个小坑：① 任务文本**别拼进命令行**，走 stdin（结尾的 `-`）最稳；
 ② 成功时 stdout 里会混进 `[llm-deepseek-account] model listing …` 这类诊断行，贴给人之前要滤掉。
 
+## 10. `wscript` 去 Run 一个 `.cmd`，会弹「无法验证发布者」
+
+和第 3 条是同一种病：**弹窗的根源不是"窗口没藏好"，是让 ShellExecute 去启动一个脚本文件。**
+
+表现：`无法验证发布者。你确定要运行此软件吗？`，里面写着
+`名称: ...\dafeiyu\tools\ledger-tidy.cmd`、`类型: Windows 命令脚本`。
+两条链都撞过：
+
+- **每半小时一次**：计划任务 → `wscript.exe //B` → vbs 里 `sh.Run "...\ledger-tidy.cmd"`
+- **每次开机一次**：启动文件夹的 `.lnk` → `wscript.exe start-silent.vbs` → 同样 `sh.Run` 一个 `.cmd`
+
+`.cmd` / `.bat` 在 Attachment Manager 眼里是"高风险脚本类型"，经 ShellExecute 启动就要你确认一次 ——
+**跟有没有 Mark-of-the-Web 无关**（`dir /r` 查不到 `Zone.Identifier` 也一样弹）。
+
+改法只有一条原则：**别让 ShellExecute 启动脚本，直接起一个签过名的 exe。**
+
+```powershell
+# 计划任务：隐藏 PowerShell 跑 .ps1
+$act = New-ScheduledTaskAction -Execute 'powershell.exe' `
+  -Argument '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "...\ledger-tidy-hidden.ps1"'
+Set-ScheduledTask -TaskName 'DaFeiYu-LedgerTidy' -Action $act
+
+# 开机自启：快捷方式直接指向 powershell.exe，而不是 wscript
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\DaFeiYu.lnk")
+$s.TargetPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+$s.Arguments  = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "...\start-dafeiyu.ps1"'
+$s.Save()
+```
+
+在 `.ps1` 里用 `& "...\x.cmd"` 调 `.cmd` 是**没问题**的：那走 cmd.exe 直接执行，不经 ShellExecute。
+
+排查口径：先 `schtasks /Query /TN <任务> /V /FO LIST | findstr "Task To Run"` 看动作是不是还挂着 wscript，
+再看启动文件夹里有没有指着 vbs 的快捷方式 —— 两处都换掉，弹窗才真的没了。
+
+
