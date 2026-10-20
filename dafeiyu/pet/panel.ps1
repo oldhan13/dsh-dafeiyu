@@ -47,6 +47,9 @@ $script:ptyping = $null
 $script:pavatar = @{}
 $script:precording = $false
 $script:popen = $false
+# 她主动发来的话（比如后台 agent 跑完的结果）：bridge 那边排队，面板每两秒取一次。
+# pout 是"已经收到第几条"，打开面板时先对齐一次，免得和读历史重复显示。
+$script:pout = 0
 $script:pfishForm = $null
 $script:panim = $null
 $script:plastText = $null
@@ -75,7 +78,8 @@ $script:pwelcomeJob = $null
 $script:pwelcomeDone = 0
 
 function Save-PanelState {
-  try { @{ voice = [bool]$script:pvoice } | ConvertTo-Json -Compress | Set-Content $PSTATE -Encoding UTF8 } catch { }
+  # open 也要写：bridge 靠它决定"结果要不要再用气泡喊一声" —— 面板开着就不喊，否则一条显示两遍
+  try { @{ voice = [bool]$script:pvoice; open = [bool]$script:popen } | ConvertTo-Json -Compress | Set-Content $PSTATE -Encoding UTF8 } catch { }
 }
 function Load-PanelState {
   try {
@@ -122,6 +126,24 @@ function Panel-Post([string]$text) {
 }
 function Panel-Reply([string]$id) { return Invoke-RestMethod -Uri "$BRIDGE/reply?id=$id" -TimeoutSec 15 }
 function Panel-History([int]$n) { return @(Invoke-RestMethod -Uri "$BRIDGE/history?n=$n" -TimeoutSec 15) }
+function Panel-Outbox([int]$since) { return Invoke-RestMethod -Uri "$BRIDGE/outbox?since=$since" -TimeoutSec 8 }
+
+# 她主动发来的（后台 agent 跑完的结果就走这条）。
+# 面板关着的时候不取 —— 攒在 bridge 那边，下次打开先读历史、再把游标推到最新，一条只显示一次。
+function Poll-PanelOutbox {
+  if (-not (Test-PanelOpen)) { return }
+  try {
+    $r = Panel-Outbox $script:pout
+    if ($null -eq $r -or $null -eq $r.items) { return }
+    foreach ($m in @($r.items)) {
+      if ($null -eq $m) { continue }
+      $script:pout = [int]$m.seq
+      Add-PanelMsg 'her' ([string]$m.text) $m.at
+      Update-PanelMood
+      Speak-PanelText ([string]$m.text)
+    }
+  } catch { Trace ('panel outbox failed: ' + $_.Exception.Message) }
+}
 
 # 圆形头像：不用额外素材，把 avatar.png 裁成圆。缓存住，每条消息复用同一张位图。
 function Get-PanelAvatar([int]$size) {
@@ -456,6 +478,8 @@ function Load-PanelHistory {
     Trace ('panel history failed: ' + $_.Exception.Message)
     Add-PanelMsg 'her' '（连不上她：bridge 没起来）'
   }
+  # 历史里已经有的，就当"已经收到过"：把游标推到现在，免得 outbox 再把它们显示一遍
+  try { $script:pout = [int](Panel-Outbox 0).max } catch { }
 }
 
 function Set-PanelTip([string]$t) { if ($script:ptip) { $script:ptip.Text = $t } }
@@ -867,6 +891,7 @@ function Initialize-Panel {
   $t.Add_Tick({
       $script:ptick = $script:ptick + 1
       if (($script:ptick % 10) -eq 0) { Poll-PanelWelcome }
+      if (($script:ptick % 50) -eq 0) { Poll-PanelOutbox }
       if (-not $script:pwaiting -or -not $script:ppending) { return }
       if (($script:ptick % 10) -ne 0) { return }
       try {
@@ -961,6 +986,7 @@ function Show-Panel {
 
   $script:pform.Show()
   $script:popen = $true
+  Save-PanelState          # 告诉 bridge「面板开着」——它就不再用气泡喊一遍
   if ($null -ne $fish) { $fish.Hide() }
   $script:pform.Activate()
   $script:pform.BringToFront()
@@ -1020,6 +1046,7 @@ function Hide-Panel {
   Trace 'panel: hide called'
   if (-not $script:pform -or -not $script:popen) { return }
   $script:popen = $false
+  Save-PanelState          # 面板收了：结果改成走鱼头顶的气泡
   if ($script:panim) { try { $script:panim.Stop(); $script:panim.Dispose() } catch { }; $script:panim = $null }
   if ($script:pwrap) { $script:pwrap.Visible = $true }   # 动画中途收起过的话，别把消息区留在隐藏状态
   try { $script:pform.Opacity = 1.0 } catch { }        # 淡入被打断的话别把面板留在半透明

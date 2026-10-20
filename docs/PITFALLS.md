@@ -83,3 +83,37 @@ Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddH
 
 逐帧改窗口大小会每帧重排子控件（卡）、新露出的区域先画黑底（黑框）、上一层留下的气泡被挤成一条（绿框）。
 正确做法：**一次摆到最终尺寸，只改 Region 一点点揭开**，再叠一个淡入。
+
+## 9. `dsh headless` 里账号登录用不了（要用一次性的 overlay）
+
+`dsh --profile headless "任务"` 是最省事的"后台 agent"：一次跑完就退出，stdout 就是结果。
+但 headless 的基线层把 `authorization` / `credentials` / `deepseek-account` **三个服务关掉了**，
+所以走账号登录（而不是 API key）的机器会直接失败：
+
+```
+dsh: warning: 1 entry did not activate
+deepseek-account (...): pending (waiting for service: authorization)
+dsh: ACCOUNT_SIGN_IN_REQUIRED: Sign in to DeepSeek to use the account provider.
+```
+
+**不用改自己的 profile**，每次带一份 overlay 把三个服务打开就行（`--patch` 只作用于这一次）：
+
+```yaml
+- id: authorization
+  name: '@deepseek-ai/dsh-authorization'
+  disabled: false
+- id: credentials
+  name: '@deepseek-ai/dsh-credentials-local'
+  disabled: false
+- id: deepseek-account
+  name: '@deepseek-ai/dsh-deepseek-account-platform'
+  disabled: false
+```
+
+```powershell
+dsh --profile headless --patch .\agent-overlay.yml "把这件事办掉"   # 任务也可以从 stdin 读：结尾写 -
+```
+
+⚠️ 还有两个小坑：① 任务文本**别拼进命令行**，走 stdin（结尾的 `-`）最稳；
+② 成功时 stdout 里会混进 `[llm-deepseek-account] model listing …` 这类诊断行，贴给人之前要滤掉。
+

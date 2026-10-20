@@ -20,7 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dns from 'node:dns';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 
 dns.setDefaultResultOrder('ipv4first'); // 这台机器先解析到 IPv6 会挂住（心跳里踩过）
 
@@ -36,6 +36,9 @@ const LOGDIR = path.join(ROOT, '_ledger-log');
 const LEDGER = path.join(ROOT, 'LEDGER.md');
 const CONTROL = path.join(ROOT, 'dafeiyu', 'tools', 'control.ps1');
 const ACT = path.join(ROOT, 'dafeiyu', 'pet', 'activity.json');
+const PSTATE = path.join(ROOT, 'dafeiyu', 'pet', 'panel-state.json');
+const AGENT_OVERLAY = path.join(DESK, 'agent-overlay.yml');
+const AGENT_TIMEOUT = (Number(process.env.DAFEIYU_AGENT_TIMEOUT_SEC) || 600) * 1000;
 const KEY = fs.readFileSync(path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'siliconflow-key.txt'), 'utf8').trim();
 const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
 const PORT = 3079;
@@ -67,6 +70,92 @@ function history(n) {
 function append(o) { fs.appendFileSync(HIST, JSON.stringify(o) + '\n'); }
 function traceAction(line) {
   try { fs.appendFileSync(ACTIONS, new Date().toISOString() + '  ' + line + '\n'); } catch { }
+}
+
+// ---------------------------------------------------------------- 后台 agent
+// 浮窗办不了的事，交给后台那个完整的 agent：走 dsh 自己的 headless 通道，
+// 一次跑完就退出，stdout 就是结果，不用第二个常驻进程。
+// ⚠️ headless 的基线层把 authorization / credentials / deepseek-account 三个服务关掉了，
+//    账号登录这条路就认不到凭据（报 ACCOUNT_SIGN_IN_REQUIRED）。所以每次跑都带一份
+//    overlay 把它们打开 —— 不写进你的 profile，只作用于这一次。用 API key 的人不受影响。
+const AGENT_OVERLAY_TEXT = [
+  '- id: authorization',
+  "  name: '@deepseek-ai/dsh-authorization'",
+  '  disabled: false',
+  '- id: credentials',
+  "  name: '@deepseek-ai/dsh-credentials-local'",
+  '  disabled: false',
+  '- id: deepseek-account',
+  "  name: '@deepseek-ai/dsh-deepseek-account-platform'",
+  '  disabled: false',
+  '',
+].join('\n');
+
+/** dsh 的入口：优先直接跑它那个 bin.js（不过 shell，省掉一堆引号麻烦）。 */
+function dshCommand() {
+  const appdata = process.env.APPDATA || '';
+  const bin = path.join(appdata, 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+  if (appdata && fs.existsSync(bin)) return { cmd: process.execPath, args: [bin], shell: false };
+  return { cmd: 'dsh', args: [], shell: true };
+}
+
+const outbox = [];
+let outseq = 0;
+
+/** 面板开着没有 —— 关着的时候才用气泡喊一声，否则同一条会在面板里显示两遍。 */
+function panelOpen() {
+  try { return !!JSON.parse(readIf(PSTATE) || '{}').open; } catch { return false; }
+}
+
+/** 主动发一条（不是对某句话的回复）：进面板的待收队列，同时记进历史。
+ *  面板靠 /outbox 轮询取；面板关着就攒着，下次打开再收。bubble 是鱼头顶那句短话。 */
+function emit(text, bubble) {
+  const t = String(text || '').trim();
+  if (!t) return;
+  outseq++;
+  outbox.push({ seq: outseq, text: t, at: Date.now() });
+  while (outbox.length > 40) outbox.shift();
+  append({ role: 'assistant', text: t, at: Date.now() });
+  traceAction('emit: ' + t.slice(0, 120));
+  if (bubble && !panelOpen()) say(bubble);
+}
+
+/** 把任务交给 headless 的完整 agent：任务走 stdin（用 - 让它从 stdin 读），结果从 stdout 拿。 */
+function runAgent(task, why) {
+  return new Promise((resolve) => {
+    try { fs.writeFileSync(AGENT_OVERLAY, AGENT_OVERLAY_TEXT, 'utf8'); } catch { }
+    const d = dshCommand();
+    const args = [...d.args, '--profile', 'headless', '--patch', AGENT_OVERLAY, '-'];
+    traceAction('agent start (' + (why || '没写原因') + '): ' + String(task).slice(0, 200));
+    let out = '', err = '', done = false, killer = null;
+    const finish = (r) => { if (!done) { done = true; if (killer) clearTimeout(killer); resolve(r); } };
+    let child;
+    try {
+      child = spawn(d.cmd, args, { cwd: ROOT, windowsHide: true, shell: d.shell, env: process.env });
+    } catch (e) {
+      return resolve({ ok: false, text: '起不来：' + (e?.message || String(e)) });
+    }
+    killer = setTimeout(() => {
+      try { child.kill(); } catch { }
+      finish({ ok: false, text: '超过 ' + Math.round(AGENT_TIMEOUT / 60000) + ' 分钟还没跑完，我把它掐了。' });
+    }, AGENT_TIMEOUT);
+    child.stdout?.on('data', b => { out += b; });
+    child.stderr?.on('data', b => { err += b; });
+    child.on('error', e => finish({ ok: false, text: '起不来：' + (e?.message || String(e)) }));
+    child.on('close', (code) => {
+      const clean = s => String(s || '').replace(/\u001b\[[0-9;]*m/g, '').trim();
+      // 插件会往 stdout 打诊断行，那是给日志看的，不该出现在她的回话里。
+      const strip = s => s.split('\n')
+        .filter(l => !/^\[llm-[a-z-]+\]/.test(l))
+        .filter(l => !/^dsh: warning: \d+ entry did not activate/.test(l))
+        .join('\n').trim();
+      const o = clean(out), e = clean(err);
+      traceAction('agent done: code=' + code + ' out=' + o.length + ' err=' + e.length);
+      if (code === 0 && o) return finish({ ok: true, text: strip(o) || o });
+      finish({ ok: false, text: [o, e].filter(Boolean).join('\n---\n') || ('退出码 ' + code + '，什么都没输出') });
+    });
+    try { child.stdin.write(String(task)); child.stdin.end(); } catch { }
+  });
 }
 
 /** 取尾部 n 个字，从行首开始 —— 日志是追加写的，最新的话在末尾。 */
@@ -161,6 +250,12 @@ function systemPrompt() {
     '- 做完简短说一句你做了什么；别说一大段解释。',
     '- 动了别人的东西、或者发现你自己搞错了，直接说，不要遮掩。',
     '',
+    '## 办不了的事，交出去',
+    '有几件事你在这个小窗口里**办不了**：要查资料、要写或改代码、要装插件、要在好几个文件之间对齐、要跑很久。',
+    '这种时候不要硬编、也不要嘴上说"你去弄一下" —— 调 delegate，把任务交给后台那个完整的 agent。',
+    '它会跑完，结果会自动贴回这个面板上（你不在的时候会攒着，等你打开）。',
+    '交出去之后，你就说一句"交出去了，等它回来"，不用替它猜结果。',
+    '',
     '## 记忆索引（摘）',
     idx,
     '',
@@ -237,6 +332,25 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'delegate',
+      description:
+        '把一件你在这个小窗口里办不了的事，交给后台那个完整的 agent：它有全套工具（能装东西、能上网查、'
+        + '能读一大堆文件、能连着改好几处、能跑很久），做完会自己把结果发回到面板上。'
+        + '什么时候用：要查资料、要写或改代码、要装插件、要在好几个文件之间对齐、或者你估摸着得动手五步以上。'
+        + '任务里要写清三件：做什么、做到什么算完、东西放哪（它看不到我们这段对话，得自带上下文）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: '给后台 agent 的完整任务说明' },
+          why: { type: 'string', description: '一句话：为什么这件事你在浮窗里办不了' },
+        },
+        required: ['task'],
+      },
+    },
+  },
 ];
 
 function clip(s, n = 6000) {
@@ -309,6 +423,22 @@ async function runTool(name, rawArgs) {
       fs.mkdirSync(path.dirname(p), { recursive: true });
       fs.writeFileSync(p, String(args.content ?? ''), 'utf8');
       return '写好了：' + p + '（' + String(args.content ?? '').length + ' 字）';
+    }
+    case 'delegate': {
+      const task = String(args.task || '').trim();
+      if (!task) return '要交给后台的任务是空的。';
+      const why = String(args.why || '').trim();
+      // 不 await：她要立刻回一句，后台跑完自己再发一条进来（走 emit → /outbox）
+      (async () => {
+        activity('acting', '后台 agent');
+        const r = await runAgent(task, why);
+        activity('idle', '');
+        emit(
+          (r.ok ? '（后台回来了）\n' : '（后台没跑成）\n') + clip(r.text, r.ok ? 1400 : 900),
+          r.ok ? '后台弄完了，看面板' : '后台没跑成，看面板',
+        );
+      })();
+      return '已经交给后台了。它有自己的全套工具，一般几分钟；弄完我直接把结果贴到这儿 —— 你先去忙别的。';
     }
     default:
       return '没有这个工具：' + name;
@@ -400,6 +530,12 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/history') {
     const n = Number(url.searchParams.get('n') || 40);
     return json(200, history(n));
+  }
+
+  // 面板每两秒来问一次：有没有她主动发来的话（后台跑完的结果就走这儿）
+  if (url.pathname === '/outbox') {
+    const since = Number(url.searchParams.get('since') || 0);
+    return json(200, { items: outbox.filter(m => m.seq > since), max: outseq });
   }
 
   if (url.pathname === '/reply') {
