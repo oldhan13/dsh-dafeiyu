@@ -85,7 +85,7 @@ dsh plugin --profile web add dsh-onebot-qq
 装 [NapCat](https://napcat.napneko.icu/)，用**一个小号**登录（别拿主号），然后：
 
 - 反向 WebSocket 指向 `ws://127.0.0.1:8643`
-- HTTP 服务开在 `3000`（`start-dafeiyu.cmd` 靠它判断"她在不在线"）
+- HTTP 服务开在 `3000`（`dafeiyu.cmd` 靠它判断"她在不在线"）
 - access token 填一个你自己编的字符串，**同时**写进 `%USERPROFILE%\.dsh\onebot-token.txt`
 
 ### 4.3 补丁：改三个占位符
@@ -108,17 +108,15 @@ notepad "$env:USERPROFILE\.dsh\profiles\web\cordis.patch.dafeiyu.sample.yml"
 
 **做完这步你应该看到**：QQ 给那个小号发一句话，几秒后有回复；`netstat -ano | findstr 8643` 有一条 ESTABLISHED。
 
-## 5. 启动：两个窗口
+## 5. 启动：一个入口
 
 ```powershell
-# 窗口 A —— 宿主。它会一直占着，别关
-.\start-dsh-web.cmd
-
-# 窗口 B —— 她。跑完就可以关掉这个窗口
-.\start-dafeiyu.cmd
+.\dafeiyu.cmd
 ```
 
-`start-dafeiyu.cmd` 会**缺什么补什么**，已经活着的不重复起。它管这几样：
+也可以直接**双击**仓库根目录的 `dafeiyu.cmd`，效果一样。
+它的原则只有一条：**缺什么补什么** —— 宿主没起就自己起（不开窗口），然后补齐后面所有东西；
+已经活着的一律不重复起（重复起宿主会 `EADDRINUSE` 当场自杀）。
 
 | 它拉起的 | 端口 | 干什么 |
 |---|---|---|
@@ -131,15 +129,25 @@ notepad "$env:USERPROFILE\.dsh\profiles\web\cordis.patch.dafeiyu.sample.yml"
 | 她的主页 `serve.mjs` | `3077` | `http://127.0.0.1:3077/` |
 | 台账瘦身（计划任务） | — | 每 30 分钟把台账压回预算内、重写开场简报 |
 
-也可以只问不干：
+三种用法：
 
 ```powershell
-.\start-dafeiyu.cmd -Status      # 现在谁活着
-.\start-dafeiyu.cmd -NoHost      # 宿主你自己开着，别动它
+.\dafeiyu.cmd            # 一键（或者直接双击）
+.\dafeiyu.cmd -Status    # 只看看谁活着 —— 这条一个字节都不写
+.\dafeiyu.cmd -Open      # 起来之后顺便把网页界面打开
 ```
 
-**做完这步你应该看到**：末尾那张 `=== 现在 ===` 里，`宿主` / `桌宠` / `循环` / `主页` 都是好的，
-退出码是 0（缺东西会是 1，方便快捷方式判断）。
+宿主现在**不开窗口**了，日志在 `%USERPROFILE%\.dsh\logs\`。
+真要盯着它看（调插件、看它启动时报什么错），换成手动两步：
+
+```powershell
+.\start-dsh-web.cmd           # 窗口 A：宿主，会一直占着
+.\start-dafeiyu.cmd -NoHost   # 窗口 B：其余全部（-NoHost = 别碰宿主）
+```
+
+**做完这步你应该看到**：末尾那张 `=== 现在 ===` 里，`宿主` / `桌宠` / `循环` / `主页` 都是好的。
+退出码 `0` = 桌面这条线起来了，`1` = 还缺东西 —— 双击入口靠它决定是"关窗口"还是"停住让你看"。
+**QQ 不算在必须项里**：没接 QQ 也算成功。
 
 ## 6. 验收
 
@@ -161,17 +169,17 @@ notepad "$env:USERPROFILE\.dsh\profiles\web\cordis.patch.dafeiyu.sample.yml"
 .\stop-dafeiyu.cmd -Status
 ```
 
-五行都是 `[ok]` 或 `[--]`（`[--]` 表示那个没起，不算错，比如没接 QQ），就不算 `[!!]`。
+六行都是 `[ok]` 或 `[--]`（`[--]` 表示那个没起，不算错 —— 比如没接 QQ、或宿主你自己关掉了），就不算 `[!!]`。
 
 ## 7. 收工、重启
 
 ```powershell
-.\stop-dafeiyu.cmd            # 鱼 + 后台循环全停
-.\stop-dafeiyu.cmd -Status    # 只看，不动
+.\stop-dafeiyu.cmd              # 鱼 + 后台循环全停，宿主留着
+.\stop-dafeiyu.cmd -WithHost    # 连宿主一起停（网页界面 3080 会断）
+.\stop-dafeiyu.cmd -Status      # 只看，不动
 ```
 
-宿主不归它管 —— 那是窗口 A，自己关（`Ctrl+C` 或点叉）。
-改完 profile 或插件、又不想手动关宿主：
+只重启宿主（改完 profile 或插件之后）：
 
 ```powershell
 dafeiyu\tools\restart-host.cmd
@@ -196,7 +204,7 @@ dafeiyu\tools\restart-host.cmd
 ## 9. 拆掉
 
 ```powershell
-.\stop-dafeiyu.cmd                                    # 先停
+.\stop-dafeiyu.cmd -WithHost                          # 先停（连宿主一起）
 schtasks /Delete /TN DaFeiYu-LedgerTidy /F            # 删计划任务（不删会一直跑，找不到文件就报错）
 [Environment]::SetEnvironmentVariable('DAFEIYU_OWNER_QQ', $null, 'User')
 [Environment]::SetEnvironmentVariable('DAFEIYU_BOT_QQ',   $null, 'User')

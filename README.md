@@ -24,7 +24,7 @@ dsh --version    # 要 0.2.x
 $PSVersionTable.PSVersion   # 系统自带 5.1 就行
 ```
 
-然后四条命令：
+然后三条命令（第三条也可以直接**双击**仓库根目录的 `dafeiyu.cmd`）：
 
 ```powershell
 # 1) 放到一个你想当"工作区"的目录。别放在 ~/.dsh 里面（沙箱会拦）
@@ -34,14 +34,14 @@ cd C:\dsh-workspace
 # 2) 检查环境（这一步不装插件，先确认跑得动；两个 QQ 号现在随便填，接 QQ 时才用得上）
 .\install.ps1 -SkipPlugins
 
-# 3) 起宿主。这个窗口会一直占着 —— 别关
-.\start-dsh-web.cmd
-
-# 4) 另开一个 PowerShell，把鱼放出来
-.\start-dafeiyu.cmd
+# 3) 一键：宿主没起就自己起，然后把鱼放出来
+.\dafeiyu.cmd
 ```
 
-**第 4 步会一行一行告诉你它拉起了什么**，末尾是这个样子：
+宿主不开窗口（它自己在后台跑），网页界面还是 `http://127.0.0.1:3080`。
+想盯着它看日志、或者调插件的时候，才需要 `.\start-dsh-web.cmd` 手动开一个窗口。
+
+**第 3 步会一行一行告诉你它拉起了什么**，末尾是这个样子：
 
 ```
 === 现在 ===
@@ -72,11 +72,10 @@ cd C:\dsh-workspace
 **怎么收工**
 
 ```powershell
-.\stop-dafeiyu.cmd            # 鱼 + 后台循环全停
-.\stop-dafeiyu.cmd -Status    # 只看看谁在跑，一个都不动
+.\stop-dafeiyu.cmd              # 鱼 + 后台循环全停，宿主留着
+.\stop-dafeiyu.cmd -WithHost    # 连宿主一起停（网页界面也会断）
+.\stop-dafeiyu.cmd -Status      # 只看看谁在跑，一个都不动
 ```
-
-宿主那个窗口自己关（`Ctrl+C` 或点叉）。它不归上面这条管 —— 宿主停了，整个网页界面也就没了。
 
 ## 它到底会什么
 

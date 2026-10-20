@@ -3,13 +3,14 @@
 
   停这些：主动循环（heartbeat.mjs）、她自己的主页（serve.mjs）、群随听（watch.mjs）、
   桌面那条聊天线（bridge.mjs）、屏幕右下角那只鱼（pet-wf.ps1）。
-  DSH 宿主不归这里管 —— 那是你自己开的窗口，关窗口 / Ctrl+C 就行。
+  DSH 宿主默认**不动** —— 它是网页界面（3080）本身，你可能还在用它。真要把宿主也一起停，加 -WithHost。
 
   用法：
-    .\stop-dafeiyu.cmd            # 停上面这些
-    .\stop-dafeiyu.cmd -Status    # 只看现在谁在跑，一个都不动
+    .\stop-dafeiyu.cmd              # 停上面这些，宿主留着
+    .\stop-dafeiyu.cmd -Status      # 只看现在谁在跑，一个都不动
+    .\stop-dafeiyu.cmd -WithHost    # 连宿主一起停（网页界面也会断）
 #>
-param([switch]$Status)
+param([switch]$Status, [switch]$WithHost)
 
 $ErrorActionPreference = 'Continue'
 function Say($m) { Write-Host $m }
@@ -66,7 +67,31 @@ else {
     }
 }
 
+# 宿主：node 跑 @deepseek-ai/dsh 的 bin 带 web，或者 npx 那层壳。
+# ⚠️ 必须排除 subprocess-local —— 它的命令行里塞着整段 PowerShell 文本，松散匹配会误杀。
+$reHost = '(?i)(?:@deepseek-ai[\\/]dsh[\\/][^\s"]*\.js"?\s+web\s*$)|(?:npx-cli\.js"?\s+@deepseek-ai/dsh\s+web\s*$)'
+$hostProcs = @(Get-Nodes | Where-Object {
+    $_.CommandLine -and $_.CommandLine -notmatch 'subprocess-local' -and $_.CommandLine -match $reHost
+})
+if ($hostProcs.Count -eq 0) {
+    Say '  [--] 宿主：没在跑'
+} elseif ($Status) {
+    Say ("  [ok] 宿主：在跑（pid {0}）" -f ($hostProcs.ProcessId -join ','))
+} elseif (-not $WithHost) {
+    Say ("  [--] 宿主：在跑（pid {0}），这次不动它" -f ($hostProcs.ProcessId -join ','))
+} else {
+    foreach ($x in $hostProcs) {
+        try {
+            Stop-Process -Id $x.ProcessId -Force -ErrorAction Stop
+            Say ("  [ok] 宿主：已停（pid {0}）" -f $x.ProcessId)
+        } catch {
+            Say ("  [!!] 宿主：停不掉 pid {0} —— {1}" -f $x.ProcessId, $_.Exception.Message)
+        }
+    }
+}
+
 Say ''
 if ($Status) { Say '  （-Status：只看了看，什么都没动）' }
-else { Say '  宿主还开着。要全关，把它那个窗口关掉（或 Ctrl+C）。' }
+elseif ($WithHost) { Say '  全停了。' }
+else { Say '  宿主还开着（网页界面 3080 还在）。要连它一起停：-WithHost' }
 Say ''

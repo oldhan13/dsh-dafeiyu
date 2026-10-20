@@ -7,18 +7,20 @@
     3. 后台冲动循环 heartbeat.mjs —— 8~13 分钟醒一次，自己决定发不发（间隔在 heartbeat.mjs 里改）
     4. 她的主页 serve.mjs —— http://127.0.0.1:3077/
 
-  用法：
-    .\start-dafeiyu.cmd            # 全部拉起（缺什么补什么）
-    .\start-dafeiyu.cmd -Status    # 只看现在活着没有，不动任何东西
-    .\start-dafeiyu.cmd -NoHost    # 不动宿主（你自己已经开着 dsh web）
+  用法（两种，效果一样）：
+    双击仓库根目录的 dafeiyu.cmd   ← 一键：宿主没起就自己起，然后把鱼放出来
+    .\start-dafeiyu.cmd            # 同一个东西；-Status 只看不动；-NoHost 不动宿主
+    .\start-dafeiyu.cmd -Open      # 起来之后再帮你把网页界面打开
 
-  关键环境：TMP/TEMP 会在启动宿主前指向 C:\dsh-temp。
-  原因：Windows ACL 沙箱要求 temp root 在 workspace 之外，而默认 tmpdir 落在 <HOME> 里，
-  会让 cwd 在 <HOME> 的会话 shell 起不来（报「temp root 必须在 workspace 之外」）。
+  只有一条原则：**缺什么补什么**。已经活着的一律不重复起 —— 重复起宿主会 EADDRINUSE 当场自杀。
+
+  关于 TMP：宿主交给 start-dsh-web.cmd 起，那个脚本自己把 TMP/TEMP 指到工作区外面
+  （Windows ACL 沙箱要求 temp root 不在 workspace 里，否则会话里的 shell 起不来）。
 #>
 param(
     [switch]$Status,
-    [switch]$NoHost
+    [switch]$NoHost,
+    [switch]$Open
 )
 
 $ErrorActionPreference = 'Continue'
@@ -122,20 +124,29 @@ if ($hostUp) {
     if ((Test-Port 8643) -and (Test-Port 3080)) { Ok '起来了' }
     else { Bad '端口被占着但没起全。别重复启动（会 EADDRINUSE），先查是谁占的。' }
 } elseif ($Status) {
-    Bad '没在运行 —— 用 start-dafeiyu.cmd 拉起来'
+    Bad '没在运行 —— 双击 dafeiyu.cmd（或 .\start-dafeiyu.cmd）拉起来'
 } elseif ($NoHost) {
     Bad '-NoHost 指定不动宿主，但 8643/3080 没在监听'
 } else {
     if (-not (Test-Path $HOST_LAUNCHER)) { Bad "找不到启动器：$HOST_LAUNCHER"; }
     else {
-        Todo '启动宿主（TMP 已指到 C:\dsh-temp；窗口不显示）'
+        Todo '启动宿主（没窗口；TMP 由 start-dsh-web.cmd 指到工作区外）'
         # 必须写成 /c call "<path>"：cmd 会把 /c 后面字符串的首尾引号剥掉，
         # 路径里有空格时命令就散了 —— restart-host.ps1 第一版栽的就是这个（2026-10-19 23:00）。
         # 2026-10-20：改成 Start-Bg —— 原来这行没加 Hidden，dsh web 又是常驻进程，
         # 那个 cmd 窗口会一直挂在桌面/任务栏上，就是他说「挂特别多的 cmd 窗口」的那个。
         Start-Bg ('call "' + $HOST_LAUNCHER + '"') $PROJECT | Out-Null
         [void](Wait-Until { (Test-Port 8643) -and (Test-Port 3080) } 120 '宿主就绪')
-        if (Test-Port 8643) { Ok '宿主已起（8643 在听）' }
+        if ((Test-Port 8643) -and (Test-Port 3080)) {
+            Ok '宿主已起（3080 网页 / 8643 QQ 通道）'
+        } else {
+            # 一键启动最容易卡在这儿，而且窗口是隐藏的 —— 必须给他可执行的下一步，
+            # 别让他对着一行 [!!] 猜。
+            Bad '宿主没起全。八成是 dsh 没装、或 3080/8643 被别的进程占着。'
+            Say '     手动跑一次看真实报错（它会带着窗口跑）：'
+            Say ('       ' + $HOST_LAUNCHER)
+            Say '     看端口是谁占的：netstat -ano | findstr "3080 8643"'
+        }
     }
 }
 
@@ -239,23 +250,33 @@ else {
 # 别改回 S4U / session 0 —— presence.ps1 靠 GetLastInputInfo 判断他在不在键盘前，session 0 会读错。
 $tidyPs   = Join-Path $PSScriptRoot 'ledger-tidy-hidden.ps1'
 $tidyName = 'DaFeiYu-LedgerTidy'
-$exists = $null
-try { $exists = schtasks /Query /TN $tidyName 2>$null } catch { }
-if (-not $exists) {
-    # 先把「每 30 分钟」这个节奏建出来（动作先给个占位，下面立刻换成真的）
-    schtasks /Create /SC MINUTE /MO 30 /TN $tidyName /TR 'powershell.exe -NoProfile -Command exit' /F | Out-Null
-    Say '  [ok] 已注册台账自动瘦身任务（每 30 分钟）'
+
+if ($Status) {
+    # -Status 说好"只看看"，那就一个字节都不写。
+    $tj = $null
+    try { $tj = schtasks /Query /TN $tidyName 2>$null } catch { }
+    if ($tj) { Say '  [ok] 台账瘦身任务：已注册' } else { Say '  [--] 台账瘦身任务：没注册' }
 }
-try {
-    # 用 Set-ScheduledTask 设动作：它能正确给参数里的路径加引号，
-    # 而 schtasks /TR 在路径带空格时会被 PowerShell 的引号处理搞散。
-    $act = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $tidyPs + '"')
-    Set-ScheduledTask -TaskName $tidyName -Action $act | Out-Null
-    Say '  [ok] 任务动作 = 隐藏 PowerShell（不经 wscript，不弹窗）'
-} catch {
-    Say '  [!!] 没能自动设置任务动作。手动把 DaFeiYu-LedgerTidy 的动作改成这一行：'
-    Say ('       powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $tidyPs + '"')
+
+if (-not $Status) {
+    $exists = $null
+    try { $exists = schtasks /Query /TN $tidyName 2>$null } catch { }
+    if (-not $exists) {
+        # 先把「每 30 分钟」这个节奏建出来（动作先给个占位，下面立刻换成真的）
+        schtasks /Create /SC MINUTE /MO 30 /TN $tidyName /TR 'powershell.exe -NoProfile -Command exit' /F | Out-Null
+        Say '  [ok] 已注册台账自动瘦身任务（每 30 分钟）'
+    }
+    try {
+        # 用 Set-ScheduledTask 设动作：它能正确给参数里的路径加引号，
+        # 而 schtasks /TR 在路径带空格时会被 PowerShell 的引号处理搞散。
+        $act = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $tidyPs + '"')
+        Set-ScheduledTask -TaskName $tidyName -Action $act | Out-Null
+        Say '  [ok] 任务动作 = 隐藏 PowerShell（不经 wscript，不弹窗）'
+    } catch {
+        Say '  [!!] 没能自动设置任务动作。手动把 DaFeiYu-LedgerTidy 的动作改成这一行：'
+        Say ('       powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $tidyPs + '"')
+    }
 }
 
 # ---- 汇总 ----
@@ -281,10 +302,17 @@ Say '  网页界面  : http://127.0.0.1:3080'
 Say '  她的主页  : http://127.0.0.1:3077/'
 Say ''
 
+if ($Open -and $host_ok) {
+    try { Start-Process 'http://127.0.0.1:3080' } catch { Say '  [!!] 打不开浏览器，自己点： http://127.0.0.1:3080' }
+}
+
 # 每次跑完留一行摘要 —— 没有它，出问题时只能靠猜（2026-10-19 的教训）。
 $summary = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') +
     ("  host={0} qq={1} loop={2} web={3} group={4} pet={5} desk={6}" -f $host_ok, $qq_ok, $loop_ok, $web_ok, $group_ok, $pet_ok, $desk_ok)
 try { Add-Content -Path (Join-Path $PSScriptRoot 'start-dafeiyu.log') -Value $summary -Encoding UTF8 } catch { }
 
-# 退出码就是健康度：0 = 四件套都在，1 = 还缺东西（方便脚本/快捷方式判断）
-if ($host_ok -and $qq_ok -and $loop_ok -and $web_ok) { exit 0 } else { exit 1 }
+# 退出码就是健康度（0 = 起来了，1 = 还缺东西）——双击入口靠它决定"关窗口还是停住让你看"。
+# 只算**桌面这条线**：宿主 + 循环 + 主页 + 桌面桥 + 鱼。
+# ⚠️ 不要把 QQ 算进必须项：没接 QQ 的人，一键启动会永远判失败，窗口每次都停下来。
+$core_ok = $host_ok -and $loop_ok -and $web_ok -and $desk_ok -and $pet_ok
+if ($core_ok) { exit 0 } else { exit 1 }
