@@ -149,6 +149,13 @@ notepad "$env:USERPROFILE\.dsh\profiles\web\cordis.patch.dafeiyu.sample.yml"
 退出码 `0` = 桌面这条线起来了，`1` = 还缺东西 —— 双击入口靠它决定是"关窗口"还是"停住让你看"。
 **QQ 不算在必须项里**：没接 QQ 也算成功。
 
+### 换模型（一行）
+
+桌面面板和主动循环各有一行 `const MODEL = ...`（`dafeiyu/desk/bridge.mjs`、`dafeiyu/heartbeat/heartbeat.mjs`），
+改完要重启那两个进程才生效。挑的时候只看一件事：**它支不支持 function calling** ——
+她的"手"（跑命令、读写文件、发消息）全挂在这上面，不支持的模型会变成只能说、不能动。
+当前用的是 `deepseek-ai/DeepSeek-V4.1-Flash`。
+
 ## 6. 验收
 
 按顺序过一遍，每步都该有反应：

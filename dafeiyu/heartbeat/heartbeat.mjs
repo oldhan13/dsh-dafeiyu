@@ -33,7 +33,7 @@ const ONEBOT = fs.readFileSync(path.join(process.env.USERPROFILE || process.env.
 const OWNER = Number(OWNER_QQ || 0);
 /** 我自己的号。用来把「我发的」和「对方发的」分开 —— 判断未读全靠它。 */
 const SELF = Number(process.env.DAFEIYU_BOT_QQ || 0);
-const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
+const MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash';   // 和面板那条线保持一致
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;

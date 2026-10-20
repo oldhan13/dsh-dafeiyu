@@ -40,7 +40,7 @@ const PSTATE = path.join(ROOT, 'dafeiyu', 'pet', 'panel-state.json');
 const AGENT_OVERLAY = path.join(DESK, 'agent-overlay.yml');
 const AGENT_TIMEOUT = (Number(process.env.DAFEIYU_AGENT_TIMEOUT_SEC) || 600) * 1000;
 const KEY = fs.readFileSync(path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'siliconflow-key.txt'), 'utf8').trim();
-const MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
+const MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash';   // 换模型就改这一行；4.1 也支持 function calling（实测）
 const PORT = 3079;
 /** 一次回复里最多动手几步 —— 再多的活儿她会扯太久，也该让他插一句。 */
 const MAX_STEPS = 10;
