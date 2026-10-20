@@ -57,7 +57,7 @@ DSH 里每一处说话都是一个独立会话（QQ 每人一条、网页一条�
 
 ```powershell
 # 1) 把这份仓库放到你想当工作区的地方
-git clone https://github.com/c1overzz/dsh-dafeiyu.git my-workspace
+git clone https://github.com/oldhan13/dsh-dafeiyu.git my-workspace
 cd my-workspace
 
 # 2) 设两个身份（QQ 相关的部件才需要）
@@ -81,7 +81,7 @@ setx DAFEIYU_BOT_QQ   "机器人的QQ号"
 
 | 部件 | 装法 | 说明 |
 |---|---|---|
-| **刷 B站** | `dsh plugin --profile web add github:c1overzz/dsh-bili-scroll` | 独立插件：每天谷时自己刷一轮、读字幕、写日报。[仓库](https://github.com/c1overzz/dsh-bili-scroll) |
+| **刷 B站** | `dsh plugin --profile web add github:c1overzz/dsh-bili-scroll` | **另一位开发者**（[c1overzz](https://github.com/c1overzz)）的独立插件：谷时自己刷一轮、读字幕、写日报。[仓库](https://github.com/c1overzz/dsh-bili-scroll) |
 | 语音输入 | `dsh plugin --profile web add dsh-voice-chat` | 浏览器麦克风 + 自动朗读 |
 
 ## 这个仓库里**没有**什么
@@ -96,11 +96,31 @@ setx DAFEIYU_BOT_QQ   "机器人的QQ号"
 zstd 多帧会话日志只解第一帧、Windows 11 拿 VBScript 弹弃用提示、`/api` 的浏览器信任校验。
 照抄这份代码之前先看一眼，能少走两天弯路。
 
+## 各家的长处
+
+这一套不是一件东西，是几件**各有所长**的东西接在一起。写清楚谁擅长什么，才知道哪天该换掉哪一块。
+
+| 东西 | 谁做的 | 它擅长什么 | 在这儿干什么 |
+|---|---|---|---|
+| **大肥鱼**（本仓库） | oldhan13 | 把「身体 / 记性 / 主动性」接起来，落到桌面上：会动、会自己开口、记得住事 | 就是那层胶水 —— 下面每一样单拎出来都比它硬，但它让这些一起活起来 |
+| **DSH**（DeepSeek Harness） | DeepSeek | 会话、工具、插件机制（cordis）、网页界面 | 地基。上面每一块都挂在它身上 |
+| **dsh-ledger-memory** | 陈黛华 | 项目级记忆：台账每回合自动注入、决策卡、经验教训，**压缩前抓逐字胶囊、压完还能按指针回查原文**，跨会话交接单 | 她的记性，和"不丢原话"的底 |
+| **dsh-onebot-qq** | mario841859784 | 一条真的 QQ 通道：OneBot 11 / NapCat，私聊群聊、图与语音、长文转图卡、设置页里配 | QQ 那条线。本仓库**一行协议代码都没写** —— 全是它的 |
+| **dsh-bili-scroll** | c1overzz | 自己刷 B 站：按字幕原文挑、写日报、值得的 @ 你，谷时自动跑 | 可选。本仓库只"提一句"，没包含它 |
+| **dsh-voice-chat** | maoyuching | 浏览器里说和听：麦克风 → 文字 → 回复自动朗读，TTS 后端可换 | 可选，网页那边的嘴 |
+| **@lijian-ui/dsh-im-gateway** | lijian-ui | 一个网关接五种 IM（钉钉 / QQ / 个人微信 / 飞书 / 企微），扫码绑定、流式回复 | 可选。要多通道时，比逐个接划算 |
+| **dsh-context** | bowenliang123 | 上下文透视：看清上下文由什么组成、怎么长起来的 | 可选，调上下文时看 |
+| **billion-context** | ranxianglei | 把长会话压进小窗口 | 可选，和上面那件二选一 |
+
+一句话：**本仓库只做"把它们串成一个活着的东西"这一件事。** 每一样的长处都在它自己那边，不在我这儿 ——
+哪天哪块不够用了，换掉它，剩下的照样转。
+
 ## 别人的东西
 
 这个仓库的代码是自己写的，但**跑起来靠的是别人做的零件**。每一处"用到别人仓库"的地方都列在
-**[CREDITS.md](CREDITS.md)** 里：宿主（DSH）、四个 DSH 插件（`dsh-ledger-memory` / `dsh-onebot-qq` /
-`dsh-voice-chat` / `dsh-im-gateway`）、NapCat、SiliconFlow、QQ、B 站。
+**[CREDITS.md](CREDITS.md)** 里：宿主（DSH）、六个 DSH 插件（`dsh-ledger-memory` / `dsh-onebot-qq` /
+`dsh-voice-chat` / `dsh-im-gateway` / `dsh-context` / `billion-context`）、另一位开发者的可选插件
+`dsh-bili-scroll`，以及 NapCat、SiliconFlow、QQ、B 站这些外部程序与服务。
 
 一句话：**没有 vendor 任何第三方源码，也没有 fork 后改**。第三方都是"装上去用的"，不是"抄进来的"。
 `dsh-onebot-qq` 是 BSD-3-Clause —— 两个测试文件会直接 import 它的模块，那条保留版权声明的义务对它成立。

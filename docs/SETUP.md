@@ -16,7 +16,7 @@
 ## 1. 放到工作区
 
 ```powershell
-git clone https://github.com/c1overzz/dsh-dafeiyu.git C:\Users\<你>\dsh-workspace
+git clone https://github.com/oldhan13/dsh-dafeiyu.git C:\Users\<你>\dsh-workspace
 cd C:\Users\<你>\dsh-workspace
 ```
 
@@ -48,7 +48,7 @@ dsh plugin --profile web add dsh-onebot-qq      # 只在要接 QQ 时
 dsh plugin --profile web add dsh-voice-chat     # 可选：浏览器麦克风 + 朗读
 ```
 
-刷 B 站是**可选**的独立插件：
+刷 B 站是**可选**的独立插件，作者是另一位开发者 c1overzz（和本仓库不是同一个人）：
 
 ```powershell
 dsh plugin --profile web add github:c1overzz/dsh-bili-scroll
