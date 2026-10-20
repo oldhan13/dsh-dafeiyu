@@ -38,6 +38,30 @@ const KNOWN = {
   },
 };
 
+// ---- 超时与重试（2026-10-21 他说的「刚刚卡住了，加一下超时重试吧」）----
+// 以前 chat() 里一个上限都没有：一次挂住的 fetch 会让面板永远停在「在想」、
+// 心跳那条 line 一直吊着（undici 自带的 headersTimeout 是 5 分钟，等于没救）。
+// 现在每次请求 45 秒封顶；网络 / 超时 / 5xx / 429 再给一次机会（退避 1.2 秒），
+// key 错和余额不足**不重试** —— 那两种错再试三遍也是一样的结果，只会让他多等。
+const TIMEOUT_MS = Number(process.env.DAFEIYU_LLM_TIMEOUT_SEC || 45) * 1000;
+const RETRIES_RAW = process.env.DAFEIYU_LLM_RETRIES;
+const RETRIES = RETRIES_RAW === undefined || RETRIES_RAW === '' ? 1 : Math.max(0, Number(RETRIES_RAW) || 0);
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** 1500 → "1.5"，45000 → "45"（别把 1.5 秒说成 2 秒） */
+const secOf = (ms) => String(Math.round(ms / 100) / 10);
+
+/** 这个错值不值得再试一次。 */
+function retryable(e) {
+  const m = String((e && e.message) || e || '');
+  if (/^(NOKEY|KEY|BALANCE):/.test(m)) return false;   // 换 key / 充钱才行，重试没意义
+  if (/^RATE:/.test(m)) return true;                    // 限流，等一下可能就通
+  if (/^(TIMEOUT|NET):/.test(m)) return true;           // 网络抖动
+  if (/^http 5\d\d/.test(m)) return true;               // 服务端自己出问题
+  return false;
+}
+
 function expandHome(p) {
   const s = String(p || '');
   if (s === '~') return os.homedir();
@@ -97,9 +121,44 @@ function mapError(status, j) {
   return new Error('http ' + status + ' ' + JSON.stringify(j).slice(0, 200));
 }
 
+/** 一次请求，带硬超时。调用方给的 signal 和超时用 AbortSignal.any 合成一个。 */
+async function requestOnce(c, body, timeoutMs, outer) {
+  const to = AbortSignal.timeout(timeoutMs);
+  const signal = outer ? AbortSignal.any([outer, to]) : to;
+  let r;
+  try {
+    r = await fetch(c.baseUrl + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + c.apiKey },
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (e) {
+    if (outer && outer.aborted) throw e;      // 外层自己掐的（心跳到点了），原样往外抛
+    if (to.aborted) {
+      throw new Error('TIMEOUT: ' + secOf(timeoutMs) + ' 秒没等到 ' + c.label +
+        ' 回话（网络卡住，或那边在排队）');
+    }
+    throw new Error('NET: 连不上 ' + c.label + '（' + String((e && e.message) || e).slice(0, 160) + '）');
+  }
+  let j = {};
+  try {
+    j = await r.json();
+  } catch (e) {
+    // 回话读到一半断了：也按超时算，不然会掉进下面那个「empty message」里，看不出是网络问题
+    if (to.aborted) throw new Error('TIMEOUT: ' + secOf(timeoutMs) + ' 秒只等到半截回话，断了');
+    j = {};
+  }
+  if (!r.ok) throw mapError(r.status, j);
+  const msg = j?.choices?.[0]?.message;
+  if (!msg) throw new Error('empty message ' + JSON.stringify(j).slice(0, 200));
+  return msg;
+}
+
 /**
  * 调一次模型，返回原始 message（含 content / tool_calls）。
- * opts: { tools, temperature, maxTokens, signal }
+ * opts: { tools, temperature, maxTokens, signal, timeoutMs, retries }
+ * 值得再试的错最多试 1 + retries 次（默认 1 次）；key / 余额那种立刻抛，别让他白等。
  */
 export async function chat(messages, opts = {}) {
   const c = llmConfig();
@@ -117,17 +176,22 @@ export async function chat(messages, opts = {}) {
     body.tools = opts.tools;
     body.tool_choice = 'auto';
   }
-  const r = await fetch(c.baseUrl + '/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + c.apiKey },
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw mapError(r.status, j);
-  const msg = j?.choices?.[0]?.message;
-  if (!msg) throw new Error('empty message ' + JSON.stringify(j).slice(0, 200));
-  return msg;
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : TIMEOUT_MS;
+  const tries = opts.retries === undefined ? RETRIES : Math.max(0, Number(opts.retries) || 0);
+
+  let last;
+  for (let i = 0; i <= tries; i++) {
+    // 外层已经掐了就别再起新请求 —— 心跳到点的时候这一条最要紧
+    if (opts.signal && opts.signal.aborted) throw opts.signal.reason || new Error('aborted');
+    try {
+      return await requestOnce(c, body, timeoutMs, opts.signal);
+    } catch (e) {
+      last = e;
+      if (i >= tries || !retryable(e)) throw e;
+      await sleep(1200 * (i + 1));
+    }
+  }
+  throw last;
 }
 
 /** 给人看的一行状态（面板启动时打一次，省得又猜「现在用的是哪家」）。 */
@@ -140,5 +204,7 @@ export function llmSummary() {
     baseUrl: c.baseUrl,
     hasKey: !!c.apiKey,
     keyFile: c.keyFile,
+    timeoutSec: Math.round(TIMEOUT_MS / 1000),
+    retries: RETRIES,
   };
 }

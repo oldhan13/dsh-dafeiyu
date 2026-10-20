@@ -47,7 +47,8 @@ const PORT = 3079;
 // 起来时打一行：现在用的是哪家、哪个模型、key 有没有 —— 免得以后再靠猜。
 try {
   const s = llmSummary();
-  console.log('[llm] ' + s.label + ' · ' + s.model + ' · ' + (s.hasKey ? 'key ok' : 'NO KEY (' + s.keyFile + ')'));
+  console.log('[llm] ' + s.label + ' · ' + s.model + ' · ' + (s.hasKey ? 'key ok' : 'NO KEY (' + s.keyFile + ')') +
+    ' · timeout ' + s.timeoutSec + 's x' + (s.retries + 1));
 } catch { }
 /** 一次回复里最多动手几步 —— 再多的活儿她会扯太久，也该让他插一句。 */
 const MAX_STEPS = 10;
@@ -604,14 +605,19 @@ const server = http.createServer((req, res) => {
         if (!quiet) say(reply);
         jobs.set(id, { status: 'done', text: reply });
       } catch (err) {
-        const raw = String(err && err.message ? err.message : err);
+        const reason = String(err && err.message ? err.message : err);
+        // 前缀契约跟着 lib/llm.mjs 的 mapError 走：BALANCE / KEY / RATE 后面都带冒号和细节。
+        // 以前这里判的是 raw === 'BALANCE'，而 llm.mjs 返回的是 'BALANCE: <家名>…'
+        // ⇒ 余额不足会被显示成「我这边卡住了」，2026-10-21 顺手修掉。
         const msg =
-          raw === 'BALANCE' ? '（我这边账户没钱了 —— 模型余额不足，回不了话。充上就好，别的一句都没丢）' :
-          raw.startsWith('KEY:') ? '（key 不对：' + raw.slice(4).trim() + '）' :
-          raw.startsWith('RATE:') ? '（被限流了：' + raw.slice(5).trim() + '）' :
-          '（我这边卡住了：' + raw.slice(0, 200) + '）';
+          reason.startsWith('BALANCE:') ? '（我这边账户没钱了 —— ' + reason.slice(9).trim() + '。充上就好，别的一句都没丢）' :
+          reason.startsWith('KEY:') ? '（key 不对：' + reason.slice(4).trim() + '）' :
+          reason.startsWith('RATE:') ? '（被限流了：' + reason.slice(5).trim() + '）' :
+          reason.startsWith('TIMEOUT:') ? '（等太久没回音了：' + reason.slice(8).trim() + '。你再说一句，我重来）' :
+          reason.startsWith('NET:') ? '（网络没通：' + reason.slice(4).trim() + '。你再说一句，我重来）' :
+          '（我这边出错了：' + reason.slice(0, 200) + '）';
         traceAction('error: ' + msg);
-        activity('error', raw === 'BALANCE' ? '余额不足' : raw.slice(0, 60));
+        activity('error', reason.startsWith('BALANCE:') ? '余额不足' : reason.slice(0, 60));
         jobs.set(id, { status: 'error', text: msg });
       }
     });
