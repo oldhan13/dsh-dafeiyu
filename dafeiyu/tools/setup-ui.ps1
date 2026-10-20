@@ -22,6 +22,8 @@ param(
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+# PS 5.1 默认协议可能还停在 TLS 1.0，测 key 的 https 请求要 1.2
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
 $ErrorActionPreference = 'Continue'
 $PROJECT = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # dafeiyu\tools -> 项目根
@@ -48,7 +50,7 @@ $fMono  = New-Object System.Drawing.Font('Consolas', 9)
 # ---------- 窗 ----------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '大肥鱼 · 部署'
-$form.Size = New-Object System.Drawing.Size(860, 720)
+$form.Size = New-Object System.Drawing.Size(860, 856)
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $BG
 $form.FormBorderStyle = 'FixedSingle'
@@ -149,9 +151,38 @@ $c2.Controls.Add($chkVoice)
 New-Label $c2 '两个号只写在本机 dafeiyu\state\machine.json（.gitignore 挡着），不会进 git。' 14 146 370 32 $fSub $MUTED | Out-Null
 $btnInstall = New-Button $c2 '开始安装' 14 182 120 -Primary
 
-# ---- 卡片 3：状态 + 日志 ----
-$c3 = New-Card 24 310 812 250
-New-Label $c3 '③ 起没起来' 14 10 200 22 $fH $INK | Out-Null
+# ---- 卡片 3：模型 key（桌面这条线是独立进程，要自己的 key） ----
+$ck = New-Card 24 310 812 150
+New-Label $ck '③ 模型 key —— 她说话要用的' 14 10 340 22 $fH $INK | Out-Null
+New-Label $ck '供应商' 14 40 80 18 $fSub $MUTED | Out-Null
+
+$comboProv = New-Object System.Windows.Forms.ComboBox
+$comboProv.Location = New-Object System.Drawing.Point(14, 60)
+$comboProv.Size = New-Object System.Drawing.Size(190, 26)
+$comboProv.DropDownStyle = 'DropDownList'
+$comboProv.Font = $fBody
+[void]$comboProv.Items.Add('DeepSeek 官方（推荐）')
+[void]$comboProv.Items.Add('硅基流动 SiliconFlow')
+$comboProv.SelectedIndex = 0
+$ck.Controls.Add($comboProv)
+
+New-Label $ck 'API key（贴进来，不回显）' 216 40 240 18 $fSub $MUTED | Out-Null
+$txtKey = New-Object System.Windows.Forms.TextBox
+$txtKey.Location = New-Object System.Drawing.Point(216, 60)
+$txtKey.Size = New-Object System.Drawing.Size(320, 26)
+$txtKey.Font = $fMono
+$txtKey.UseSystemPasswordChar = $true
+$ck.Controls.Add($txtKey)
+
+$btnTest    = New-Button $ck '测一下' 548 56 90
+$btnSaveKey = New-Button $ck '保存 key' 646 56 140 -Primary
+
+$lblKeyHint  = New-Label $ck '' 14 98 520 46 $fSub $MUTED
+$lblKeyState = New-Label $ck '' 548 100 240 22 $fSub $MUTED
+
+# ---- 卡片 4：状态 + 日志 ----
+$c3 = New-Card 24 470 812 250
+New-Label $c3 '④ 起没起来' 14 10 200 22 $fH $INK | Out-Null
 $listStatus = New-Object System.Windows.Forms.ListBox
 $listStatus.Location = New-Object System.Drawing.Point(12, 38)
 $listStatus.Size = New-Object System.Drawing.Size(360, 196)
@@ -172,13 +203,13 @@ $log.BackColor = [System.Drawing.Color]::FromArgb(252, 252, 253)
 $log.BorderStyle = 'FixedSingle'
 $c3.Controls.Add($log)
 
-$btnStart   = New-Button $form '一键启动' 24 574 120 -Primary
-$btnStatus  = New-Button $form '只看状态' 152 574 110
-$btnWeb     = New-Button $form '打开网页界面' 270 574 120
-$btnHome    = New-Button $form '打开她的主页' 398 574 120
-$btnClose   = New-Button $form '关闭' 720 574 116
+$btnStart   = New-Button $form '一键启动' 24 734 120 -Primary
+$btnStatus  = New-Button $form '只看状态' 152 734 110
+$btnWeb     = New-Button $form '打开网页界面' 270 734 120
+$btnHome    = New-Button $form '打开她的主页' 398 734 120
+$btnClose   = New-Button $form '关闭' 720 734 116
 
-$lblFoot = New-Label $form '' 24 616 812 22 $fSub $MUTED
+$lblFoot = New-Label $form '' 24 776 812 22 $fSub $MUTED
 $lblFoot.Text = '提示：装完第一次启动会慢一点（她要在读记忆）；端口被占时先看 3077 / 3079 / 3080 谁在用。'
 
 # ---------- 小工具 ----------
@@ -329,10 +360,13 @@ function Run-Checks {
 
     $napcat = @(
         (Join-Path $env:LOCALAPPDATA 'NapCat\NapCatWinBootMain.exe'),
-        'D:\Tools\NapCat\onekey\NapCat.52230.Shell\NapCatWinBootMain.exe',
         (Join-Path $env:USERPROFILE 'NapCat\NapCatWinBootMain.exe')
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
     Add-Check 'NapCat（接 QQ 才需要）' $true $(if ($napcat) { $napcat } else { '没找到 —— 不接 QQ 可以不管' })
+
+    $cfgNow = Get-ProviderCfg $comboProv.SelectedIndex
+    $kk = Read-KeyFile $cfgNow.keyFile
+    Add-Check ('模型 key（' + $cfgNow.label + '）') ($kk.Length -gt 10) $(if ($kk.Length -gt 10) { '已有，点「测一下」确认能真用' } else { '还没有 —— 贴到卡片 ③ 里保存' })
 
     $lblEnvHint.Text = '检测完了。'
 }
@@ -352,9 +386,141 @@ function Save-Machine {
     Write-Log ('已保存身份：' + $MACHINE_FILE)
 }
 
+# ---------- 模型 key ----------
+# 面板对话（desk\bridge.mjs）与主动循环（heartbeat\heartbeat.mjs）是独立进程，拿不到宿主
+# 进程内的 DSH 账号登录，所以它们需要一把能直连的 key。网页 / QQ 那条线走 DSH 账号，不用这把。
+function Get-ProviderCfg([int]$i) {
+    if ($i -eq 1) {
+        return @{
+            provider = 'siliconflow'
+            label    = '硅基流动'
+            baseUrl  = 'https://api.siliconflow.cn/v1'
+            model    = 'deepseek-ai/DeepSeek-V4.1-Flash'
+            keyFile  = (Join-Path $env:USERPROFILE '.dsh\siliconflow-key.txt')
+        }
+    }
+    return @{
+        provider = 'deepseek'
+        label    = 'DeepSeek 官方'
+        baseUrl  = 'https://api.deepseek.com/v1'
+        model    = 'deepseek-chat'
+        keyFile  = (Join-Path $env:USERPROFILE '.dsh\deepseek-key.txt')
+    }
+}
+
+function Read-KeyFile([string]$file) {
+    if (-not (Test-Path $file)) { return '' }
+    try { return [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8).Trim() } catch { return '' }
+}
+
+# 真的打一次，不靠"应该能用"。四种错翻成人话。
+function Test-ApiKey([string]$baseUrl, [string]$model, [string]$key) {
+    try {
+        $body = @{
+            model       = $model
+            messages    = @(@{ role = 'user'; content = 'ping' })
+            max_tokens  = 8
+            temperature = 0
+        } | ConvertTo-Json -Depth 6 -Compress
+        $r = Invoke-RestMethod -Uri ($baseUrl.TrimEnd('/') + '/chat/completions') `
+            -Method Post -TimeoutSec 30 -UseBasicParsing `
+            -Headers @{ Authorization = ('Bearer ' + $key) } `
+            -ContentType 'application/json; charset=utf-8' `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
+        $c = ''
+        try { $c = [string]$r.choices[0].message.content } catch { }
+        if (-not $c) { $c = '(回了个空的，但通了)' }
+        return @{ ok = $true; msg = ('通了，它说：' + $c) }
+    } catch {
+        $code = 0
+        try { $code = [int]$_.Exception.Response.StatusCode.value__ } catch { try { $code = [int]$_.Exception.Response.StatusCode } catch { } }
+        if ($code -eq 401 -or $code -eq 403) { return @{ ok = $false; msg = ('key 被拒（http ' + $code + '）—— 少复制了几位？') } }
+        if ($code -eq 402) { return @{ ok = $false; msg = '余额不足（http 402）—— 去后台充一点' } }
+        if ($code -eq 429) { return @{ ok = $false; msg = '请求太密（http 429）—— 等会儿再试' } }
+        if ($code -eq 0) { return @{ ok = $false; msg = ('没连上：' + $_.Exception.Message) } }
+        return @{ ok = $false; msg = ('http ' + $code + '：' + $_.Exception.Message) }
+    }
+}
+
+function Refresh-KeyHint {
+    $cfg = Get-ProviderCfg $comboProv.SelectedIndex
+    $k = Read-KeyFile $cfg.keyFile
+    $where = if ($k.Length -gt 8) { '已有 ' + $k.Substring(0, 5) + '…' + $k.Substring($k.Length - 4) } elseif ($k) { '文件是空的' } else { '还没有' }
+    $lblKeyHint.Text = ('存到 ' + $cfg.keyFile + '（' + $where + '）。面板和心跳是独立进程，得有这一把；网页与 QQ 走 DSH 账号，不需要。语音合成另算，不装语音就不用管。')
+}
+
+function Save-ApiKey {
+    $cfg = Get-ProviderCfg $comboProv.SelectedIndex
+    $k = $txtKey.Text.Trim()
+    $dir = Split-Path -Parent $cfg.keyFile
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+    if ($k) {
+        if ($k -match '\s') { Write-Log 'key 里有空格或换行 —— 重新复制一遍再贴'; return $false }
+        # 无 BOM：读的一方是按 UTF-8 裸文本拿的，BOM 会跟着进 header
+        [System.IO.File]::WriteAllText($cfg.keyFile, $k, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Log ('已保存 key：' + $cfg.keyFile)
+        $txtKey.Text = ''
+    } elseif (Read-KeyFile $cfg.keyFile) {
+        Write-Log ('没贴新 key，沿用已有的：' + $cfg.keyFile)
+    } else {
+        Write-Log '还没贴 key —— 桌面上那只鱼会开不了口。'
+        return $false
+    }
+
+    # llm.json 是面板与心跳唯一认的端点来源；同样无 BOM，否则 JSON.parse 会栽在头三个字节上
+    $lj = Join-Path $PROJECT 'dafeiyu\state\llm.json'
+    $obj = [ordered]@{
+        provider   = $cfg.provider
+        baseUrl    = $cfg.baseUrl
+        model      = $cfg.model
+        apiKeyFile = ('~/.dsh/' + (Split-Path -Leaf $cfg.keyFile))
+    }
+    $json = ($obj | ConvertTo-Json) + "`r`n"
+    [System.IO.File]::WriteAllText($lj, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Log ('模型配置：' + $cfg.label + ' · ' + $cfg.model + ' → ' + $lj)
+    return $true
+}
+
+function Load-KeyState {
+    $lj = Join-Path $PROJECT 'dafeiyu\state\llm.json'
+    if (Test-Path $lj) {
+        try {
+            $o = Get-Content $lj -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($o.provider -eq 'siliconflow') { $comboProv.SelectedIndex = 1 } else { $comboProv.SelectedIndex = 0 }
+        } catch { }
+    }
+    Refresh-KeyHint
+}
+
 # ---------- 事件 ----------
 $btnCheck.Add_Click({ Run-Checks })
 $btnStatus.Add_Click({ Show-Status })
+
+$comboProv.Add_SelectedIndexChanged({ Refresh-KeyHint })
+
+$btnTest.Add_Click({
+    $cfg = Get-ProviderCfg $comboProv.SelectedIndex
+    $k = $txtKey.Text.Trim()
+    if (-not $k) { $k = Read-KeyFile $cfg.keyFile }
+    if (-not $k) { $lblKeyState.Text = '先贴 key 再测'; $lblKeyState.ForeColor = $MUTED; return }
+    $btnTest.Enabled = $false
+    $lblKeyState.Text = '测…'
+    $lblKeyState.ForeColor = $MUTED
+    [System.Windows.Forms.Application]::DoEvents()
+    try {
+        $r = Test-ApiKey $cfg.baseUrl $cfg.model $k
+        $lblKeyState.Text = $r.msg
+        $lblKeyState.ForeColor = if ($r.ok) { $OKC } else { $BADC }
+        Write-Log ('—— 测 key（' + $cfg.label + '）：' + $r.msg)
+    } finally { $btnTest.Enabled = $true }
+})
+
+$btnSaveKey.Add_Click({
+    $ok = Save-ApiKey
+    Refresh-KeyHint
+    if ($ok) { $lblKeyState.Text = '存好了'; $lblKeyState.ForeColor = $OKC }
+})
 
 $btnInstall.Add_Click({
     $btnInstall.Enabled = $false
@@ -387,6 +553,7 @@ $btnClose.Add_Click({ $form.Close() })
 
 $form.Add_Shown({
     Write-Log ('工作区：' + $PROJECT)
+    Load-KeyState
     Run-Checks
     Show-Status
 })
