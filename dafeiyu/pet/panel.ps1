@@ -107,13 +107,23 @@ function Load-PanelState {
     }
   } catch { }
 }
+# 声音开关的「样子」（2026-10-20 他要的：关掉时把文字划掉，一眼看得出是关的）。
+# 以前开/关只差一个绿色，灰绿在小字号上根本分不出来 —— 他点了也不确定到底开没开。
+function Set-VoiceLook([bool]$on) {
+  if (-not $script:pvoiceLbl) { return }
+  $style = [System.Drawing.FontStyle]::Regular
+  if (-not $on) { $style = [System.Drawing.FontStyle]::Strikeout }
+  try {
+    $script:pvoiceLbl.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10, $style)
+  } catch { }
+  if ($on) { $script:pvoiceLbl.ForeColor = [System.Drawing.Color]::FromArgb(149, 236, 105) }
+  else { $script:pvoiceLbl.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 136) }
+}
+
 function Set-PanelVoice([bool]$on) {
   $script:pvoice = $on
   Save-PanelState
-  if ($script:pvoiceLbl) {
-    if ($on) { $script:pvoiceLbl.ForeColor = [System.Drawing.Color]::FromArgb(149, 236, 105) }
-    else { $script:pvoiceLbl.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 136) }
-  }
+  Set-VoiceLook $on
   Trace ('panel: voice=' + $on)
 }
 
@@ -1044,7 +1054,7 @@ function Initialize-Panel {
   [void]$head.Controls.Add($vo)
   $script:pvoiceLbl = $vo
   Load-PanelState
-  if ($script:pvoice) { $vo.ForeColor = [System.Drawing.Color]::FromArgb(149, 236, 105) }
+  Set-VoiceLook ([bool]$script:pvoice)
   $vo.Add_Click({ Set-PanelVoice (-not $script:pvoice) })
   $vo.Add_MouseEnter({ $script:pvoiceLbl.ForeColor = [System.Drawing.Color]::White })
   $vo.Add_MouseLeave({

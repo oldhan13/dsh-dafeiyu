@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dns from 'node:dns';
 import { execFile } from 'node:child_process';
+import { chat, llmSummary } from '../lib/llm.mjs';
 
 // 2026-10-19 19:52：这台机器上先解析到 IPv6，连 SiliconFlow 会**挂住**（实测：进程活着、只挂着一条
 // 到 2408:… 的 443 连接、90 秒超时被打断）。强制 IPv4 优先，别把心跳吊在一条死路上。
@@ -17,7 +18,7 @@ const AGENTS = path.join(ROOT, 'AGENTS.md');
 const OWNER_QQ = process.env.DAFEIYU_OWNER_QQ || '';
 const PEOPLE = path.join(ROOT, 'dafeiyu', 'people', OWNER_QQ + '.md');
 const DIARY_DIR = path.join(ROOT, 'dafeiyu', 'memory', 'diary');
-const NAPCAT_LOG_DIR = 'D:\\Tools\\NapCat\\onekey';
+const NAPCAT_LOG_DIR = process.env.DAFEIYU_NAPCAT_LOG_DIR || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'NapCat', 'onekey');
 /** 最新一份 quick*.log（NapCat 每次重启换文件名，写死路径会读到过期日志）。 */
 function newestNapcatLog() {
   try {
@@ -28,18 +29,22 @@ function newestNapcatLog() {
     return files.length ? path.join(NAPCAT_LOG_DIR, files[0].f) : null;
   } catch { return null; }
 }
-const KEY = fs.readFileSync(path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'siliconflow-key.txt'), 'utf8').trim();
 const ONEBOT = fs.readFileSync(path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'onebot-token.txt'), 'utf8').trim();
 const OWNER = Number(OWNER_QQ || 0);
 /** 我自己的号。用来把「我发的」和「对方发的」分开 —— 判断未读全靠它。 */
 const SELF = Number(process.env.DAFEIYU_BOT_QQ || 0);
-const MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash';   // 和面板那条线保持一致
+// 模型端点不再写死：和面板共用 dafeiyu/lib/llm.mjs 那一份解析。
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   fs.appendFileSync(LOG, line);
   console.log(line.trim());
 }
+
+try {
+  const s = llmSummary();
+  log('[llm] ' + s.label + ' · ' + s.model + ' · ' + (s.hasKey ? 'key ok' : 'NO KEY (' + s.keyFile + ')'));
+} catch { }
 
 function readState() {
   try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch { return { sent: [], } }
@@ -77,33 +82,19 @@ function recentChat() {
 }
 
 async function decide(ctx) {
-  const body = {
-    model: MODEL,
-    temperature: 0.95,
-    max_tokens: 120,
-    messages: [
-      { role: 'system', content: ctx.persona },
-      { role: 'user', content: ctx.situation }
-    ]
-  };
   // 2026-10-19 19:47：没有超时的话，一次卡住的请求会把整条心跳吊死（实测 19:32 那次挂了 15 分钟还没回来，
   // 进程活着、CPU 0.1s、只挂着一个 HTTPS 连接）⇒ 给模型调用加硬超时，超时就当这一轮没结论、继续睡。
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), LLM_TIMEOUT_MS);
-  let r;
   try {
-    r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${KEY}` },
-      body: JSON.stringify(body),
-      signal: ac.signal
-    });
+    const msg = await chat([
+      { role: 'system', content: ctx.persona },
+      { role: 'user', content: ctx.situation }
+    ], { temperature: 0.95, maxTokens: 120, signal: ac.signal });
+    return String(msg.content || '').trim();
   } finally {
     clearTimeout(timer);
   }
-  if (!r.ok) throw new Error(`llm ${r.status} ${await r.text()}`);
-  const j = await r.json();
-  return (j.choices?.[0]?.message?.content ?? '').trim();
 }
 
 async function send(text, to = OWNER) {

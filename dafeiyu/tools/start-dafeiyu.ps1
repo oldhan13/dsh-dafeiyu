@@ -69,7 +69,6 @@ $NODE = Pick @($env:DAFEIYU_NODE, (Field 'nodeExe'), 'node')
 $NAPCAT_CANDIDATES = @(
     $env:DAFEIYU_NAPCAT_EXE,
     (Field 'napcatExe'),
-    'D:\Tools\NapCat\onekey\NapCat.52230.Shell\NapCatWinBootMain.exe',
     (Join-Path $env:LOCALAPPDATA 'NapCat\NapCatWinBootMain.exe'),
     (Join-Path $env:USERPROFILE 'NapCat\NapCatWinBootMain.exe')
 )

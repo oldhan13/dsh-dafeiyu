@@ -358,10 +358,17 @@ function Run-Checks {
         Add-Check 'machine.json' $true '还没配（下面填两个号就会生成）'
     }
 
+    # NapCat 装在哪因机器而异：先看 machine.json / 环境变量，再退到两个常见位置。
+    $mNapcat = ''
+    if (Test-Path $MACHINE_FILE) {
+        try { $m2 = Get-Content $MACHINE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json; if ($m2.napcatExe) { $mNapcat = [string]$m2.napcatExe } } catch { }
+    }
     $napcat = @(
+        $env:DAFEIYU_NAPCAT_EXE,
+        $mNapcat,
         (Join-Path $env:LOCALAPPDATA 'NapCat\NapCatWinBootMain.exe'),
         (Join-Path $env:USERPROFILE 'NapCat\NapCatWinBootMain.exe')
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
     Add-Check 'NapCat（接 QQ 才需要）' $true $(if ($napcat) { $napcat } else { '没找到 —— 不接 QQ 可以不管' })
 
     $cfgNow = Get-ProviderCfg $comboProv.SelectedIndex

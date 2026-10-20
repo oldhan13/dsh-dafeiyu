@@ -2,7 +2,8 @@
 //
 // 为什么不是直接开一个 dsh 会话：宿主里那条模型通路只认「自己进程内的目的地」
 // （headless 单独跑会报 ACCOUNT_SIGN_IN_REQUIRED: request destination must allow
-// account authentication）。所以桌面这条线走 SiliconFlow 的同一个模型（心跳也用这支），
+// account authentication）。所以桌面这条线要一把能直连的 API key —— 端点与模型统一在
+// dafeiyu/lib/llm.mjs 里解析（默认 DeepSeek 官方，也能配成硅基流动），
 // 人设与记忆从文件里读 —— 她是同一个人。
 //
 // 2026-10-20 11:30：他要求「为和桌宠的聊天界面赋予权限」。
@@ -21,6 +22,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dns from 'node:dns';
 import { execFile, spawn } from 'node:child_process';
+import { chat, llmSummary } from '../lib/llm.mjs';
 
 dns.setDefaultResultOrder('ipv4first'); // 这台机器先解析到 IPv6 会挂住（心跳里踩过）
 
@@ -39,9 +41,14 @@ const ACT = path.join(ROOT, 'dafeiyu', 'pet', 'activity.json');
 const PSTATE = path.join(ROOT, 'dafeiyu', 'pet', 'panel-state.json');
 const AGENT_OVERLAY = path.join(DESK, 'agent-overlay.yml');
 const AGENT_TIMEOUT = (Number(process.env.DAFEIYU_AGENT_TIMEOUT_SEC) || 600) * 1000;
-const KEY = fs.readFileSync(path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'siliconflow-key.txt'), 'utf8').trim();
-const MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash';   // 换模型就改这一行；4.1 也支持 function calling（实测）
+// 模型端点不再写死在这儿：统一由 dafeiyu/lib/llm.mjs 决定
+// （dafeiyu/state/llm.json > 环境变量 > 有 DeepSeek key 就用官方，否则退回硅基流动）。
 const PORT = 3079;
+// 起来时打一行：现在用的是哪家、哪个模型、key 有没有 —— 免得以后再靠猜。
+try {
+  const s = llmSummary();
+  console.log('[llm] ' + s.label + ' · ' + s.model + ' · ' + (s.hasKey ? 'key ok' : 'NO KEY (' + s.keyFile + ')'));
+} catch { }
 /** 一次回复里最多动手几步 —— 再多的活儿她会扯太久，也该让他插一句。 */
 const MAX_STEPS = 10;
 
@@ -458,39 +465,16 @@ async function runTool(name, rawArgs) {
 
 // ---------------------------------------------------------------- 模型
 
+// 具体端点、模型、key 全在 dafeiyu/lib/llm.mjs 里解析（和心跳共用一份）。
+// 这里只留「这一轮要不要给工具」这一个决定。
 async function callModel(messages, forbidTools) {
-  const body = {
-    model: MODEL,
-    messages,
+  return chat(messages, {
+    tools: forbidTools ? null : TOOLS,
     temperature: 0.6,
-    max_tokens: 900,
-  };
-  if (!forbidTools) {
-    body.tools = TOOLS;
-    body.tool_choice = 'auto';
-  }
-  const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    maxTokens: 900,
   });
-  const j = await r.json();
-  if (!r.ok) {
-    // 把「后端没钱了」这种事翻成人话。以前这里是原样抛 `http 402 {...}`，
-    // 面板上就只剩一串 JSON —— 看着像程序崩了，其实是账户余额。
-    const code = j && (j.code !== undefined ? j.code : (j.error && j.error.code));
-    const why = String((j && (j.message || (j.error && j.error.message))) || '');
-    if (r.status === 402 || code === 30001 || /balance|insufficient/i.test(why)) {
-      throw new Error('BALANCE');
-    }
-    if (r.status === 401 || r.status === 403) throw new Error('KEY: 这个 key 不对或没权限（http ' + r.status + '）');
-    if (r.status === 429) throw new Error('RATE: 被限流了，等一两分钟再试（http 429）');
-    throw new Error('http ' + r.status + ' ' + JSON.stringify(j).slice(0, 200));
-  }
-  const msg = j?.choices?.[0]?.message;
-  if (!msg) throw new Error('empty message ' + JSON.stringify(j).slice(0, 300));
-  return msg;
 }
+
 
 async function agentLoop(text, files) {
   // 历史里带过文件的那几句，也要把路径再交给她一遍 —— 否则回头问"刚才那个文件"她一脸茫然。
