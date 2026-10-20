@@ -16,7 +16,8 @@
   ASCII-only 不适用：这文件里有中文，必须带 BOM（ACP=936 下没 BOM 会变乱码）。
 #>
 param(
-    [switch]$Close
+    [switch]$Close,
+    [switch]$Check      # 自检：只把"它认的项目根"写出来就退出（打出来的 exe 也用它验）
 )
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -26,10 +27,41 @@ Add-Type -AssemblyName System.Drawing
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
 $ErrorActionPreference = 'Continue'
-$PROJECT = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # dafeiyu\tools -> 项目根
-$TOOLS   = $PSScriptRoot
+
+# 项目根不能靠"往上两级"硬算：ps2exe 打出来的 exe 里 $PSScriptRoot 是**空的**（实测），
+# 摆进 dist\ 时上一版算出来的项目根也不对 —— 整个界面会认错项目（查的环境是别人的、启动的也不是这套）。
+# 所以先把自己在哪搞清楚，再往上找标记：谁下面有 dafeiyu\tools\setup-ui.ps1，谁就是项目根。
+$SELF_DIR = $PSScriptRoot
+if (-not $SELF_DIR) {
+    # exe 里没有 $PSScriptRoot：拿当前进程的可执行文件路径
+    try { $SELF_DIR = Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch { }
+}
+if (-not $SELF_DIR) {
+    try { $SELF_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path } catch { }
+}
+if (-not $SELF_DIR) { $SELF_DIR = (Get-Location).Path }
+
+function Find-Project([string]$start) {
+    $d = $start
+    for ($i = 0; $i -lt 6; $i++) {
+        if ($d -and (Test-Path (Join-Path $d 'dafeiyu\tools\setup-ui.ps1'))) { return $d }
+        if (-not $d) { break }
+        $d = Split-Path -Parent $d
+        if (-not $d) { break }
+    }
+    return (Split-Path -Parent (Split-Path -Parent $start))   # 找不到就退回老算法
+}
+$PROJECT = Find-Project $SELF_DIR
+$TOOLS   = Join-Path $PROJECT 'dafeiyu\tools'
 $MACHINE_FILE = Join-Path $PROJECT 'dafeiyu\state\machine.json'
 $LOG_DIR = Join-Path $PROJECT 'dafeiyu\state'
+
+if ($Check) {
+    $line = 'PROJECT=' + $PROJECT + "`r`nTOOLS=" + $TOOLS + "`r`nSELF_DIR=" + $SELF_DIR + "`r`nPSScriptRoot=" + $PSScriptRoot
+    try { [System.IO.File]::WriteAllText((Join-Path $env:TEMP 'dfy-exe-check.txt'), $line, (New-Object System.Text.UTF8Encoding($true))) } catch { }
+    Write-Output $line
+    exit 0
+}
 
 # ---------- 配色 ----------
 $BG     = [System.Drawing.Color]::FromArgb(246, 247, 249)

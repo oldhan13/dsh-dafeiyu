@@ -79,6 +79,17 @@ $script:ptimeFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
 # 两条消息隔多久才再标一次时间（QQ / 微信也是这个量级）：5 分钟。换天必标。
 $script:ptimeGap = 300
 
+# ---- 历史分页（2026-10-20 深夜他要的：别等气泡都排完才展开）----
+# 以前打开面板是同步造 30 个气泡再开始动画（实测那一段就是"先愣一下"）。
+# 现在只画最新的 pfirst 条，往上滚到顶再一批一批往**前**补。
+# phist 是整段历史（分隔条已经预处理好），pshown 是"从最新往回画了几条"。
+$script:phist = @()
+$script:pshown = 0
+$script:pfirst = 8          # 打开时先画几条：够铺满一屏，再多就是白等
+$script:pchunk = 10         # 往上滚一次补几条
+$script:phistBusy = $false
+$script:phistAt = [DateTime]::MinValue   # 上一次补的时间，用来挡"补完还停在顶部又立刻补"
+
 $BRIDGE = 'http://127.0.0.1:3079'
 $STT = Join-Path $ROOT 'dafeiyu\tools\stt-siliconflow.ps1'
 $SPEAKPLAY = Join-Path $ROOT 'dafeiyu\tools\speak-play.ps1'
@@ -333,35 +344,54 @@ function Add-PanelTimeSep([datetime]$t) {
   $script:plist.Add($row)
 }
 
-function Add-PanelMsg([string]$who, [string]$text, $at = $null) {
+# 把历史里那个 at（毫秒时间戳 / 字符串 / datetime）统一成 datetime。
+# 抽出来是因为"要不要标时间"现在要在**画之前**就算好（补历史时不能边画边推断）。
+function ConvertTo-PanelTime($at) {
+  if ($null -eq $at) { return (Get-Date) }
+  try {
+    if ($at -is [datetime]) { return [datetime]$at }
+    if ($at -is [long] -or $at -is [int] -or $at -is [double]) {
+      return [DateTimeOffset]::FromUnixTimeMilliseconds([long]$at).LocalDateTime
+    }
+    return [datetime]$at
+  } catch { return (Get-Date) }
+}
+
+# 这两句之间该不该插一行灰字。跟 Add-PanelMsg 里那套判据是同一条规矩，
+# 区别只是它算的是"数据"，不依赖屏上现在画到哪 —— 往上补历史时才不会错位。
+function Test-PanelSep($prev, $cur) {
+  if ($null -eq $prev) { return $true }
+  if ($cur.Date -ne $prev.Date) { return $true }
+  if ((($cur - $prev).TotalSeconds) -gt $script:ptimeGap) { return $true }
+  return $false
+}
+
+# -forceSep：直接用调用方算好的结论（补历史时用），null 就是照老规矩现算。
+# -NoScroll：这一批还没画完，别每条都顶一次底（那就是以前那 30 次滚动的来源）。
+# -NoTrack ：别动 plastAt / 去重表 —— 补上来的是**旧**消息，
+#             让它们参与"最后一条是什么时候"会把之后新消息的时间条判错。
+function Add-PanelMsg([string]$who, [string]$text, $at = $null, $forceSep = $null, [switch]$NoScroll, [switch]$NoTrack) {
   if (-not $script:pwrap) { return }
   if (-not $text) { return }
   # 去重只对"她"的话有意义（同一条回复有 /reply 和 say.txt 两条路进来）。
   # 他自己发的不能去重：同一批文件发两次，第二条气泡会被前缀判成重复而消失（实测）。
-  if ($who -eq 'her') {
+  if ($who -eq 'her' -and -not $NoTrack) {
     if (Test-PanelDup $who $text) { return }
     Register-PanelMsg $who $text
   }
-  $script:plastText = $text
-  $script:plastWho = $who
+  if (-not $NoTrack) {
+    $script:plastText = $text
+    $script:plastWho = $who
+  }
 
   # ---- 什么时候插时间 ----
-  $when = Get-Date
-  if ($null -ne $at) {
-    try {
-      if ($at -is [datetime]) { $when = $at }
-      elseif ($at -is [long] -or $at -is [int] -or $at -is [double]) { $when = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$at).LocalDateTime }
-      else { $when = [datetime]$at }
-    } catch { $when = Get-Date }
-  }
+  $when = ConvertTo-PanelTime $at
   $needSep = $false
-  if ($null -eq $script:plastAt) { $needSep = $true }
-  else {
-    if ($when.Date -ne $script:plastAt.Date) { $needSep = $true }
-    elseif ((($when - $script:plastAt).TotalSeconds) -gt $script:ptimeGap) { $needSep = $true }
-  }
-  if ($needSep) { Add-PanelTimeSep $when }
-  $script:plastAt = $when
+  if ($null -ne $forceSep) { $needSep = [bool]$forceSep }
+  elseif ($null -eq $script:plastAt) { $needSep = $true }
+  else { $needSep = (Test-PanelSep $script:plastAt $when) }
+  if ($needSep) { [void](Add-PanelTimeSep $when) }
+  if (-not $NoTrack) { $script:plastAt = $when }
 
   $rowW = Get-PanelRowWidth
   $maxW = $rowW - 52 - 14
@@ -417,8 +447,11 @@ function Add-PanelMsg([string]$who, [string]$text, $at = $null) {
 
   # 让布局落定再滚 —— FlowLayoutPanel 自己维护滚动范围，不用我们算。
   # ScrollControlIntoView 只保证"看得见"，最后一行常常只露一半（实测）⇒ 直接顶到底。
-  $script:pwrap.PerformLayout()
-  Panel-ScrollToEnd
+  # 批量补历史时这条关掉：一批画完只滚一次（原来是每条都滚，30 条就是 30 次）。
+  if (-not $NoScroll) {
+    $script:pwrap.PerformLayout()
+    Panel-ScrollToEnd
+  }
 }
 
 function Remove-PanelTyping {
@@ -492,26 +525,127 @@ function Clear-PanelMsgs {
   try { $script:pwrap.AutoScrollPosition = New-Object System.Drawing.Point(0, 0) } catch { }
 }
 
-function Load-PanelHistory {
-  Clear-PanelMsgs
+# 只取 + 算，不建控件：把整段历史整理成"每一条都带着该不该插时间条"的数组。
+# 建控件那一步放到真正要显示的时候 —— 这正是"打开不卡"的关键。
+function Prepare-PanelHistory {
+  $script:phist = @()
+  $script:pshown = 0
+  $script:phistBusy = $false
+  $arr = New-Object System.Collections.ArrayList
+  $err = ''
   try {
-    $h = Panel-History 30
-    if ($h.Count -eq 0) { Add-PanelMsg 'her' '我在。' }
+    $h = Panel-History 60
+    # prev 记的是"这条之前那条是什么时候" —— 分隔条只认数据，不认屏上画到哪
+    $prev = $null
     foreach ($m in $h) {
-      # at 是 jsonl 里记的毫秒时间戳 —— 打开面板看到的是当时几点说的，不是"刚刚"
+      $at = $m.at
       if ($m.role -eq 'user') {
-        if ($m.text) { Add-PanelMsg 'me' $m.text $m.at }
+        if ($m.text) {
+          $w = ConvertTo-PanelTime $at
+          [void]$arr.Add([pscustomobject]@{ who = 'me'; text = [string]$m.text; at = $at; sep = (Test-PanelSep $prev $w) })
+          $prev = $w
+        }
         $fl = @()
         foreach ($f in @($m.files)) { if ($f) { $fl += [string]$f } }
-        if ($fl.Count -gt 0) { Add-PanelMsg 'me' (Format-PanelFileList $fl) $m.at }
-      } else { Add-PanelMsg 'her' $m.text $m.at }
+        if ($fl.Count -gt 0) {
+          $w = ConvertTo-PanelTime $at
+          [void]$arr.Add([pscustomobject]@{ who = 'me'; text = (Format-PanelFileList $fl); at = $at; sep = (Test-PanelSep $prev $w) })
+          $prev = $w
+        }
+      } else {
+        if (-not $m.text) { continue }
+        $w = ConvertTo-PanelTime $at
+        [void]$arr.Add([pscustomobject]@{ who = 'her'; text = [string]$m.text; at = $at; sep = (Test-PanelSep $prev $w) })
+        $prev = $w
+      }
     }
   } catch {
-    Trace ('panel history failed: ' + $_.Exception.Message)
-    Add-PanelMsg 'her' '（连不上她：bridge 没起来）'
+    $err = $_.Exception.Message
+    Trace ('panel history failed: ' + $err)
   }
+  if ($arr.Count -eq 0) {
+    # 连不上就说连不上，别拿「我在。」糊过去 —— 那会让他以为她只是没话说
+    $t = if ($err) { '（连不上她：bridge 没起来）' } else { '我在。' }
+    [void]$arr.Add([pscustomobject]@{ who = 'her'; text = $t; at = (Get-Date); sep = $true })
+  }
+  $script:phist = $arr.ToArray()
   # 历史里已经有的，就当"已经收到过"：把游标推到现在，免得 outbox 再把它们显示一遍
   try { $script:pout = [int](Panel-Outbox 0).max } catch { }
+}
+
+# 画一段历史（不滚动）。返回这一轮新加进来的控件，补历史时要拿它们算高度、搬位置。
+# $track 只有"最新那一批"要给真：那批决定 plastAt，之后新消息的时间条靠它。
+function Add-PanelHistRange([int]$from, [int]$take, [bool]$track) {
+  $out = New-Object System.Collections.ArrayList
+  for ($i = $from; $i -lt $from + $take; $i++) {
+    $m = $script:phist[$i]
+    $c0 = $script:pwrap.Controls.Count
+    $opts = @{ NoScroll = $true }
+    if (-not $track) { $opts['NoTrack'] = $true }
+    # [void]：Add-PanelMsg 里 Add-PanelTimeSep 会把 ListBox 的返回下标漏进管道，
+    # 一漏进来 $out 里就混着 int，后面拿 .Height 就炸（实测 "Cannot convert Object[] to Int32"）。
+    [void](Add-PanelMsg -who $m.who -text $m.text -at $m.at -forceSep $m.sep @opts)
+    for ($k = $c0; $k -lt $script:pwrap.Controls.Count; $k++) { [void]$out.Add($script:pwrap.Controls[$k]) }
+  }
+  # 不要那个逗号：调用方是拿 foreach / Where-Object 一条条收的。
+  # 加了逗号整份数组会被当成"一个对象"送出去 ⇒ $c 是个 Object[]，$c.Height 加出来永远是 0（实测）。
+  return $out.ToArray()
+}
+
+# 打开面板：先只画最新的 pfirst 条，滚一次到底就开动画。
+# 以前是 30 条全造完再动画 —— 那一下就是"先愣一会儿才展开"。
+function Load-PanelHistory {
+  Clear-PanelMsgs
+  Prepare-PanelHistory
+  $n = $script:phist.Count
+  $take = [Math]::Min($script:pfirst, $n)
+  if ($take -gt 0) { [void](Add-PanelHistRange ($n - $take) $take $true) }
+  $script:pshown = $take
+  $script:pwrap.PerformLayout()
+  Panel-ScrollToEnd
+}
+
+# 往上滚到头：把更早的一批补到消息区**顶上**，并且让眼睛停在原来那句话上。
+# 做法：量出新加那几行一共多高，再把滚动位置往同一个方向推同样多。
+function Add-PanelOlder {
+  if ($script:phistBusy) { return }
+  if ($script:pshown -ge $script:phist.Count) { return }
+  $script:phistBusy = $true
+  try {
+    $before = -$script:pwrap.AutoScrollPosition.Y
+    $take = [Math]::Min($script:pchunk, $script:phist.Count - $script:pshown)
+    $from = $script:phist.Count - $script:pshown - $take
+    # 只要控件：万一有东西漏进管道，这里挡一下，别让下面 .Height 拿到一个数组
+    $added = @(Add-PanelHistRange $from $take $false | Where-Object { $_ -is [System.Windows.Forms.Control] })
+    # 新行是追加在末尾的，搬回最前面（顺序不能乱）
+    $idx = 0
+    foreach ($c in $added) {
+      try { $script:pwrap.Controls.SetChildIndex($c, $idx) } catch { }
+      $idx++
+    }
+    $hh = 0
+    foreach ($c in $added) { $hh += [int]$c.Height + [int]$c.Margin.Top + [int]$c.Margin.Bottom }
+    $script:pwrap.PerformLayout()
+    $script:pwrap.AutoScrollPosition = New-Object System.Drawing.Point(0, [int]([Math]::Max(0, $before + $hh)))
+    $script:pshown += $take
+    Trace ('panel: older +' + $take + ' (' + $script:pshown + '/' + $script:phist.Count + ', +' + $hh + 'px)')
+  } catch {
+    Trace ('panel older failed: ' + $_.Exception.Message)
+  } finally {
+    $script:phistAt = [DateTime]::Now
+    $script:phistBusy = $false
+  }
+}
+
+# 滚到接近顶部就补一批。轮子和 Scroll 两个入口都挂上：
+# 只挂轮子的话，他拖滚动条到顶就不会补；只挂 Scroll 的话，触控板连滑几下会被合并掉。
+function Test-PanelOlder {
+  if ($script:phistBusy) { return }
+  if ($script:pshown -ge $script:phist.Count) { return }
+  # 刚补完又停在顶部时别再补 —— 否则一次快速拖到顶会把整段历史一口气拉回来
+  if ((([DateTime]::Now) - $script:phistAt).TotalMilliseconds -lt 220) { return }
+  try { if ((-$script:pwrap.AutoScrollPosition.Y) -gt 24) { return } } catch { return }
+  Add-PanelOlder
 }
 
 function Set-PanelTip([string]$t) { if ($script:ptip) { $script:ptip.Text = $t } }
@@ -1100,6 +1234,10 @@ function Initialize-Panel {
   [void]$f.Controls.Add($wrap)
   $script:pwrap = $wrap
   Enable-PanelDoubleBuffer $wrap
+  # 往上滚就到顶补历史（Add-PanelOlder）。轮子 + Scroll 都挂：
+  # 只挂轮子，他拖滚动条到顶就不补；只挂 Scroll，触控板连滑会被系统合并成一次。
+  $wrap.Add_Scroll({ try { Test-PanelOlder } catch { } })
+  $wrap.Add_MouseWheel({ try { if ($_.Delta -gt 0) { Test-PanelOlder } } catch { } })
   $script:plist = New-Object System.Collections.ArrayList
 
   # ---- 输入条（Dock=Bottom，必须排在 Fill 之后加）----
