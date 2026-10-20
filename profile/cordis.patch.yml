@@ -1,0 +1,28 @@
+# 大肥鱼用到的 profile patch 片段。
+# 合并进 %USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml（顶层是 YAML 数组）。
+# ⚠️ 三处占位符必须换成你自己的：accessToken / adminUsers / botQQ。
+
+# ── QQ 通道（反向 WebSocket，NapCat 拨进来）─────────────────────────
+- id: dsh-onebot
+  name: 'dsh-onebot-qq'
+  config:
+    mode: reverse
+    host: 127.0.0.1
+    port: 8643
+    accessToken: "<NapCat 那边配的 token>"
+    adminUsers:
+      - "<主人QQ>"
+    botQQ: "<机器人QQ>"
+    # 中间话：实时发出，但**不撤回**、回合结束也**不**拼那张带编号的「本轮中间记录」图卡。
+    # 默认值会让长回合变成「先发→90秒撤回→编号卡→再发最终回复」，看着像故障。
+    interimMessages: true
+    interimRecall: false
+
+# ── 模型 ──────────────────────────────────────────────────────────
+# 桌面那条线（desk/bridge.mjs）走 SiliconFlow，不走这里；这里只管 DSH 宿主自己的模型。
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: deepseek-account
+    model: deepseek-flash
+    reasoningEffort: high

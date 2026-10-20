@@ -1,0 +1,49 @@
+node_modules/
+.pnpm-store/
+
+# 日志与备份
+*.log
+*.bak-*
+.idea/
+
+# ── 个人数据：这些东西永远不该进 git ─────────────────────────
+# 记忆与日记（会写进你的生活）
+dafeiyu/memory/brief.md
+dafeiyu/memory/diary/
+# 人：每张卡都是一个人
+dafeiyu/people/*.md
+!dafeiyu/people/README.md
+# 群
+dafeiyu/group/*.md
+!dafeiyu/group/README.md
+dafeiyu/group/raw.jsonl
+# 两边捎的话
+dafeiyu/relay/qq.md
+dafeiyu/relay/web.md
+# 图、音频、刷 B站的产物
+dafeiyu/assets/
+dafeiyu/voice/
+dafeiyu/voice-samples/
+dafeiyu/bili/
+# 运行时状态
+dafeiyu/*/state.json
+dafeiyu/pet/say.txt
+dafeiyu/pet/activity.json
+dafeiyu/pet/panel-state.json
+dafeiyu/desk/history.jsonl
+dafeiyu/desk/actions.log
+dafeiyu/desk/*.log
+dafeiyu/homepage/data/posts.json
+
+# 台账那一套（装 dsh-ledger-memory 才有）
+_ledger-log/
+_ledger-archive/
+_stash/
+_acl-recovery/
+LEDGER.md
+JOURNAL.md
+DECISIONS.md
+LESSONS.md
+GOALS.md
+.dsh-ledger.json
+LEDGER.md.bak-*

@@ -1,0 +1,281 @@
+﻿<#
+  start-dafeiyu.ps1 —— 一键把「大肥鱼」的四件套拉起来（已在跑的会跳过）。
+
+  四件套：
+    1. DSH 宿主（dsh web）——它同时是 QQ 通道的服务端（反向 WS 监听 8643）和网页界面（3080）
+    2. NapCat（QQ 客户端 + OneBot）—— 以 <机器人QQ> 登录，反向拨 8643，HTTP 在 3000
+    3. 后台冲动循环 heartbeat.mjs —— 25~40 分钟醒一次，自己决定发不发
+    4. 她的主页 serve.mjs —— http://127.0.0.1:3077/
+
+  用法：
+    .\start-dafeiyu.cmd            # 全部拉起（缺什么补什么）
+    .\start-dafeiyu.cmd -Status    # 只看现在活着没有，不动任何东西
+    .\start-dafeiyu.cmd -NoHost    # 不动宿主（你自己已经开着 dsh web）
+
+  关键环境：TMP/TEMP 会在启动宿主前指向 C:\dsh-temp。
+  原因：Windows ACL 沙箱要求 temp root 在 workspace 之外，而默认 tmpdir 落在 <HOME> 里，
+  会让 cwd 在 <HOME> 的会话 shell 起不来（报「temp root 必须在 workspace 之外」）。
+#>
+param(
+    [switch]$Status,
+    [switch]$NoHost
+)
+
+$ErrorActionPreference = 'Continue'
+$PROJECT = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # dafeiyu\tools -> 项目根
+$NODE = 'node'
+$NAPCAT_EXE = if ($env:DAFEIYU_NAPCAT_EXE) { $env:DAFEIYU_NAPCAT_EXE } else { 'D:\Tools\NapCat\onekey\NapCat.52230.Shell\NapCatWinBootMain.exe' }  # 用 -e DAFEIYU_NAPCAT_EXE 指你自己的
+$BOT_QQ = $env:DAFEIYU_BOT_QQ
+$TOKEN_FILE = Join-Path $env:USERPROFILE '.dsh\onebot-token.txt'
+$HB_DIR = Join-Path $PROJECT 'dafeiyu\heartbeat'
+$HOME_DIR = Join-Path $PROJECT 'dafeiyu\homepage'
+$HOST_LAUNCHER = Join-Path $PROJECT 'start-dsh-web.cmd'
+
+function Say($msg) { Write-Host $msg }
+function Ok($msg)   { Write-Host "  [ok] $msg"   -ForegroundColor Green }
+function Todo($msg) { Write-Host "  [..] $msg"   -ForegroundColor Yellow }
+function Bad($msg)  { Write-Host "  [!!] $msg"   -ForegroundColor Red }
+
+function Test-Port([int]$port) {
+    try {
+        $c = New-Object System.Net.Sockets.TcpClient
+        $c.Connect('127.0.0.1', $port); $c.Close(); return $true
+    } catch { return $false }
+}
+
+# 后台启动：完全不创建控制台窗口。
+#
+# 2026-10-20 上午他提的：「每次启动后台都要挂特别多的 cmd 窗口」。
+# 根因有两个：① 这里原来用 Start-Process -WindowStyle Hidden —— 那是「先把窗口建出来、再藏起来」，
+# 启动那一瞬间屏幕上还是啪一下，五六个 node/powershell 串起来就是一片黑框；
+# ② 起宿主机那行压根没加 Hidden，`cmd /c call start-dsh-web.cmd` 而 dsh web 是常驻的
+# ⇒ 那个 cmd 窗口会**一直挂在那儿**关不掉。② 才是"挂"字的意思。
+#
+# .NET 的 CreateNoWindow 是**根本不创建**控制台，连闪都没有。
+# 套一层 cmd.exe 是为了要它那句 `> log 2>&1` —— 用 RedirectStandardOutput 接事件再写文件，
+# 在 PowerShell 里又慢又容易被缓冲噎住，不值当。cmd 自己也被 CreateNoWindow 压住了。
+function Start-Bg([string]$CmdLine, [string]$WorkDir) {
+    $si = New-Object System.Diagnostics.ProcessStartInfo
+    $si.FileName = 'cmd.exe'
+    # 整体再包一对引号：cmd 会把 /c 后面的首尾引号剥掉，命令本身以引号开头时
+    # 不包就会散架（2026-10-19 23:00 restart-host.ps1 栽过一次）。
+    $si.Arguments = '/c "' + $CmdLine + '"'
+    if ($WorkDir) { $si.WorkingDirectory = $WorkDir }
+    $si.UseShellExecute = $false
+    $si.CreateNoWindow = $true
+    # 必须重定向，哪怕没人读。不重定向的话子进程会**继承调用者的 stdout/stderr 句柄**：
+    # 于是 `start-dafeiyu.ps1 | ...` 这种管道永远不关，双击 .cmd 起的那个黑窗口也会
+    # 一直挂到所有服务退出 —— 这是「挂特别多的 cmd 窗口」的另一半根因（2026-10-20 实测）。
+    # 这里不读也不怕：命令自己已经 >log 2>log 了，cmd 本身几乎没有输出。
+    $si.RedirectStandardOutput = $true
+    $si.RedirectStandardError = $true
+    return [System.Diagnostics.Process]::Start($si)
+}
+
+function Get-Nodes {
+    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue
+}
+
+function Get-ProcByScript([string]$script) {
+    # 只认「node.exe <script>」这种真实调用；不要用松散的 .mjs 子串匹配 ——
+    # dsh 的 subprocess runner 命令行里会带上整段 PowerShell 文本，会误报出别的进程。
+    $pattern = '(?i)node(\.exe)?"?\s+' + [regex]::Escape($script) + '\s*$'
+    Get-Nodes | Where-Object { $_.CommandLine -and $_.CommandLine.Trim() -match $pattern }
+}
+
+function NapCat-Online {
+    try {
+        $token = (Get-Content $TOKEN_FILE -Raw).Trim()
+        $h = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
+        $r = Invoke-RestMethod -Uri 'http://127.0.0.1:3000/get_status' -Method Post -Headers $h -Body '{}' -TimeoutSec 5
+        return [bool]$r.data.online
+    } catch { return $false }
+}
+
+function Wait-Until($condition, [int]$seconds, [string]$what) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (& $condition) { return $true }
+        Start-Sleep -Milliseconds 800
+    }
+    Bad "等 $what 超时（$seconds 秒）"
+    return $false
+}
+
+Say ''
+Say '=== 大肥鱼 · 启动检查 ==='
+Say ''
+
+# ---- 1. DSH 宿主 ----
+Say '1) DSH 宿主（QQ 通道 8643 + 网页 3080）'
+$p8643 = Test-Port 8643
+$p3080 = Test-Port 3080
+$hostUp = $p8643 -and $p3080
+if ($hostUp) {
+    Ok '已在运行'
+} elseif ($p8643 -or $p3080) {
+    # 只有一个端口在听：多半是上一个实例还在起、或者残留的监听。
+    # 这时候再叠一个实例上去，新实例会 listen EADDRINUSE 当场自杀
+    # （2026-10-19 19:29 那次就是这样，日志在 ~/.dsh/logs/startup-*.log）。
+    Todo ("端口只有一半在听（8643={0} 3080={1}）—— 等 40 秒看它自己走完" -f $p8643, $p3080)
+    [void](Wait-Until { (Test-Port 8643) -and (Test-Port 3080) } 40 '半个宿主起来')
+    if ((Test-Port 8643) -and (Test-Port 3080)) { Ok '起来了' }
+    else { Bad '端口被占着但没起全。别重复启动（会 EADDRINUSE），先查是谁占的。' }
+} elseif ($Status) {
+    Bad '没在运行 —— 用 start-dafeiyu.cmd 拉起来'
+} elseif ($NoHost) {
+    Bad '-NoHost 指定不动宿主，但 8643/3080 没在监听'
+} else {
+    if (-not (Test-Path $HOST_LAUNCHER)) { Bad "找不到启动器：$HOST_LAUNCHER"; }
+    else {
+        Todo '启动宿主（TMP 已指到 C:\dsh-temp；窗口不显示）'
+        # 必须写成 /c call "<path>"：cmd 会把 /c 后面字符串的首尾引号剥掉，
+        # 路径里有空格时命令就散了 —— restart-host.ps1 第一版栽的就是这个（2026-10-19 23:00）。
+        # 2026-10-20：改成 Start-Bg —— 原来这行没加 Hidden，dsh web 又是常驻进程，
+        # 那个 cmd 窗口会一直挂在桌面/任务栏上，就是他说「挂特别多的 cmd 窗口」的那个。
+        Start-Bg ('call "' + $HOST_LAUNCHER + '"') $PROJECT | Out-Null
+        [void](Wait-Until { (Test-Port 8643) -and (Test-Port 3080) } 120 '宿主就绪')
+        if (Test-Port 8643) { Ok '宿主已起（8643 在听）' }
+    }
+}
+
+# ---- 2. NapCat ----
+Say ''
+Say '2) NapCat（QQ 客户端）'
+$napcatProc = Get-CimInstance Win32_Process -Filter "Name='NapCatWinBootMain.exe'" -ErrorAction SilentlyContinue
+if (NapCat-Online) {
+    Ok '在线（HTTP 3000 有响应，online=true）'
+} elseif ($Status) {
+    Bad '不在线'
+} else {
+    if ($napcatProc) { Todo '进程在，但还没登进去，等它一下' }
+    else {
+        Todo "启动 NapCat（QQ $BOT_QQ）"
+        if (-not (Test-Path $NAPCAT_EXE)) { Bad "找不到：$NAPCAT_EXE" }
+        else { Start-Process -FilePath $NAPCAT_EXE -ArgumentList $BOT_QQ -WorkingDirectory (Split-Path $NAPCAT_EXE -Parent) }
+    }
+    [void](Wait-Until { NapCat-Online } 120 'NapCat 登录')
+    if (NapCat-Online) { Ok '已登录，反向 WS 会自己拨上 8643' } else { Bad '还是不在线 —— 可能要扫码，或小号在别处登录把它踢了' }
+}
+
+# ---- 3. 后台冲动循环 ----
+Say ''
+Say '3) 后台冲动循环（heartbeat.mjs）'
+$hb = Get-ProcByScript 'heartbeat.mjs'
+if ($hb) { Ok "在跑（pid $($hb.ProcessId -join ','))" }
+elseif ($Status) { Bad '没在跑' }
+else {
+    Todo '启动 heartbeat'
+    Start-Bg ('"' + $NODE + '" heartbeat.mjs > "' + (Join-Path $HB_DIR 'stdout.log') + '" 2> "' + (Join-Path $HB_DIR 'stderr.log') + '"') $HB_DIR | Out-Null
+    Start-Sleep -Seconds 2
+    $hb2 = Get-ProcByScript 'heartbeat.mjs'
+    if ($hb2) { Ok "已起（pid $($hb2.ProcessId -join ',')）" } else { Bad '没起来，看 dafeiyu\heartbeat\stderr.log' }
+}
+
+# ---- 4. 她的主页 ----
+Say ''
+Say '4) 她的主页（serve.mjs @ 3077）'
+$web = Get-ProcByScript 'serve.mjs'
+if ($web -and (Test-Port 3077)) { Ok "在跑（pid $($web.ProcessId -join ',')）" }
+elseif ($Status) { Bad '没在跑' }
+else {
+    Todo '启动主页服务'
+    Start-Bg ('"' + $NODE + '" serve.mjs > "' + (Join-Path $HOME_DIR 'server.out.log') + '" 2> "' + (Join-Path $HOME_DIR 'server.err.log') + '"') $HOME_DIR | Out-Null
+    [void](Wait-Until { Test-Port 3077 } 15 '主页服务')
+    if (Test-Port 3077) { Ok '已起' } else { Bad '没起来' }
+}
+
+# ---- 5. 群聊随听 ----
+Say ''
+Say '5) 群聊随听（watch.mjs @ 3078，NapCat 把群里每条消息都推给它）'
+$gw = Get-ProcByScript 'watch.mjs'
+if ($gw -and (Test-Port 3078)) { Ok "在跑（pid $($gw.ProcessId -join ',')）" }
+elseif ($Status) { Bad '没在跑 —— 群里她就不说话了' }
+else {
+    Todo '启动群聊随听'
+    $gwDir = Join-Path $PROJECT 'dafeiyu\group'
+    Start-Bg ('"' + $NODE + '" watch.mjs > "' + (Join-Path $gwDir 'stdout.log') + '" 2> "' + (Join-Path $gwDir 'stderr.log') + '"') $gwDir | Out-Null
+    [void](Wait-Until { Test-Port 3078 } 15 '群聊随听')
+    if (Test-Port 3078) { Ok '已起' } else { Bad '没起来，看 dafeiyu\group\stderr.log' }
+}
+
+# ---- 6. 桌面她的聊天框 ----
+Say ''
+Say '6) 桌面聊天框（desk\bridge.mjs @ 3079 —— 双击她就能打字说话）'
+$deskUp = (Test-Port 3079)
+if ($deskUp) { Ok '在跑（3079 在听）' }
+elseif ($Status) { Bad '没在跑 —— 双击她只能退回开网页' }
+else {
+    Todo '启动桌面聊天框的桥'
+    $deskDir = Join-Path $PROJECT 'dafeiyu\desk'
+    Start-Bg ('"' + $NODE + '" bridge.mjs > "' + (Join-Path $deskDir 'bridge.out.log') + '" 2> "' + (Join-Path $deskDir 'bridge.err.log') + '"') $deskDir | Out-Null
+    [void](Wait-Until { Test-Port 3079 } 15 '桌面聊天桥')
+    if (Test-Port 3079) { Ok '已起' } else { Bad '没起来，看 dafeiyu\desk\bridge.err.log' }
+}
+
+# ---- 7. 桌面宠物 ----
+Say ''
+Say '7) 桌面宠物（pet-wf.ps1 —— 屏幕右下角那只鱼）'
+function Get-PetProc {
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*pet-wf.ps1*' }
+}
+$pet = Get-PetProc
+if ($pet) { Ok "在跑（pid $($pet.ProcessId -join ',')）" }
+elseif ($Status) { Bad '没在跑 —— 桌面上看不见她' }
+else {
+    Todo '把桌宠放出来'
+    # pet-wf.ps1 是 WinForms：CreateNoWindow 只压住控制台，它自己创建的窗口照样显示。
+    Start-Bg ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $PROJECT 'dafeiyu\pet\pet-wf.ps1') + '"') $PROJECT | Out-Null
+    [void](Wait-Until { [bool](Get-PetProc) } 10 '桌宠')
+    if (Get-PetProc) { Ok '已出来' } else { Bad '没出来，看 dafeiyu\pet\pet.log' }
+}
+
+# ---- 台账自动瘦身（计划任务）----
+# 2026-10-20：这条原来每 30 分钟弹一个黑框 —— 是所有窗口来源里**最持续**的一个
+# （启动时才闪的都还好，这个是一整天每隔半小时来一下）。
+# 改成用 wscript 跑一个 vbs 包一层（WScript.Shell.Run 的 0 = 不显示窗口），
+# 任务本身只多一个 wscript 进程，看不到任何东西。
+$tidyVbs = Join-Path $PSScriptRoot 'ledger-tidy-silent.vbs'
+$tidyTr = 'wscript.exe //B //Nologo "' + $tidyVbs + '"'
+$exists = $null
+try { $exists = schtasks /Query /TN DaFeiYu-LedgerTidy 2>$null } catch { }
+if (-not $exists) {
+    schtasks /Create /SC MINUTE /MO 30 /TN DaFeiYu-LedgerTidy /TR $tidyTr /F | Out-Null
+    Say '  [ok] 已注册台账自动瘦身任务（每 30 分钟，不弹窗）'
+} elseif ($exists -and ($exists -join ' ') -notmatch 'ledger-tidy-silent\.vbs') {
+    # 老任务是直接跑 .cmd 的：顺手换成静默版（/F 覆盖，不新增任务）
+    schtasks /Create /SC MINUTE /MO 30 /TN DaFeiYu-LedgerTidy /TR $tidyTr /F | Out-Null
+    Say '  [ok] 台账自动瘦身任务已换成静默版'
+}
+
+# ---- 汇总 ----
+$host_ok = (Test-Port 8643)
+$qq_ok = NapCat-Online
+$loop_ok = [bool](Get-ProcByScript 'heartbeat.mjs')
+$web_ok = (Test-Port 3077)
+$group_ok = (Test-Port 3078)
+$pet_ok = [bool](Get-PetProc)
+$desk_ok = (Test-Port 3079)
+
+Say ''
+Say '=== 现在 ==='
+Say ("  宿主    : {0}" -f $(if ($host_ok) { '8643 在听 (3080 网页)' } else { '未启动' }))
+Say ("  QQ      : {0}" -f $(if ($qq_ok) { '在线' } else { '离线' }))
+Say ("  循环    : {0}" -f $(if ($loop_ok) { '在跑' } else { '停着' }))
+Say ("  主页    : {0}" -f $(if ($web_ok) { 'http://127.0.0.1:3077/' } else { '未启动' }))
+Say ("  群随听  : {0}" -f $(if ($group_ok) { '在听（3078）' } else { '未启动' }))
+Say ("  桌宠    : {0}" -f $(if ($pet_ok) { '在屏幕上' } else { '没出来' }))
+Say ("  聊天框  : {0}" -f $(if ($desk_ok) { '3079 在听' } else { '没起' }))
+Say ''
+Say '  网页界面  : http://127.0.0.1:3080'
+Say '  她的主页  : http://127.0.0.1:3077/'
+Say ''
+
+# 每次跑完留一行摘要 —— 没有它，出问题时只能靠猜（2026-10-19 的教训）。
+$summary = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') +
+    ("  host={0} qq={1} loop={2} web={3} group={4} pet={5} desk={6}" -f $host_ok, $qq_ok, $loop_ok, $web_ok, $group_ok, $pet_ok, $desk_ok)
+try { Add-Content -Path (Join-Path $PSScriptRoot 'start-dafeiyu.log') -Value $summary -Encoding UTF8 } catch { }
+
+# 退出码就是健康度：0 = 四件套都在，1 = 还缺东西（方便脚本/快捷方式判断）
+if ($host_ok -and $qq_ok -and $loop_ok -and $web_ok) { exit 0 } else { exit 1 }

@@ -1,0 +1,21 @@
+{
+  "name": "dsh-profile-dafeiyu",
+  "private": true,
+  "description": "参考：跑大肥鱼需要的 bundle。真正生效的那份在 ~/.dsh/profiles/<profile>/package.json，由 dsh plugin add 维护。",
+  "dependencies": {
+    "dsh-ledger-memory": "^1.2.8",
+    "dsh-onebot-qq": "^0.9.3",
+    "dsh-voice-chat": "^0.4.1"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-ledger-memory",
+        "dsh-voice-chat",
+        "dsh-onebot-qq"
+      ]
+    }
+  }
+}
