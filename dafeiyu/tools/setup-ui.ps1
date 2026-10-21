@@ -400,6 +400,7 @@ $btnStart   = New-Button $form '一键启动' 24 734 120 -Primary
 $btnStatus  = New-Button $form '只看状态' 152 734 110
 $btnWeb     = New-Button $form '打开网页界面' 270 734 120
 $btnHome    = New-Button $form '打开她的主页' 398 734 120
+$btnExt     = New-Button $form '拓展模块…' 526 734 150
 $btnClose   = New-Button $form '关闭' 720 734 116
 
 $lblFoot = New-Label $form '' 24 776 812 22 $fSub $MUTED
@@ -419,7 +420,7 @@ function Write-Log([string]$s) {
 # 为什么不 RedirectStandardOutput + ReadLine：那是**同步**读，子进程一秒不吐字，
 # 界面就一秒不刷新（按钮卡住、窗口像死了）。改成让子进程自己把输出用 UTF-8 写一个临时文件，
 # 这边只管按增量读 —— 界面一直是活的，中文也不会按 GBK 乱码。
-function Invoke-PsFile([string]$ps1, [string]$extra) {
+function Invoke-PsFile([string]$ps1, [string]$extra, [int]$Minutes = 6) {
     $tmp = Join-Path $env:TEMP ('dfy-' + [guid]::NewGuid().ToString('N') + '.log')
     $inner = "& '" + $ps1 + "' " + $extra + " 2>&1 | Out-File -FilePath '" + $tmp + "' -Encoding utf8"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -431,7 +432,7 @@ function Invoke-PsFile([string]$ps1, [string]$extra) {
     $p = [System.Diagnostics.Process]::Start($psi)
 
     $printed = 0
-    $deadline = (Get-Date).AddMinutes(6)
+    $deadline = (Get-Date).AddMinutes($Minutes)
     while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 150
         [System.Windows.Forms.Application]::DoEvents()
@@ -710,6 +711,358 @@ function Load-KeyState {
     Refresh-KeyHint
 }
 
+# ================================================================
+# 拓展模块（2026-10-21 他要的）
+#
+#   他原话：「给我们配置的 GUI 界面增加一个『拓展模块』选项，里面有包括刷 B 站、生图等在内、
+#   需要额外配置的非必须功能」。
+#
+#   三条设计，改这个面板前先看：
+#   ① **模块是一张表**（$EXT_MODULES），加一个模块就往表里加一行，别写成四段胶水。
+#   ② 状态**只用本地事实**判断（文件在不在、端口通不通），不发网络请求 ——
+#      点开就是准的，也不会因为在墙外卡十秒。
+#   ③ 动作全部落在**已有的真实脚本**上，界面里不另写一套逻辑：
+#        生图 → tools\comfyui-install.mjs（安装/补齐）+ tools\draw-once.mjs（画一张）
+#        B站  → ~\.dsh\bili-duty（日报 / config.json / 扫码图都在那儿）
+#        语音 → tools\speak-play.ps1（脱管进程，界面不卡；中文走 UTF-8 文件，不过命令行）
+#      ⇒ 以后脚本改了，这个界面不用跟着改。
+# ================================================================
+
+$BILI_DIR    = Join-Path $env:USERPROFILE '.dsh\bili-duty'
+$COMFY_ROOT  = if ($env:COMFY_ROOT) { $env:COMFY_ROOT } else { 'D:\ComfyUI' }
+$SILICON_KEY = Join-Path $env:USERPROFILE '.dsh\siliconflow-key.txt'
+
+# id / 标题 / 一句话 / 需要什么。加模块只加这一行。
+$EXT_MODULES = @(
+    [ordered]@{ id = 'bili'; title = '刷 B 站'; desc = '她每天谷时自己刷一轮，把值当的挑出来写成日报 —— 她看，不打扰你。'; need = '需要：一个 Python 环境（自动建）+ B 站扫码登录一次' }
+    [ordered]@{ id = 'comfy'; title = '生图'; desc = '她能用这块显卡画图，说一句就出图，十几秒一张。'; need = '需要：约 24 GB 磁盘、8 GB 以上显存；装完常驻 8188' }
+    [ordered]@{ id = 'voice'; title = '语音'; desc = '她能出声，用带语气的合成念一句（跟她的文字是同一个人）。'; need = '需要：一把硅基流动 key（卡片 ③ 选「硅基流动」再存一次）' }
+    [ordered]@{ id = 'qq'; title = 'QQ 通道'; desc = '手机上也能找她 —— 小号挂在 NapCat 上，QQ 里说话她听得见。'; need = '需要：NapCat + 一个小号（主界面卡片 ② 填）' }
+)
+
+function Test-LocalPort([int]$port) {
+    try {
+        $c = New-Object System.Net.Sockets.TcpClient
+        $ar = $c.BeginConnect('127.0.0.1', $port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne(400)) { $c.Close(); return $false }
+        $c.EndConnect($ar); $c.Close(); return $true
+    } catch { return $false }
+}
+
+# 只看本地事实：不联网、不启动任何东西。
+function Get-ExtStates {
+    $st = @{}
+
+    $py = Join-Path $BILI_DIR '.venv\Scripts\python.exe'
+    $cred = Join-Path $BILI_DIR 'bili_credential.json'
+    $logged = $false
+    if (Test-Path $cred) {
+        try {
+            $cc = Get-Content $cred -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($cc.sessdata -and $cc.bili_jct) { $logged = $true }
+        } catch { }
+    }
+    $st.bili = [ordered]@{
+        venv  = [bool](Test-Path $py)
+        login = $logged
+        today = [bool](Test-Path (Join-Path $BILI_DIR ('out\' + (Get-Date).ToString('yyyy-MM-dd') + '.md')))
+    }
+
+    $models = Join-Path $COMFY_ROOT 'app\ComfyUI\models'
+    $st.comfy = [ordered]@{
+        app    = [bool](Test-Path (Join-Path $COMFY_ROOT 'app\ComfyUI\main.py'))
+        models = ([bool](Test-Path (Join-Path $models 'diffusion_models\flux1-schnell-fp8.safetensors'))) -and
+                 ([bool](Test-Path (Join-Path $models 'vae\ae.safetensors')))
+        up     = (Test-LocalPort 8188)
+    }
+
+    $kl = 0
+    if (Test-Path $SILICON_KEY) { try { $kl = ([System.IO.File]::ReadAllText($SILICON_KEY)).Trim().Length } catch { } }
+    $st.voice = [ordered]@{
+        script = [bool](Test-Path (Join-Path $TOOLS 'speak-play.ps1'))
+        key    = [bool]($kl -gt 10)
+    }
+
+    $nap = ''; $bot = ''
+    if (Test-Path $MACHINE_FILE) {
+        try {
+            $mj = Get-Content $MACHINE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($mj.napcatExe) { $nap = [string]$mj.napcatExe }
+            if ($mj.botQQ) { $bot = [string]$mj.botQQ }
+        } catch { }
+    }
+    $st.qq = [ordered]@{
+        nap = [bool]($nap -and (Test-Path $nap))
+        bot = $bot
+    }
+    $st.napPath = $nap
+    return $st
+}
+
+# 跑一个 .mjs：跟 Invoke-PsFile 一样的临时日志增量读法（同步 ReadLine 会让界面像死了）。
+#
+# $Sink：这行输出往哪打。拓展模块那个窗口是模态的 —— 它盖住主窗，
+# 如果把输出写进主窗的「过程」里，人一个字都看不见（实测：点「画一张」，报错跑到背后去了）。
+# 所以调用方传自己的 ELog 进来。
+function Invoke-NodeFile([string]$js, [string[]]$argList, [int]$Minutes = 30, [scriptblock]$Sink = $null) {
+    $node = 'node'
+    try { $nc = Get-Command node -ErrorAction Stop; if ($nc.Source) { $node = $nc.Source } } catch { }
+    $q = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
+    $argv = @((& $q $node), (& $q $js))
+    foreach ($a in $argList) { if ($a) { $argv += (& $q $a) } }
+    $tmp = Join-Path $env:TEMP ('dfy-node-' + [guid]::NewGuid().ToString('N') + '.log')
+    $inner = '& ' + ($argv -join ' ') + ' 2>&1 | Out-File -FilePath ' + (& $q $tmp) + ' -Encoding utf8'
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -Command "' + $inner + '"'
+    $psi.WorkingDirectory = $PROJECT
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+
+    $printed = 0
+    $deadline = (Get-Date).AddMinutes($Minutes)
+    # 增量读：自己读，不借 Read-NewLog（那个写死在主窗的日志框里）
+    $read = {
+        param($file, $done)
+        try {
+            if (-not (Test-Path $file)) { return $done }
+            $all = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
+            if ($all.Length -gt $done) {
+                $chunk = $all.Substring($done).TrimEnd()
+                if ($chunk) {
+                    if ($Sink) { & $Sink $chunk } else { Write-Log $chunk }
+                }
+                return $all.Length
+            }
+        } catch { }
+        return $done
+    }
+    while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+        [System.Windows.Forms.Application]::DoEvents()
+        $printed = & $read $tmp $printed
+    }
+    [void]$p.WaitForExit(5000)
+    $printed = & $read $tmp $printed
+    Start-Sleep -Milliseconds 150
+    [void](& $read $tmp $printed)
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    return $p.ExitCode
+}
+
+function Show-Extensions {
+    $x = New-Object System.Windows.Forms.Form
+    $x.Text = '大肥鱼 · 拓展模块'
+    $x.Size = New-Object System.Drawing.Size(880, 780)
+    $x.StartPosition = 'CenterParent'
+    $x.BackColor = $BG
+    $x.FormBorderStyle = 'FixedSingle'
+    $x.MaximizeBox = $false
+    $x.Font = $fBody
+
+    New-Label $x '拓展模块' 24 12 300 32 $fTitle $INK | Out-Null
+    New-Label $x '这些都不是必须的。不装，她只是少一样本事；装了的，各要一份自己的配置。' 24 46 820 20 $fSub $MUTED | Out-Null
+
+    $script:extLbl = @{}
+    $script:extLog = $null
+
+    function New-ExtCard([int]$y) {
+        $p = New-Object System.Windows.Forms.Panel
+        $p.Location = New-Object System.Drawing.Point(24, $y)
+        $p.Size = New-Object System.Drawing.Size(812, 124)
+        $p.BackColor = $CARD
+        $p.BorderStyle = 'FixedSingle'
+        $x.Controls.Add($p)
+        return $p
+    }
+
+    function ELog([string]$s) {
+        if (-not $s) { return }
+        if ($script:extLog) {
+            $script:extLog.AppendText($s + "`r`n")
+            $script:extLog.SelectionStart = $script:extLog.TextLength
+            $script:extLog.ScrollToCaret()
+        }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    function Set-Stat([string]$id, [string]$text, [string]$badge, [string]$color) {
+        if ($script:extLbl.ContainsKey($id + 'Stat')) {
+            $script:extLbl[$id + 'Stat'].Text = $text
+            $script:extLbl[$id + 'Stat'].ForeColor = [System.Drawing.ColorTranslator]::FromHtml($color)
+        }
+        if ($script:extLbl.ContainsKey($id + 'Badge')) {
+            $script:extLbl[$id + 'Badge'].Text = $badge
+            $script:extLbl[$id + 'Badge'].ForeColor = [System.Drawing.ColorTranslator]::FromHtml($color)
+        }
+    }
+
+    function Update-ExtAll {
+        $s = Get-ExtStates
+        $mk = { param($ok) if ($ok) { '✓' } else { '✗' } }
+
+        # 刷 B 站
+        $okB = ($s.bili.venv -and $s.bili.login)
+        $txtB = ('环境 ' + (& $mk $s.bili.venv) + ' · 已登录 ' + (& $mk $s.bili.login) + ' · 今天的日报 ' + (& $mk $s.bili.today))
+        $colB = if ($okB -and $s.bili.today) { '#15803d' } elseif ($okB) { '#6b7280' } elseif ($s.bili.venv -or $s.bili.login) { '#b91c1c' } else { '#6b7280' }
+        $badB = if ($okB) { '已装好' } elseif ($s.bili.venv -or $s.bili.login) { '缺一项' } else { '没装' }
+        Set-Stat 'bili' $txtB $badB $colB
+
+        # 生图
+        $okC = ($s.comfy.app -and $s.comfy.models)
+        # ⚠️ PS 5.1 里 `if` 是语句不是表达式 —— 塞进字符串拼接会报「无法将 if 识别为 cmdlet」，先算进变量。
+        $upTxt = '没起'
+        if ($s.comfy.up) { $upTxt = '在跑' }
+        $txtC = ('程序 ' + (& $mk $s.comfy.app) + ' · 模型 ' + (& $mk $s.comfy.models) + ' · 8188 ' + $upTxt)
+        $colC = if ($okC) { '#15803d' } elseif ($s.comfy.app -or $s.comfy.models) { '#b91c1c' } else { '#6b7280' }
+        $badC = if ($okC) { '已装好' } elseif ($s.comfy.app -or $s.comfy.models) { '缺一项' } else { '没装' }
+        Set-Stat 'comfy' $txtC $badC $colC
+
+        # 语音
+        $okV = ($s.voice.script -and $s.voice.key)
+        $txtV = ('合成脚本 ' + (& $mk $s.voice.script) + ' · 硅基流动 key ' + (& $mk $s.voice.key))
+        $colV = if ($okV) { '#15803d' } elseif ($s.voice.script -or $s.voice.key) { '#b91c1c' } else { '#6b7280' }
+        $badV = if ($okV) { '能用' } elseif ($s.voice.script -or $s.voice.key) { '缺一项' } else { '没装' }
+        Set-Stat 'voice' $txtV $badV $colV
+
+        # QQ
+        $okQ = $s.qq.nap
+        $botTxt = ' · 小号还没填'
+        if ($s.qq.bot) { $botTxt = ' · 小号 ' + $s.qq.bot }
+        $txtQ = ('NapCat ' + (& $mk $s.qq.nap) + $botTxt)
+        $colQ = if ($okQ) { '#15803d' } else { '#6b7280' }
+        $badQ = if ($okQ) { '在' } else { '没找到' }
+        Set-Stat 'qq' $txtQ $badQ $colQ
+    }
+
+    # ---- 四张卡 ----
+    # ⚠️ 循环变量叫 $pnl 不叫 $card：PowerShell 变量名**不分大小写**，$card 就是 $CARD（卡片底色那个颜色），
+    #    第二张卡开始 $CARD 变成上一张 Panel ⇒ 每张卡都抛「无法将 …Panel 转换为 …Color」（实测踩过）。
+    $y = 74
+    foreach ($m in $EXT_MODULES) {
+        $pnl = New-ExtCard $y
+        New-Label $pnl $m.title 14 8 300 22 $fH $INK | Out-Null
+        $bd = New-Label $pnl '' 690 8 106 22 $fSub $MUTED
+        $bd.TextAlign = 'MiddleRight'
+        $script:extLbl[$m.id + 'Badge'] = $bd
+        New-Label $pnl $m.desc 14 28 800 18 $fSub $INK | Out-Null
+        New-Label $pnl $m.need 14 46 800 18 $fSub $MUTED | Out-Null
+        $stt = New-Label $pnl '' 14 64 800 20 $fSub $MUTED
+        $script:extLbl[$m.id + 'Stat'] = $stt
+
+        switch ($m.id) {
+            'bili' {
+                $b1 = New-Button $pnl '看今天的日报' 14 86 120
+                $b2 = New-Button $pnl '打开目录' 142 86 100
+                $b3 = New-Button $pnl '打开配置' 250 86 100
+                $b1.Add_Click({
+                        $today = Join-Path $BILI_DIR ('out\' + (Get-Date).ToString('yyyy-MM-dd') + '.md')
+                        if (Test-Path $today) { try { Start-Process $today } catch { } ; ELog '打开今天的日报' ; return }
+                        $last = @(Get-ChildItem (Join-Path $BILI_DIR 'out') -Filter '*.md' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+                        if ($last.Count -gt 0) { try { Start-Process $last[0].FullName } catch { } ; ELog ('今天还没有，打开最近一份：' + $last[0].Name) }
+                        else { ELog '一份日报都还没有 —— 她第一轮跑完才会有。' }
+                    })
+                $b2.Add_Click({ if (Test-Path $BILI_DIR) { Start-Process $BILI_DIR } else { ELog ('没有这个目录：' + $BILI_DIR) } })
+                $b3.Add_Click({
+                        $cfgp = Join-Path $BILI_DIR 'config.json'
+                        if (Test-Path $cfgp) { try { Start-Process notepad.exe $cfgp } catch { } ; ELog '配置：' + $cfgp } else { ELog ('还没有配置文件：' + $cfgp) }
+                    })
+            }
+            'comfy' {
+                $b1 = New-Button $pnl '安装 / 补齐' 14 86 110
+                $tp = New-Object System.Windows.Forms.TextBox
+                $tp.Location = New-Object System.Drawing.Point(132, 88)
+                $tp.Size = New-Object System.Drawing.Size(360, 26)
+                $tp.Font = $fBody
+                $tp.Text = 'a small orange fish swimming in dark water, soft rim light'
+                $pnl.Controls.Add($tp)
+                $b2 = New-Button $pnl '画一张' 500 86 90
+                $b3 = New-Button $pnl '打开图目录' 598 86 110
+                $b1.Add_Click({
+                        ELog '—— 安装 / 补齐 ComfyUI（缺什么补什么，断了重跑会接着下；下面会一行一行出）'
+                        $rc = Invoke-NodeFile (Join-Path $TOOLS 'comfyui-install.mjs') @() 180 -Sink ${function:ELog}
+                        ELog ('—— 结束，退出码 ' + $rc + $(if ($rc -eq 0) { '（装好了）' } else { '（没装完，看上面最后几行）' }))
+                        Update-ExtAll
+                    })
+                $b2.Add_Click({
+                        $txt = $tp.Text.Trim()
+                        if (-not $txt) { ELog '先写一句想画什么。'; return }
+                        $tmp = Join-Path $env:TEMP ('dfy-prompt-' + [guid]::NewGuid().ToString('N') + '.txt')
+                        [System.IO.File]::WriteAllText($tmp, $txt, (New-Object System.Text.UTF8Encoding($false)))
+                        ELog ('—— 画：' + $txt)
+                        $rc = Invoke-NodeFile (Join-Path $TOOLS 'draw-once.mjs') @('--file', $tmp, '--open') 12 -Sink ${function:ELog}
+                        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                        if ($rc -ne 0) { ELog '—— 没画出来（看上面那行原因）' }
+                        Update-ExtAll
+                    })
+                $b3.Add_Click({
+                        $o = Join-Path $COMFY_ROOT 'output'
+                        if (Test-Path $o) { Start-Process $o } else { ELog ('还没有出过图：' + $o) }
+                    })
+            }
+            'voice' {
+                $tv = New-Object System.Windows.Forms.TextBox
+                $tv.Location = New-Object System.Drawing.Point(14, 88)
+                $tv.Size = New-Object System.Drawing.Size(420, 26)
+                $tv.Font = $fBody
+                $tv.Text = '我在。今天也在这儿。'
+                $pnl.Controls.Add($tv)
+                $b1 = New-Button $pnl '念出来' 442 86 90
+                $b1.Add_Click({
+                        $txt = $tv.Text.Trim()
+                        if (-not $txt) { ELog '先写一句要念的话。'; return }
+                        if (-not (Test-Path (Join-Path $TOOLS 'speak-play.ps1'))) { ELog '缺 tools\speak-play.ps1'; return }
+                        $tmp = Join-Path $env:TEMP ('dfy-tts-' + [guid]::NewGuid().ToString('N') + '.txt')
+                        [System.IO.File]::WriteAllText($tmp, $txt, (New-Object System.Text.UTF8Encoding($false)))
+                        try {
+                            # 脱管：合成 + 播放交给子进程，界面不卡（中文走文件，不过命令行 —— ACP=936）
+                            Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $TOOLS 'speak-play.ps1'), '-TextFile', $tmp
+                            ELog ('—— 念：' + $txt)
+                        } catch { ELog ('没念出来：' + $_.Exception.Message) }
+                        Update-ExtAll
+                    })
+            }
+            'qq' {
+                $b1 = New-Button $pnl '打开 NapCat 目录' 14 86 140
+                $b2 = New-Button $pnl '打开身份配置' 162 86 120
+                $b1.Add_Click({
+                        $s2 = Get-ExtStates
+                        if ($s2.napPath -and (Test-Path $s2.napPath)) { Start-Process (Split-Path -Parent $s2.napPath) }
+                        else { ELog '没找到 NapCat —— 不接 QQ 可以不管这一条。' }
+                    })
+                $b2.Add_Click({ if (Test-Path $MACHINE_FILE) { try { Start-Process notepad.exe $MACHINE_FILE } catch { } ; ELog '身份：' + $MACHINE_FILE } else { ELog '还没生成 machine.json —— 主界面填两个号、点「开始安装」就有了。' } })
+            }
+        }
+        $y += 130
+    }
+
+    $script:extLog = New-Object System.Windows.Forms.TextBox
+    $script:extLog.Location = New-Object System.Drawing.Point(24, 596)
+    $script:extLog.Size = New-Object System.Drawing.Size(812, 84)
+    $script:extLog.Multiline = $true
+    $script:extLog.ScrollBars = 'Vertical'
+    $script:extLog.ReadOnly = $true
+    $script:extLog.Font = $fMono
+    $script:extLog.BackColor = [System.Drawing.Color]::FromArgb(252, 252, 253)
+    $script:extLog.BorderStyle = 'FixedSingle'
+    $x.Controls.Add($script:extLog)
+
+    New-Label $x '想加一个模块：往 setup-ui.ps1 的 $EXT_MODULES 里加一行，再给它配几个按钮。' 24 690 560 20 $fSub $MUTED | Out-Null
+
+    $btnRe = New-Button $x '刷新状态' 590 686 110
+    $btnXc = New-Button $x '关闭' 720 686 116
+    $btnRe.Add_Click({ Update-ExtAll; ELog '—— 状态刷新了' })
+    $btnXc.Add_Click({ $x.Close() })
+
+    $x.Add_Shown({
+            ELog '状态只看本地：文件在不在、端口通不通。装什么、补什么，按上面卡片里的按钮。'
+            Update-ExtAll
+        })
+
+    [void]$x.ShowDialog($form)
+}
+
 # ---------- 事件 ----------
 $btnCheck.Add_Click({ Run-Checks })
 $btnStatus.Add_Click({ Show-Status })
@@ -766,6 +1119,7 @@ $btnStart.Add_Click({
 
 $btnWeb.Add_Click({ try { Start-Process 'http://127.0.0.1:3080' } catch { Write-Log '打不开浏览器，自己点 http://127.0.0.1:3080' } })
 $btnHome.Add_Click({ try { Start-Process 'http://127.0.0.1:3077/' } catch { Write-Log '打不开浏览器，自己点 http://127.0.0.1:3077/' } })
+$btnExt.Add_Click({ Show-Extensions })
 $btnClose.Add_Click({ $form.Close() })
 
 $form.Add_Shown({
