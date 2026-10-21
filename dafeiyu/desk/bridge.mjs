@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import dns from 'node:dns';
 import { execFile, spawn } from 'node:child_process';
 import { chat, llmSummary } from '../lib/llm.mjs';
+import { draw } from '../lib/comfy.mjs';
 
 dns.setDefaultResultOrder('ipv4first'); // 这台机器先解析到 IPv6 会挂住（心跳里踩过）
 
@@ -262,6 +263,8 @@ function systemPrompt() {
     '',
     '## 你能动手（2026-10-20 他给的这个权限）',
     '你手上有工具：能跑 PowerShell 命令、列他开着的窗口、打开程序或网址、读写文件。',
+    '**你还有一支笔**：`draw` 能当场画一张图（本机 ComfyUI，十几秒），画完会弹到他屏幕上。',
+    '他说"画一个…"、或者你自己想到了一个画面 —— 直接画，不用问。',
     '**这些是真的会在这台机器上发生的事，不是模拟。** 所以：',
     '- 想看他屏幕上有什么、想知道某个东西在不在、想改一个文件 —— 直接动手，别只嘴上说"你去看看"。',
     '- 顺序是「先看，再动」：不确定的地方先查（windows / run），看清楚再改。',
@@ -370,6 +373,29 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'draw',
+      description:
+        '画一张图 —— 本机的 ComfyUI（FLUX.1-schnell），1024，十几秒一张。'
+        + '想给他看个画面、想给自己配张图、他说"画一个…"的时候用，不用问他要不要。'
+        + 'prompt 用英文写效果最好，一句到三句：主体 + 在什么环境 + 什么光 + 什么质感。'
+        + '别堆形容词（"beautiful, amazing, masterpiece"这种反而更差），也别写中文成语。'
+        + '画完图会自动弹到他屏幕上，你只需要说一句你画了什么。',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: '画面描述，英文' },
+          model: { type: 'string', enum: ['flux', 'sdxl'], description: 'flux 好看（默认，约 14 秒）；sdxl 更快' },
+          width: { type: 'integer', description: '默认 1024' },
+          height: { type: 'integer', description: '默认 1024' },
+          seed: { type: 'integer', description: '想复现某一张就填那次的数，不填就随机' },
+        },
+        required: ['prompt'],
+      },
+    },
+  },
 ];
 
 function clip(s, n = 6000) {
@@ -458,6 +484,27 @@ async function runTool(name, rawArgs) {
         );
       })();
       return '已经交给后台了。它有自己的全套工具，一般几分钟；弄完我直接把结果贴到这儿 —— 你先去忙别的。';
+    }
+    case 'draw': {
+      const prompt = String(args.prompt || '').trim();
+      if (!prompt) return '要画什么是空的。';
+      activity('acting', '画画');
+      const r = await draw({
+        prompt,
+        model: args.model === 'sdxl' ? 'sdxl' : 'flux',
+        width: args.width,
+        height: args.height,
+        seed: Number.isInteger(args.seed) ? args.seed : undefined,
+      });
+      activity('thinking', '');
+      if (!r.ok) return '没画成：' + r.error;
+      // 面板是纯文字，图画只能弹出来 —— 画完就给他看一眼，这正是画画的意思
+      try {
+        const q = "'" + String(r.file).replace(/'/g, "''") + "'";
+        await runPS('Start-Process ' + q, 15);
+      } catch { }
+      return '画好了 · ' + r.model + ' · ' + r.seconds + ' 秒 · seed ' + r.seed + '\n' + r.file
+        + '\n（图已经弹到他屏幕上了。要用同一张再来一次，就把这个 seed 带上。）';
     }
     default:
       return '没有这个工具：' + name;
