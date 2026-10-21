@@ -265,6 +265,7 @@ function systemPrompt() {
     '你手上有工具：能跑 PowerShell 命令、列他开着的窗口、打开程序或网址、读写文件。',
     '**你还有一支笔**：`draw` 能当场画一张图（本机 ComfyUI，十几秒），画完会弹到他屏幕上。',
     '他说"画一个…"、或者你自己想到了一个画面 —— 直接画，不用问。',
+    '- 🔴 **说要画，就当场调 draw。** 嘴上说"画好了"而没调工具，就是骗他 —— 这一条比话说得漂亮重要得多。',
     '**这些是真的会在这台机器上发生的事，不是模拟。** 所以：',
     '- 想看他屏幕上有什么、想知道某个东西在不在、想改一个文件 —— 直接动手，别只嘴上说"你去看看"。',
     '- 顺序是「先看，再动」：不确定的地方先查（windows / run），看清楚再改。',
@@ -524,6 +525,13 @@ async function callModel(messages, forbidTools) {
 }
 
 
+/** 他这一句是不是在让她画。
+ *  2026-10-21 实测：deepseek-chat 会跳过 draw 直接回一句「画好了」—— 而且历史里留着她编的那句，
+ *  后面几轮就跟着学。所以遇上这几个词，她没调 draw 就不放她过去。 */
+function wantsDraw(text) {
+  return /(画一[张个幅下]|画个|画张|画画|画吧|来一张|来张图|绘制|用\s*draw|draw\s*工具)/i.test(String(text || ''));
+}
+
 async function agentLoop(text, files) {
   // 历史里带过文件的那几句，也要把路径再交给她一遍 —— 否则回头问"刚才那个文件"她一脸茫然。
   let recent = history(16).map(h => ({ role: h.role, content: String(h.text || '') + fileBlock(h.files) }));
@@ -550,6 +558,13 @@ async function agentLoop(text, files) {
     if (!calls || calls.length === 0) {
       const reply = String(msg.content || '').trim();
       if (!reply) throw new Error('模型这轮什么都没说');
+      // 他要画，她却只回了一句「画好了」—— 这种话最像真的，也最骗人。推她一把再问一次。
+      if (step === 0 && wantsDraw(text) && !did.includes('draw')) {
+        messages.push({ role: 'assistant', content: reply });
+        messages.push({ role: 'user', content: '（你刚才没有调用任何工具。他是在让你画 —— 现在就调 draw，把画面写成英文 prompt，画完再说。）' });
+        traceAction('nudge draw');
+        continue;
+      }
       return { reply, did };
     }
     messages.push({ role: 'assistant', content: msg.content || '', tool_calls: calls });
