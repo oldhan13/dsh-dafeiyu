@@ -162,7 +162,7 @@ cd C:\dsh-workspace
 
 **想打成一个 exe？** `.\dafeiyu\tools\build-exe.ps1` 用 ps2exe 把部署界面编成 `dist\dafeiyu-setup.exe`
 （要从 PSGallery 装一次 ps2exe；打不出来也不影响用 `setup.cmd`，两者是同一个东西）。
-打出来大概 60 KB。
+打出来大概 90 KB。
 
 **这个 exe 现在能自己起手了。** 从 release 页单下一个 `dafeiyu-setup.exe` 双击也可以：
 它发现自己不在仓库目录里，就会问你要装到哪儿，然后把仓库 zip 拉下来解开（**不需要 git**），
