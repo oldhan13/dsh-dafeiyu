@@ -17,7 +17,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -Namespace W -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
 [void][W.Dpi]::SetProcessDPIAware()
 
-$ROOT = '<WORKSPACE>'
+$ROOT = 'C:\Users\lenovo\Documents\deepseek-harness\default-workspace'
 $PET = Join-Path $ROOT 'dafeiyu\pet'
 $STATE = Join-Path $PET 'state.json'
 $LOG = Join-Path $PET 'pet.log'
@@ -325,6 +325,22 @@ function Take-Shot {
 }
 function Open-Home { Start-Process 'http://127.0.0.1:3077/' }
 
+# 打开配置界面（2026-10-21 他要的：「右键菜单加一项打开配置」）。
+# 为什么另起一个进程：部署界面是个 WinForms 模态窗，在鱼这个进程里 ShowDialog 会把鱼卡住
+# （模态循环在等窗口关闭，鱼的动画和气泡全都停）。所以只负责把它叫出来，不接它的返回值。
+function Open-Setup {
+  $ui = Join-Path $ROOT 'dafeiyu\tools\setup-ui.ps1'
+  if (-not (Test-Path $ui)) { Say-Bubble '找不到配置界面。'; return }
+  try {
+    Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ui
+    Trace 'open-setup'
+    Say-Bubble '配置界面开了。'
+  } catch {
+    Trace ('open-setup failed: ' + $_.Exception.Message)
+    Say-Bubble '配置界面打不开，看 pet.log。'
+  }
+}
+
 # ---- 点一下会做事 ----
 # 两个动作，随机挑：吐泡泡（55%）、游一下（37%）、偶尔两个一起来（8%）。
 # 泡泡是从嘴边冒出来的空心小圈，向上飘、边飘边大边淡；冲刺是整条鱼横移出去再回来 + 尾巴甩得更凶。
@@ -441,12 +457,14 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $mChat = $menu.Items.Add('说话')
 $mShot = $menu.Items.Add('看一眼屏幕')
 $mHome = $menu.Items.Add('她的主页')
+$mCfg = $menu.Items.Add('打开配置')
 [void]$menu.Items.Add('-')
 $mHide = $menu.Items.Add('躲到托盘')
 $mExit = $menu.Items.Add('退出')
 $mChat.Add_Click({ Open-Chat })
 $mShot.Add_Click({ Take-Shot })
 $mHome.Add_Click({ Open-Home })
+$mCfg.Add_Click({ Open-Setup })
 $mHide.Add_Click({ $form.Hide() })
 $mExit.Add_Click({ $script:quit = $true; $form.Close() })
 $form.ContextMenuStrip = $menu
@@ -469,6 +487,7 @@ $tShow = $tm.Items.Add('叫出来')
 $tChat = $tm.Items.Add('说话')
 $tShot = $tm.Items.Add('看一眼屏幕')
 $tHome = $tm.Items.Add('她的主页')
+$tCfg = $tm.Items.Add('打开配置')
 [void]$tm.Items.Add('-')
 $tExit = $tm.Items.Add('退出')
 $ni.ContextMenuStrip = $tm
@@ -476,6 +495,7 @@ $tShow.Add_Click({ $form.Show(); $form.Activate() })
 $tChat.Add_Click({ Open-Chat })
 $tShot.Add_Click({ Take-Shot })
 $tHome.Add_Click({ Open-Home })
+$tCfg.Add_Click({ Open-Setup })
 $tExit.Add_Click({ $script:quit = $true; $form.Close() })
 $ni.Add_DoubleClick({ $form.Show(); $form.Activate(); Open-Chat })
 

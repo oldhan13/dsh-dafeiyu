@@ -89,7 +89,12 @@ $fMono  = New-Object System.Drawing.Font('Consolas', 9)
 # ================================================================
 function Test-ProjectAt([string]$p) {
     if (-not $p) { return $false }
-    return ((Test-Path (Join-Path $p 'install.ps1')) -and (Test-Path (Join-Path $p 'dafeiyu\tools\start-dafeiyu.ps1')))
+    # 判断"这是不是一个已经装好的大肥鱼"：**只要有 start-dafeiyu.ps1 和这份界面**就算。
+    # 2026-10-21 改：原来还要 install.ps1 —— 但**跑起来的那份工作区**（他自己的这台）没有 install.ps1
+    # （那份只在仓库 clone 里），结果桌宠右键「打开配置」一按就弹"先把它自己拉下来"，等于没配。
+    # install.ps1 只有「开始安装」那一步要用，缺了在那一步说清楚就行。
+    return ((Test-Path (Join-Path $p 'dafeiyu\tools\start-dafeiyu.ps1')) -and
+        (Test-Path (Join-Path $p 'dafeiyu\tools\setup-ui.ps1')))
 }
 
 $ZIP_URL = 'https://codeload.github.com/oldhan13/dsh-dafeiyu/zip/refs/heads/main'
@@ -518,11 +523,13 @@ function Run-Checks {
 
     # 第一项就查「我在不在一个项目里」。单独下载的 exe 会算出离奇的 PROJECT（实测裸跑是 C:\），
     # 后面每一行都可能是勾，点「开始安装」才失败 —— 那太晚了，也看不出为什么。
-    $okProj = (Test-Path (Join-Path $PROJECT 'install.ps1')) -and (Test-Path (Join-Path $TOOLS 'start-dafeiyu.ps1'))
-    Add-Check '项目目录' $okProj $(if ($okProj) { $PROJECT } else { '这里不是仓库目录：先把这个仓库 clone 下来，再把 exe 放进 dist\ 或根目录（算出来是 ' + $PROJECT + '）' })
+    $okProj = (Test-Path (Join-Path $TOOLS 'start-dafeiyu.ps1'))
+    $hasInstall = Test-Path (Join-Path $PROJECT 'install.ps1')
+    Add-Check '项目目录' $okProj $(if ($okProj) { $PROJECT } else { '这里不是大肥鱼的工作区：先把这个仓库 clone 下来，再把 exe 放进 dist\ 或根目录（算出来是 ' + $PROJECT + '）' })
+    if (-not $hasInstall) { Add-Check 'install.ps1' $true '没有（不是从仓库 clone 的那份）—— 只影响「开始安装」那一步，其余照常用' }
     if ($btnInstall) {
         $btnInstall.Enabled = $okProj
-        $btnInstall.Text = if ($okProj) { '开始安装' } else { '先放回仓库目录' }
+        $btnInstall.Text = if (-not $okProj) { '先放回工作区' } elseif (-not $hasInstall) { '这里装不了（没 install.ps1）' } else { '开始安装' }
     }
 
     $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
@@ -956,6 +963,10 @@ function Show-Extensions {
                 $b1 = New-Button $pnl '看今天的日报' 14 86 120
                 $b2 = New-Button $pnl '打开目录' 142 86 100
                 $b3 = New-Button $pnl '打开配置' 250 86 100
+                # 「现在跑一轮」（2026-10-21 他要的）：不自己再造一套刷法 ——
+                # 插件（dsh-bili-scroll）在宿主 3080 上已经开了 POST /api/bili-duty/run，
+                # 它自己 spawn 一个 headless 会话、把 duty.md 交给它。这里只是按一下那个按钮。
+                $b4 = New-Button $pnl '现在跑一轮' 358 86 110
                 $b1.Add_Click({
                         $today = Join-Path $BILI_DIR ('out\' + (Get-Date).ToString('yyyy-MM-dd') + '.md')
                         if (Test-Path $today) { try { Start-Process $today } catch { } ; ELog '打开今天的日报' ; return }
@@ -967,6 +978,24 @@ function Show-Extensions {
                 $b3.Add_Click({
                         $cfgp = Join-Path $BILI_DIR 'config.json'
                         if (Test-Path $cfgp) { try { Start-Process notepad.exe $cfgp } catch { } ; ELog '配置：' + $cfgp } else { ELog ('还没有配置文件：' + $cfgp) }
+                    })
+                $b4.Add_Click({
+                        # 这一轮是**真的**：会去搜、会写日报，开着自动评论的话还会真的发到 B 站上。
+                        $ask = [System.Windows.Forms.MessageBox]::Show(
+                            '现在跑一轮会照设置里那档来 —— 你要是开着自动评论，这一轮就真会发到 B 站上去。' + "`r`n`r`n" + '跑吗？',
+                            '跑一轮？',
+                            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                            [System.Windows.Forms.MessageBoxIcon]::Question)
+                        if ($ask -ne [System.Windows.Forms.DialogResult]::Yes) { ELog '—— 嗯，没跑。'; return }
+                        ELog '—— 让她现在跑一轮（后台 headless，几分钟；跑完今天的日报就有了）'
+                        try {
+                            $r = Invoke-RestMethod -Uri 'http://127.0.0.1:3080/api/bili-duty/run' -Method Post -TimeoutSec 20
+                            if ($r.started) { ELog ('—— 开跑了 · profile ' + $r.profile + ' · 日志 ' + $r.log) }
+                            else { ELog ('—— 没起来：' + $r.error) }
+                        } catch {
+                            ELog ('—— 宿主（3080）没应：' + $_.Exception.Message + '。先回主界面点「一键启动」')
+                        }
+                        Update-ExtAll
                     })
             }
             'comfy' {
@@ -1095,6 +1124,11 @@ $btnSaveKey.Add_Click({
 $btnInstall.Add_Click({
     $btnInstall.Enabled = $false
     try {
+        # 这份工作区没有 install.ps1（不是从仓库 clone 的那份）⇒ 装不了，但别弹出难看的东西。
+        if (-not (Test-Path (Join-Path $PROJECT 'install.ps1'))) {
+            Write-Log '这里没有 install.ps1 —— 不是从仓库 clone 的那份，安装那一步跳过。启动、状态、拓展模块照常用。'
+            return
+        }
         $q = $txtOwner.Text.Trim(); $b = $txtBot.Text.Trim()
         if (-not $q -or -not $b) { Write-Log '先把两个 QQ 号都填上（只接桌面那条线、暂时不要 QQ，也要填，之后能改）。'; return }
         Save-Machine
