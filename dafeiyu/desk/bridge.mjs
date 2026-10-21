@@ -397,6 +397,27 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'look_motion',
+      description:
+        '量一张动图（GIF / WebP / APNG / 动图 MP4 / WebM）—— 不是看，是**量**：几帧、多长、多大、'
+        + '哪几个时刻变化最大。'
+        + '🔴 这条线是纯文本模型，**你看不见画面本身**。但这个工具能告诉你两件光看文件名看不出的事：'
+        + '① 它到底是不是在动（还是一张静图重复了几遍）；② 值得细看的是第几毫秒。'
+        + '它会顺手拼一张白底拼图（每格左上角标着帧号和毫秒）落在 dafeiyu/assets/motion/，'
+        + '那个路径可以给他、也可以给别的能看图的东西。'
+        + '收到图片 / 动图 / 他说"你看这个"的时候调它。**结果里只有数字，别编你没看见的画面。**',
+      parameters: {
+        type: 'object',
+        properties: {
+          file: { type: 'string', description: '文件路径（绝对路径，或相对工作区）' },
+        },
+        required: ['file'],
+      },
+    },
+  },
 ];
 
 function clip(s, n = 6000) {
@@ -433,6 +454,22 @@ function runPS(cmd, timeoutSec) {
         resolve(clip(parts.join('\n') || '(没有输出)'));
       },
     );
+  });
+}
+
+/** 跑一个 .mjs 脚本，拿它的 stdout。返回 {code, out, err}（不抛，调用方自己判）。 */
+function runNode(script, argList, timeoutSec) {
+  return new Promise((resolve) => {
+    const t = Math.min(Math.max(Number(timeoutSec) || 60, 5), 180) * 1000;
+    execFile(process.execPath, [script, ...(argList || [])], {
+      timeout: t, maxBuffer: 8 * 1024 * 1024, windowsHide: true, encoding: 'utf8', cwd: ROOT,
+    }, (err, stdout, stderr) => {
+      resolve({
+        code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+        out: String(stdout || ''),
+        err: String(stderr || '') + (err && err.killed ? `（超过 ${t / 1000} 秒，被杀掉了）` : ''),
+      });
+    });
   });
 }
 
@@ -506,6 +543,43 @@ async function runTool(name, rawArgs) {
       } catch { }
       return '画好了 · ' + r.model + ' · ' + r.seconds + ' 秒 · seed ' + r.seed + '\n' + r.file
         + '\n（图已经弹到他屏幕上了。要用同一张再来一次，就把这个 seed 带上。）';
+    }
+    case 'look_motion': {
+      const f = String(args.file || '').trim();
+      if (!f) return '要给个文件路径。';
+      let abs;
+      try { abs = resolvePath(f); } catch (e) { return String(e.message || e); }
+      if (!fs.existsSync(abs)) return '找不到这个文件：' + abs;
+      activity('acting', '量动图');
+      const r = await runNode(path.join(ROOT, 'dafeiyu', 'tools', 'motion.mjs'), [abs, '--json'], 150);
+      activity('thinking', '');
+      if (r.code !== 0) {
+        return '量不出来：' + (String(r.err || r.out).trim().split('\n').slice(-2).join(' ') || '（没有输出）');
+      }
+      let j = null;
+      try { j = JSON.parse(r.out); } catch { return '工具跑完了，但输出读不懂：\n' + clip(r.out, 400); }
+
+      const secs = (Number(j.durationMs || 0) / 1000).toFixed(2);
+      const out = [];
+      if (j.isAnimated) {
+        out.push('是动图：' + j.frames + ' 帧 / 共 ' + secs + ' 秒 / 约 ' + j.fps + ' fps / '
+          + (j.size ? j.size.w + '×' + j.size.h : '尺寸未知'));
+      } else {
+        out.push('只有 1 帧 —— 这是张静图，不是动图。');
+      }
+      if (j.扩展名骗人) {
+        out.push('⚠️ 扩展名写的是 ' + j.扩展名 + '，真身是 ' + j.真身 + ' —— 这个通道里后缀经常是假的。');
+      }
+      const tops = (j.change && Array.isArray(j.change.top)) ? j.change.top.filter((x) => Number(x.delta) > 0.5) : [];
+      if (tops.length) {
+        out.push('变化最大的是：' + tops.map((x) => x.tMs + 'ms（第 ' + x.frame + ' 帧）').join('、')
+          + '。其余时刻基本没动 —— 要细看就看这几个点。');
+      } else if (j.isAnimated) {
+        out.push('相邻帧几乎没差别 —— 它可能只是在一抖一抖，不是真的"动起来"。');
+      }
+      out.push('拼图（白底，每格左上角是帧号和毫秒）：' + j.strip);
+      out.push('（你看不见画面本身。要说话就说这些数字，别描述你没看见的东西。）');
+      return out.join('\n');
     }
     default:
       return '没有这个工具：' + name;
