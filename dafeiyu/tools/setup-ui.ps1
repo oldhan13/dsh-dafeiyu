@@ -407,6 +407,9 @@ $btnWeb     = New-Button $form '打开网页界面' 270 734 120
 $btnHome    = New-Button $form '打开她的主页' 398 734 120
 $btnExt     = New-Button $form '拓展模块…' 526 734 150
 $btnClose   = New-Button $form '关闭' 720 734 116
+# 「检查更新」（2026-10-21 他要的）：放在标题右边那一角 —— 它是个次要动作，
+# 不该跟「一键启动」抢底下一整排的位置。
+$btnUpd     = New-Button $form '检查更新' 700 14 132 34
 
 $lblFoot = New-Label $form '' 24 776 812 22 $fSub $MUTED
 $lblFoot.Text = '提示：装完第一次启动会慢一点（她要在读记忆）；端口被占时先看 3077 / 3079 / 3080 谁在用。'
@@ -1092,6 +1095,270 @@ function Show-Extensions {
     [void]$x.ShowDialog($form)
 }
 
+# ================================================================
+# 更新（2026-10-21 他要的：「配置界面加一个检查更新，直接从网上拉、下载、替换」）
+#   三条底线，改之前先看：
+#     ① **数据一律不碰** —— people / memory / state / assets / voice / group / relay / bili /
+#        homepage\data / desk\history.jsonl / 桌宠那几个 state 文件。更新只换代码和文档。
+#     ② 换之前**先备份**到 `dafeiyu\state\backup\update-<时间>\`，真出问题能退回去。
+#     ③ 只从**仓库 main 的 zip** 拿（codeload，**不需要 git**），和 Show-Bootstrap 同一个地址。
+#   还要记住：换完 `setup-ui.ps1` 自己也变了，**当前进程跑的还是旧代码** —— 必须提示重开窗口。
+# ================================================================
+$API_COMMIT = 'https://api.github.com/repos/oldhan13/dsh-dafeiyu/commits/main'
+$ZIP_MAIN   = 'https://codeload.github.com/oldhan13/dsh-dafeiyu/zip/refs/heads/main'
+$VER_FILE   = Join-Path $PROJECT 'dafeiyu\state\version.json'
+
+# 目录名（相对 dafeiyu\）—— 整棵不碰
+$NO_TOUCH_DIRS = @('people', 'memory', 'state', 'assets', 'voice', 'group', 'relay', 'bili', 'homepage\data')
+# 单个文件（相对项目根）—— 不碰
+$NO_TOUCH_FILES = @(
+    'dafeiyu\desk\history.jsonl',
+    'dafeiyu\pet\state.json',
+    'dafeiyu\pet\panel-state.json',
+    'dafeiyu\pet\say.txt',
+    'dafeiyu\pet\activity.json',
+    'dafeiyu\pet\pet.log'
+)
+# 只换这些扩展名的东西（二进制、图片一律不碰）
+$CODE_EXT = @('.ps1', '.psm1', '.mjs', '.js', '.cmd', '.bat', '.md', '.html', '.css', '.json')
+
+function Get-LocalVersion {
+    if (-not (Test-Path $VER_FILE)) { return '' }
+    try {
+        $txt = [System.IO.File]::ReadAllText($VER_FILE, [System.Text.Encoding]::UTF8)
+        $j = $txt | ConvertFrom-Json
+        if ($j.sha) { return [string]$j.sha }
+        return ''
+    } catch { return '' }
+}
+
+function Get-RemoteVersion {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $hdr = @{ 'User-Agent' = 'dafeiyu-setup'; 'Accept' = 'application/vnd.github+json' }
+    $r = Invoke-RestMethod -Uri $API_COMMIT -Headers $hdr -TimeoutSec 25
+    $sha = [string]$r.sha
+    $short = $sha
+    if ($sha.Length -ge 7) { $short = $sha.Substring(0, 7) }
+    $when = ''
+    try { $when = ([datetime]$r.commit.committer.date).ToLocalTime().ToString('MM-dd HH:mm') } catch { }
+    $msg = ''
+    try { $msg = (([string]$r.commit.message) -split "`n")[0] } catch { }
+    return @{ sha = $sha; short = $short; when = $when; msg = $msg }
+}
+
+function Invoke-UpdateZip($Sink) {
+    $say = { param($t) if ($Sink) { & $Sink $t } }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $tmp = Join-Path $env:TEMP ('dfy-upd-' + (Get-Date).ToString('yyyyMMddHHmmss'))
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    try {
+        $zpath = Join-Path $tmp 'repo.zip'
+        & $say '下载中…'
+        Invoke-WebRequest -Uri $ZIP_MAIN -OutFile $zpath -UseBasicParsing -TimeoutSec 180
+        $kb = [int]((Get-Item $zpath).Length / 1024)
+        & $say ('下载好了：' + $kb + ' KB')
+
+        $ex = Join-Path $tmp 'x'
+        Expand-Archive -LiteralPath $zpath -DestinationPath $ex -Force
+        $dirs = @(Get-ChildItem -Path $ex -Directory)
+        if ($dirs.Count -lt 1) { throw '解开的包里没有目录' }
+        $zipRoot = $dirs[0].FullName
+        & $say ('解开：' + $dirs[0].Name)
+
+        $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $bak = Join-Path $PROJECT ('dafeiyu\state\backup\update-' + $stamp)
+        $copied = 0
+        $backs = 0
+        $locked = @()
+
+        $srcFiles = @(Get-ChildItem -Path $zipRoot -Recurse -File -ErrorAction SilentlyContinue)
+        foreach ($sf in $srcFiles) {
+            $rel = $sf.FullName.Substring($zipRoot.Length).TrimStart('\')
+            if (-not $rel.StartsWith('dafeiyu\')) {
+                if ($rel -notmatch '^(setup\.cmd|start-dsh-web\.cmd|stop-dafeiyu\.cmd|dafeiyu\.cmd|install\.ps1|README\.md)$') { continue }
+            }
+            $ext = [System.IO.Path]::GetExtension($rel).ToLower()
+            if ($CODE_EXT -notcontains $ext) { continue }
+
+            $sub = $rel
+            if ($rel.StartsWith('dafeiyu\')) { $sub = $rel.Substring(8) }
+            $blocked = $false
+            foreach ($nd in $NO_TOUCH_DIRS) {
+                if ($sub.StartsWith($nd + '\') -or $sub -eq $nd) { $blocked = $true; break }
+            }
+            if ($NO_TOUCH_FILES -contains $rel) { $blocked = $true }
+            if ($blocked) { continue }
+
+            $dst = Join-Path $PROJECT $rel
+            $dstDir = Split-Path -Parent $dst
+            if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
+
+            $same = $false
+            if (Test-Path $dst) {
+                try {
+                    $h1 = (Get-FileHash -LiteralPath $sf.FullName -Algorithm MD5).Hash
+                    $h2 = (Get-FileHash -LiteralPath $dst -Algorithm MD5).Hash
+                    if ($h1 -eq $h2) { $same = $true }
+                } catch { }
+            }
+            if ($same) { continue }
+
+            if (Test-Path $dst) {
+                $bd = Split-Path -Parent (Join-Path $bak $rel)
+                if (-not (Test-Path $bd)) { New-Item -ItemType Directory -Path $bd -Force | Out-Null }
+                try { Copy-Item -LiteralPath $dst -Destination (Join-Path $bak $rel) -Force; $backs++ } catch { }
+            }
+            try {
+                Copy-Item -LiteralPath $sf.FullName -Destination $dst -Force -ErrorAction Stop
+                $copied++
+            } catch {
+                $locked += $rel
+            }
+        }
+
+        $bakTxt = ''
+        if ($backs -gt 0) { $bakTxt = '（备份了 ' + $backs + ' 个旧的到 state\backup）' }
+        & $say ('换掉了 ' + $copied + ' 个文件' + $bakTxt)
+
+        $sha = ''
+        try { $sha = (Get-RemoteVersion).sha } catch { }
+        $rec = @{
+            sha    = $sha
+            at     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            source = 'zip-main'
+            files  = $copied
+            backup = $bak
+        }
+        $json = $rec | ConvertTo-Json -Depth 4
+        [System.IO.File]::WriteAllText($VER_FILE, $json, (New-Object System.Text.UTF8Encoding($false)))
+        & $say ('版本记下了：' + $sha.Substring(0, [Math]::Min(7, $sha.Length)))
+
+        if ($locked.Count -gt 0) {
+            & $say ('⚠ 有 ' + $locked.Count + ' 个文件正在被用，这次没换成：')
+            foreach ($l in $locked) { & $say ('   ' + $l) }
+            & $say '   把桌宠 / 宿主关掉，再点一次更新。'
+        }
+        & $say '完成。'
+        return $true
+    } finally {
+        try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Show-Update {
+    $u = New-Object System.Windows.Forms.Form
+    $u.Text = '大肥鱼 · 检查更新'
+    $u.Size = New-Object System.Drawing.Size(680, 470)
+    $u.StartPosition = 'CenterParent'
+    $u.BackColor = $BG
+    $u.FormBorderStyle = 'FixedSingle'
+    $u.MaximizeBox = $false
+    $u.Font = $fBody
+
+    New-Label $u '检查更新' 24 12 300 32 $fTitle $INK | Out-Null
+    New-Label $u '从 GitHub 拉这份仓库最新的代码，换掉本地的脚本。只换代码和文档 —— 记忆、档案、图片、设置一样都不碰。' 24 46 632 20 $fSub $MUTED | Out-Null
+
+    $pnl = New-Object System.Windows.Forms.Panel
+    $pnl.Location = New-Object System.Drawing.Point(24, 74)
+    $pnl.Size = New-Object System.Drawing.Size(632, 130)
+    $pnl.BackColor = $CARD
+    $pnl.BorderStyle = 'FixedSingle'
+    $u.Controls.Add($pnl)
+
+    New-Label $pnl '现在这份' 14 10 120 20 $fSub $MUTED | Out-Null
+    $lblNow = New-Label $pnl '' 14 30 604 22 $fH $INK
+    New-Label $pnl '网上最新' 14 58 120 20 $fSub $MUTED | Out-Null
+    $lblNew = New-Label $pnl '' 14 78 604 22 $fH $INK
+    $lblMsg = New-Label $pnl '' 14 104 604 20 $fSub $MUTED
+
+    $lv0 = Get-LocalVersion
+    if ($lv0) { $lblNow.Text = $lv0.Substring(0, [Math]::Min(7, $lv0.Length)) + '  ·  ' + $lv0 }
+    else { $lblNow.Text = '还没记过（第一次更新会记下来）' }
+
+    $logU = New-Object System.Windows.Forms.TextBox
+    $logU.Location = New-Object System.Drawing.Point(24, 216)
+    $logU.Size = New-Object System.Drawing.Size(632, 150)
+    $logU.Multiline = $true
+    $logU.ScrollBars = 'Vertical'
+    $logU.ReadOnly = $true
+    $logU.Font = $fMono
+    $logU.BackColor = [System.Drawing.Color]::FromArgb(252, 252, 253)
+    $logU.BorderStyle = 'FixedSingle'
+    $u.Controls.Add($logU)
+
+    function ULog([string]$s) {
+        if (-not $s) { return }
+        $logU.AppendText($s + "`r`n")
+        $logU.SelectionStart = $logU.TextLength
+        $logU.ScrollToCaret()
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    $btnGo = New-Button $u '检查' 24 386 110 -Primary
+    $btnUp = New-Button $u '更新到最新' 150 386 140
+    $btnCl = New-Button $u '关闭' 556 386 100
+
+    $btnGo.Add_Click({
+            $btnGo.Enabled = $false
+            $lblNew.Text = '查…'
+            $lblMsg.Text = ''
+            [System.Windows.Forms.Application]::DoEvents()
+            try {
+                $rv = Get-RemoteVersion
+                $lblNew.Text = $rv.short + '  ·  ' + $rv.when + ' 提交'
+                $lblMsg.Text = $rv.msg
+                $lv2 = Get-LocalVersion
+                $lvShort = ''
+                if ($lv2) { $lvShort = $lv2.Substring(0, [Math]::Min(7, $lv2.Length)) }
+                if (-not $lvShort) {
+                    ULog '本地还没记过版本 —— 不知道差多少，点「更新到最新」就对齐了。'
+                } elseif ($lvShort -eq $rv.short) {
+                    ULog '已经是最新的（' + $lvShort + '）。'
+                } else {
+                    ULog ('本地 ' + $lvShort + ' → 网上 ' + $rv.short + '，可以更新。')
+                }
+            } catch {
+                $lblNew.Text = '查不到'
+                $lblMsg.Text = $_.Exception.Message
+                ULog ('检查失败：' + $_.Exception.Message)
+                ULog '网络不通，或者这会儿连不上 GitHub。'
+            } finally {
+                $btnGo.Enabled = $true
+            }
+        })
+
+    $btnUp.Add_Click({
+            $btnUp.Enabled = $false
+            $btnGo.Enabled = $false
+            try {
+                ULog '—— 开始更新'
+                $ok = Invoke-UpdateZip ${function:ULog}
+                if ($ok) {
+                    $lv3 = Get-LocalVersion
+                    if ($lv3) { $lblNow.Text = $lv3.Substring(0, [Math]::Min(7, $lv3.Length)) + '  ·  ' + $lv3 }
+                    ULog ''
+                    ULog '要把这个窗口关掉再开一次，新脚本才进来。'
+                    ULog '桌宠和宿主如果开着，也重开一下。'
+                }
+            } catch {
+                ULog ('更新失败：' + $_.Exception.Message)
+            } finally {
+                $btnUp.Enabled = $true
+                $btnGo.Enabled = $true
+            }
+        })
+
+    $btnCl.Add_Click({ $u.Close() })
+
+    $u.Add_Shown({
+            ULog '「检查」只问一下版本，不动任何文件。'
+            ULog '「更新到最新」会先备份、再换；数据目录一律跳过。'
+        })
+
+    [void]$u.ShowDialog($form)
+}
+
 # ---------- 事件 ----------
 $btnCheck.Add_Click({ Run-Checks })
 $btnStatus.Add_Click({ Show-Status })
@@ -1154,6 +1421,7 @@ $btnStart.Add_Click({
 $btnWeb.Add_Click({ try { Start-Process 'http://127.0.0.1:3080' } catch { Write-Log '打不开浏览器，自己点 http://127.0.0.1:3080' } })
 $btnHome.Add_Click({ try { Start-Process 'http://127.0.0.1:3077/' } catch { Write-Log '打不开浏览器，自己点 http://127.0.0.1:3077/' } })
 $btnExt.Add_Click({ Show-Extensions })
+$btnUpd.Add_Click({ Show-Update })
 $btnClose.Add_Click({ $form.Close() })
 
 $form.Add_Shown({
