@@ -15,9 +15,16 @@
 
 function New-FishPalette {
   [pscustomobject]@{
-    Body = [System.Drawing.Color]::FromArgb(255, 228, 242, 247)
+    # 2026-10-22：鱼身改成**上浅下深**（他要的「上浅下深」）。
+    # 原来只有一个 Body 平涂 —— 那条鱼看着像贴纸，没有厚度。
+    # 现在给两端：背上是光打到的白，腹部落进偏青灰的暗部，中间由一把竖直渐变刷子过渡。
+    BodyTop = [System.Drawing.Color]::FromArgb(255, 250, 253, 255)
+    BodyBottom = [System.Drawing.Color]::FromArgb(255, 186, 213, 226)
+    Body = [System.Drawing.Color]::FromArgb(255, 228, 242, 247)   # 兜底：不渐变的地方（旧调用）还用这个
     Dark = [System.Drawing.Color]::FromArgb(255, 12, 30, 38)
     Bubble = [System.Drawing.Color]::FromArgb(110, 228, 242, 247)
+    # 底板上那几条水波（就画在深色牌子上，鱼身后面的那一层）
+    Water = [System.Drawing.Color]::FromArgb(90, 44, 84, 106)
     # 透明底：桌宠要靠 TransparencyKey 抠掉背景，所以这里必须是纯透明
     None = [System.Drawing.Color]::FromArgb(0, 0, 0, 0)
   }
@@ -102,15 +109,27 @@ function Draw-Fish {
     $G.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
 
     # Tint：往暖红里混 —— 不是换色，是"气色变了"。混太多会像受伤，所以上限靠调用方夹在 0.35。
-    $bodyCol = $pal.Body
+    #
+    # 2026-10-22：从平涂改成**竖直渐变**（上浅下深）。两件事要注意：
+    #   ① 尾巴和鱼身共用**同一把**刷子，刷子的矩形横向要盖住尾巴（x 40 起）、纵向盖住整条鱼，
+    #      否则尾巴落在矩形外，LinearGradientBrush 会按 Tile 平铺，尾巴和身体出现两截色；
+    #   ② 刷子矩形是在**当前 transform 下**解释的（这里已经 Scale + Translate 过了），
+    #      所以用设计稿的 512 坐标写死就行，不用乘 BodyScale。
+    $colTop = $pal.BodyTop
+    $colBot = $pal.BodyBottom
     if ($Tint -gt 0.001) {
       $tt = [Math]::Min(1.0, $Tint)
-      $bodyCol = [System.Drawing.Color]::FromArgb(255,
-        [int]($pal.Body.R * (1 - $tt) + 236 * $tt),
-        [int]($pal.Body.G * (1 - $tt) + 146 * $tt),
-        [int]($pal.Body.B * (1 - $tt) + 146 * $tt))
+      $colTop = [System.Drawing.Color]::FromArgb(255,
+        [int]($pal.BodyTop.R * (1 - $tt) + 236 * $tt),
+        [int]($pal.BodyTop.G * (1 - $tt) + 146 * $tt),
+        [int]($pal.BodyTop.B * (1 - $tt) + 146 * $tt))
+      $colBot = [System.Drawing.Color]::FromArgb(255,
+        [int]($pal.BodyBottom.R * (1 - $tt) + 236 * $tt),
+        [int]($pal.BodyBottom.G * (1 - $tt) + 146 * $tt),
+        [int]($pal.BodyBottom.B * (1 - $tt) + 146 * $tt))
     }
-    $brush = New-Object System.Drawing.SolidBrush($bodyCol)
+    $gradRect = New-Object System.Drawing.RectangleF(40.0, 108.0, 440.0, 304.0)
+    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($gradRect, $colTop, $colBot, 90.0)
     try {
       # ---- 尾巴：先画，根部被鱼身盖住，所以旋转留下的缝看不见 ----
       # 旋转中心取 (152,256)：比接缝 (160,256) 再往里 8px，给 ±9° 留余量。
@@ -183,6 +202,53 @@ function Draw-Fish {
     }
     finally { $pen.Dispose() }
   }
+}
+
+# ---- 底板上的水波（2026-10-22）----
+# 他要「水的简笔画纹路」。有一条硬限制先说清：桌宠这块牌子外面是**透的**，
+# 能画"水"的地方只有那块深色圆角底板本身 —— 往鱼身旁边的桌面画水是没有承载面的。
+# 所以水波画在底板上、鱼的身后（先画水波、再画鱼，鱼把中间那段盖掉，只剩两侧露出来）。
+# 三条极淡的横向波纹，相位错开，随 Phase 缓慢起伏；两端收窄免得顶到圆角。
+# ⚠️ 别把它画浓 —— 一旦能看出"这是个鱼缸"，桌宠就从"桌面上的鱼"变成了"一个缸"。
+function Draw-WaterLines {
+  param(
+    [Parameter(Mandatory = $true)][System.Drawing.Graphics]$G,
+    [double]$Canvas = 256.0,
+    [double]$Phase = 0.0
+  )
+  $pal = New-FishPalette
+  $pen = New-Object System.Drawing.Pen($pal.Water, 2.2)
+  $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+  $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+  try {
+    # 三条水波**都落在鱼身下缘以下**（鱼底边约在 0.76 处）——
+    # 第一版放在 0.62，正好拦腰横穿鱼身，两侧各露出一小截，看着像鱼被一条线切开。
+    $rows = @(
+      @{ y = 0.79; amp = 3.0; off = 0.0 },
+      @{ y = 0.87; amp = 4.2; off = 1.7 },
+      @{ y = 0.945; amp = 2.6; off = 3.1 }
+    )
+    $n = 14
+    foreach ($r in $rows) {
+      $x0 = $Canvas * 0.07
+      $x1 = $Canvas * 0.93
+      $baseY = $Canvas * $r.y
+      $pts = New-Object System.Drawing.PointF[] $n
+      for ($i = 0; $i -lt $n; $i++) {
+        $px = $x0 + ($x1 - $x0) * $i / ($n - 1)
+        $taper = [Math]::Sin([Math]::PI * $i / ($n - 1))     # 两端收到 0，形状像一笔水纹
+        $py = $baseY + $r.amp * $taper * [Math]::Sin($i * 0.9 + $Phase * 0.6 + $r.off)
+        $pts[$i] = [System.Drawing.PointF]::new([float]$px, [float]$py)
+      }
+      $p = New-Object System.Drawing.Drawing2D.GraphicsPath
+      try {
+        $p.AddCurve($pts, 0.5)
+        $G.DrawPath($pen, $p)
+      }
+      finally { $p.Dispose() }
+    }
+  }
+  finally { $pen.Dispose() }
 }
 
 # 给静态场景用：一张 512×512 的透明位图，画好一帧。

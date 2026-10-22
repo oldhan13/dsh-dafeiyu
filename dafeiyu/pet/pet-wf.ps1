@@ -99,7 +99,10 @@ $script:fishScale = $CANVAS / 512.0
 # 为什么不把背景留成纯透明：TransparencyKey 只能抠**纯色**，抗锯齿产生的半透明像素
 # 会跟 Fuchsia 混合，整条鱼轮廓立刻出现一圈紫边（第一版就是）。加一块不透明的深色圆角底，
 # 鱼的抗锯齿边就只跟这块浅深色混合，紫边只剩下四角圆角那 1px。
-$script:bgBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 17, 39, 51))
+# 2026-10-22：底板也从平涂改成上浅下深 —— 上沿像透进来的光，下沿沉进暗处。
+# 这块牌子本身就是"水"：水波（Draw-WaterLines）画在它上面，鱼再盖住中间那段。
+$script:bgRect = New-Object System.Drawing.RectangleF(0, 0, [float]$CANVAS, [float]$CANVAS)
+$script:bgBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($script:bgRect, [System.Drawing.Color]::FromArgb(255, 24, 53, 69), [System.Drawing.Color]::FromArgb(255, 11, 26, 36), 90.0)
 $script:bgPath = New-Object System.Drawing.Drawing2D.GraphicsPath
 $rad = 22
 $script:bgPath.AddArc(0, 0, $rad * 2, $rad * 2, 180, 90)
@@ -604,6 +607,8 @@ $timer.Add_Tick({
         $script:fishG.Clear([System.Drawing.Color]::Transparent)
         $script:fishG.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $script:fishG.FillPath($script:bgBrush, $script:bgPath)
+        # 水波：画在底板上、鱼的身后（鱼随后把中间盖掉，只剩两侧露出来）
+        Draw-WaterLines -G $script:fishG -Canvas $CANVAS -Phase $script:phase
         $popsArr = if ($script:pops.Count -gt 0) { $script:pops.ToArray() } else { @() }
         Draw-Fish -G $script:fishG -Phase $script:phase -Talk $script:talk -Blink $script:blink `
           -BodyScale $script:fishScale -Dash $script:dash -Pops $popsArr `
