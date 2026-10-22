@@ -17,7 +17,12 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -Namespace W -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
 [void][W.Dpi]::SetProcessDPIAware()
 
-$ROOT = 'C:\Users\lenovo\Documents\deepseek-harness\default-workspace'
+# 项目根 —— 从脚本自己的位置往上两级（pet → dafeiyu → 根）。
+# 2026-10-22：原来这里是写死的一行绝对路径，本机调试留下的；别人 clone 到别处，
+# 这一行就指到他自己硬盘上的一个不存在目录 ⇒ fish-draw.ps1 dot-source 失败 ⇒ 桌宠直接起不来。
+# $PSScriptRoot 只有在 -Command 里跑时才为空，那时退回当前目录。
+$ROOT = $PWD.Path
+if ($PSScriptRoot) { $ROOT = Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }
 $PET = Join-Path $ROOT 'dafeiyu\pet'
 $STATE = Join-Path $PET 'state.json'
 $LOG = Join-Path $PET 'pet.log'
