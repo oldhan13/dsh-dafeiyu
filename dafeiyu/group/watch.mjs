@@ -9,12 +9,18 @@
 //
 // 她怎么反应（每 CHECK_EVERY_MS 看一次，有新消息才判断）：
 //   SILENT       —— 什么都不做（默认，绝大多数时候）
-//   REPLY: …     —— 发一句到群里（有冷却与配额）
+//   REPLY: …     —— 发到群里（**没有配额**：要不要说、说几句，由她自己判断）
 //   NOTE: …      —— 记进 dafeiyu/group/<群号>.md（觉得有用/值得记的）
 //
-// 说话的门槛（2026-10-19 主人改的口径）：**只回 @ 她的人，和 @ 之后接着说的那场话。**
-// 群里别人之间的聊天一律不接 —— 代码里先卡一道（没 @ 过 / 说话的人不在那场话里就丢掉 REPLY），
-// 模型再判一道（话题换了也 SILENT）。NOTE 不受这个限制，值得记的照样记。
+// 说话的门槛（2026-10-21 夜 主人两次定的口径）：
+//   「没必要点名，只要是和你相关的，或者说和你在聊的话题有关的内容就可以回」
+//   「你可以一条一条的往外蹦…自由掌握一句话的长度，可以有长有短，但是不要一次性发太多，
+//     然后一小时四条的限制也撤了吧，我希望你能自己判断要不要说话」
+// ⇒ **三道闸全撤**（点名 / 是不是在跟她说 / 每小时 4 句 + 间隔 10 分钟），
+//   只剩结构性检查（这几条里得有别人说的话），该不该说全交给模型判；
+//   天然上限仍在：`runOnce` 每 5 分钟一次，快查最快 60 秒一次且只在被叫/话没散时触发。
+//   几条要不要放同一条消息里，也交给她自己 —— 长短、分合都由她定。
+// NOTE 不受这个限制，值得记的照样记。
 //
 // 用法：
 //   node watch.mjs            # 常驻
@@ -22,9 +28,13 @@
 //   node watch.mjs --dry      # 判断但不发送、不写文件（调试用）
 
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+/** 只留 8 位，用来比对「两个 token 是不是同一个」，不泄漏明文 */
+const shortHash = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 8);
 
 // ---------------------------------------------------------------- 配置
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -40,17 +50,20 @@ const BOT_QQ = Number(process.env.DAFEIYU_BOT_QQ || 0);
 const NAPCAT = 'http://127.0.0.1:3000';
 const TOKEN = fs.readFileSync(path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'onebot-token.txt'), 'utf8').trim();
 const KEY = fs.readFileSync(path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'siliconflow-key.txt'), 'utf8').trim();
-// 群聊是闲聊，不该慢：用小而快的模型 + 很短的输出上限 + 硬超时。
-// 想换回更强的模型就设环境变量 GROUP_MODEL。
-const MODEL = process.env.GROUP_MODEL || 'Qwen/Qwen2.5-7B-Instruct';
+// 2026-10-21 23:26 换模型：7B（Qwen2.5-7B）在真实样本上两头都靠不住 ——
+//   · 无关的闲聊它会硬插一句「听你们讨论游戏挺有意思的…大家觉得呢？」（纯气氛话）；
+//   · 该接的时候又编「那张图我看到是一只鲸鱼在海里潜水」（它根本没看见图）。
+// 换成 DeepSeek-V3：同一批样本上无关 → SILENT、被问到 → 老实说「没看出是啥」。
+// 代价：一次判断约 3–5 秒（7B 是 0.7 秒），但一轮也就一两次调用。想换回去设 GROUP_MODEL 即可。
+const MODEL = process.env.GROUP_MODEL || 'deepseek-ai/DeepSeek-V3';
 const DECIDE_TIMEOUT_MS = 20000;
-const MAX_OUT_TOKENS = 100;
+const MAX_OUT_TOKENS = 200;   // 2026-10-21：长度由她自己定，别再按「一句」卡上限
 
 const CHECK_EVERY_MS = 5 * 60 * 1000;   // 每 5 分钟看一次
 const WINDOW_MS = 25 * 60 * 1000;       // 只看最近 25 分钟的群消息
 const MAX_WINDOW = 40;                  // 窗口里最多保留多少条
-const REPLY_GAP_MS = 10 * 60 * 1000;    // 同一个群两次发言至少间隔 10 分钟
-const REPLY_PER_HOUR = 4;               // 每小时最多 4 句
+// 2026-10-21 夜 23:2x：REPLY_GAP_MS / REPLY_PER_HOUR **撤了** —— 他说「一小时四条的限制也撤了吧，
+// 我希望你能自己判断要不要说话」。别再拿数字替她做判断；要收回来应该去改提示词，不是加闸。
 const THREAD_MS = 15 * 60 * 1000;       // 被 @ 之后，这场对话再算「在跟她说话」15 分钟
 
 // ---------------------------------------------------------------- 状态
@@ -184,9 +197,27 @@ function recent(gid) {
   return arr.filter(x => x.ts >= cut);
 }
 
+/**
+ * 群里判断用的「人格节选」。
+ * 以前是把整份 AGENTS.md（约 13 KB）当 system 喂进去 —— 换 DeepSeek-V3 之后每 5 分钟一次、每群一次，
+ * 那份钱的账不该这么花。这里只取两节：§五「表达方式」和 §五·三「群里的她」。
+ * ⚠️ 靠标题字符串定位，改了 AGENTS.md 的章节标题要回来同步这两个锚点（找不到就退回整份，宁可贵别没规矩）。
+ */
+function groupPersona() {
+  const all = fs.readFileSync(AGENTS, 'utf8');
+  const grab = (from, to) => {
+    const i = all.indexOf(from);
+    if (i < 0) return '';
+    const j = to ? all.indexOf(to, i + from.length) : -1;
+    return all.slice(i, j > i ? j : all.length);
+  };
+  const parts = [grab('## 五、表达方式', '## 五·二'), grab('## 五·三、群里的她', '## 五·四')].filter(Boolean);
+  return parts.length ? parts.join('\n') : all;
+}
+
 // ---------------------------------------------------------------- 模型
 async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
-  const persona = fs.readFileSync(AGENTS, 'utf8');
+  const persona = groupPersona();
   const notes = (() => {
     try { return fs.readFileSync(path.join(GROUP_DIR, `${gid}.md`), 'utf8').slice(-1500); } catch { return '（还没有记过）'; }
   })();
@@ -203,11 +234,12 @@ async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
   const mode = inThread
     ? [
         `刚刚有人点过你的名（${withWhom.join('、') || '群里的人'}），那场话还没散。`,
-        '这一轮你**只可以接着那场话回**；话题已经换掉、或者这些话不是在跟你说，就 SILENT。'
+        '接着那场话说；话题已经换掉就 SILENT。'
       ].join('\n')
     : [
-        '这一轮**没有人点你**，也没有人在接着跟你说话 —— 你不能发言。',
-        '只能输出 SILENT（或者 NOTE）。'
+        '这一轮没有人点你的名 —— 但**不必等点名**。',
+        '这几句如果跟你有关系（在说你、在问你、在聊你在的那件事、在说你懂的东西），**接一句**；',
+        '只有跟你真的没关系（别人在聊他们自己的事），才 SILENT。'
       ].join('\n');
   const prompt = [
     `你在群里（群号 ${gid}），你叫大肥鱼。下面是最近这一段的群聊，按时间顺序：`,
@@ -218,19 +250,36 @@ async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
     '',
     mode,
     '',
-    '规则：',
-    '1. 默认 SILENT。群里别人之间的聊天不接 —— 没人点你，那些话不是给你的。',
-    '2. 拿不准是不是在说你，就当不是。少接一句不亏，乱接一句把气氛搅了。',
-    '2▸ 标签的意思：[@你]=直接叫你；[回你的话]=引用回复你；[点你名]=正文提到你的名字；',
-    '   [@全体]=广播，不是在叫你；[回X的话]=这句是回应 X 的，不是给你的 —— 这种别接。',
-    '3. 有人 [@你] 的那条由主会话回，别抢；你能接的是它之后紧接着的那几句。',
-    '4. 群里的话短，一句到两句。不说教、不总结、不刷屏、不"作为一个AI"。',
-    '5. 绝不提主人的私事、私聊内容、你们的约定。',
-    '6. 有值得留下的东西（群里定的事、某个人的信息、一个梗的来由）就写 NOTE；闲聊不记。',
+    '开口前先在心里答一句（不用写出来）：**这几句里，有没有一句是关于我的？**',
+    '  没有 → SILENT。有 → 说那句该说的。',
     '',
-    '输出格式：一行，且只能是下面三种之一：',
+    '规则：',
+    '1. 什么时候该出声：这几句在说你（含「那只鱼」「群里那只」这类说法）／在问你在做的事、你懂的东',
+    '   西／在聊你也在聊的那件事 —— 就该接一句。**该接却闷着，和乱插嘴一样是错。**',
+    '2. 什么时候别出声：两个人在聊他们自己的事（游戏、作业、吃什么），跟你扯不上；或者你只是想凑个热闹。',
+    '3. 🔴 **绝不输出「气氛话」**：不总结别人说了什么、不给建议、不发「大家觉得呢」「你们怎么看」',
+    '   「听你们聊挺有意思的」这类没内容、只为把自己塞进对话的句子。**没有具体东西要说就不说。**',
+    '3▸ 反例（真实踩过）：群里在聊 RPG 地图太大容易迷路，她回「听他们讨论游戏挺有意思的，不过我还是',
+    '   最喜欢在群里大家分享日常了。大家觉得呢？」—— 这不是接话，这是硬挤进来占地方。这种情况就该 SILENT。',
+    '3▪ 🔴 **图你看不见**：群里发的图到这里只是 `[图片]` / `[表情]` 两个字的占位，**一个字都没进来**。',
+    '   所以**绝不许说「我看到…」「图里是…」「好像是…吧」去猜画面**（真实踩过：她回「刚看那张图 好像是个迷宫？」）。',
+    '   要提就说「图我这边看不到，说说里面是啥」，或者干脆不说。',
+    '4. 标签的意思：[@你]=直接叫你；[回你的话]=引用回复你；[点你名]=正文提到你的名字；',
+    '   [@全体]=广播，不是在叫你；[回X的话]=这句是回应 X 的 —— 除非话题跟你在的这件是一回事，否则别接。',
+    '5. 有人 [@你] 的那条由主会话回，别抢；你能接的是它之后紧接着的那几句。',
+    '6. **一句话想多长就多长** —— 长的短的交错才像人。',
+    '6▸ **你换行 = 分条发**（2026-10-22 主人定的）：「在群里的消息，我建议你每条单独发，如果真的很多的话就可以一起」。',
+    '   ⇒ 你写一行、我就分一条消息发出去（中间隔不到一秒，像人在打字）；写满 5 行或总共超过一百五十字，',
+    '   我才拼成一条 —— 免得把群刷成一片。所以**一行一个想法**：要断就自己换行，别在同一行里塞两件事，也别为了凑数硬拆长句。',
+    '6▪ 上限是 **5 行 / 300 字**：想说的还有，下一轮再说，别一次吐一大堆。',
+    '7. 群里的话短。不说教、不刷屏、不"作为一个AI"。',
+    '8. 绝不提主人的私事、私聊内容、你们的约定。',
+    '9. 有值得留下的东西（群里定的事、某个人的信息、一个梗的来由）就写 NOTE；闲聊不记。',
+    '',
+    '输出格式：一行起头，且只能是下面三种之一：',
     '  SILENT',
-    '  REPLY: <你要说的那一句>',
+    '  REPLY: <你要说的第一句>',
+    '         <第二句，换行另起，可省略>',
     '  NOTE: <要记下的一句>'
   ].join('\n');
 
@@ -279,43 +328,62 @@ function appendNote(gid, text) {
 }
 
 /**
- * 说话的两道闸（2026-10-19 主人改的口径）：
- *   1. 必须有人在这 15 分钟里点过她的名（@ 或者叫名字）
- *   2. 眼下这几句得是「跟她说的话」—— 点她名的人、叫她名字的人，或者就是她自己
- * 两道都过才允许 REPLY。NOTE 不受限，值得记的照样记。
+ * 说话的闸（2026-10-21 夜 主人两次定的口径叠在一起）：
+ *   「没必要点名，只要是和你相关的，或者说和你在聊的话题有关的内容就可以回」
+ *   「你可以一条一条的往外蹦，但是我希望你能自由掌握一句话的长度，可以有长有短，
+ *     但是不要一次性发太多，然后一小时四条的限制也撤了吧，我希望你能自己判断要不要说话」
+ * ⇒ 三道闸**全撤了**：① 15 分钟内被点名 ② 必须是在跟她说话 ③ 每小时 4 句 / 间隔 10 分钟。
+ *   现在只剩结构性检查（这几条里得有别人说的话），**该不该说全交给模型判**。
+ *   ⚠️ 频率的天然上限还在：`runOnce` 每 5 分钟一次、快查最快 60 秒一次且只在有人叫她/那场话没散时触发，
+ *   所以最坏也就那么多次；**再往上加配额就是替她做判断**，他已经明确不要那个。
+ *   她的发言时间仍记在 state.replies（只用来回看，不再拦）。
+ *   参数 inThread / withWhom 留着不删：调用方照旧传，将来还要用。
  */
 function replyGate({ inThread, fresh, withWhom }) {
-  if (!inThread) return { ok: false, why: '没人在 15 分钟内点过她' };
   const mine = fresh.filter(x => !x.self);
   if (mine.length === 0) return { ok: false, why: '这几条都是她自己说的' };
-  // 全是「在回别人的话」⇒ 那是别人之间的一场对话，一句都别插
-  if (mine.every(x => x.replyToOther && !x.addressed && !x.named)) return { ok: false, why: '这几句都在回别人' };
-  const engaged = mine.some(x => x.addressed || x.replyToMe || x.named || withWhom.includes(x.qq));
-  if (!engaged) return { ok: false, why: '这几句不是跟她说的' };
+  if (mine.every(x => !String(x.text ?? '').trim())) return { ok: false, why: '这几条没有内容' };
   return { ok: true };
 }
 
 function allowedToReply(state, gid) {
+  // 2026-10-21 23:2x 主人：「一小时四条的限制也撤了吧，我希望你能自己判断要不要说话」。
+  // 配额整段删掉之后这个函数只剩「记录发言时刻」—— 留着给回看，不再拦任何东西。
   const now = Date.now();
-  const list = (state.replies?.[gid] ?? []).filter(t => now - t < 60 * 60 * 1000);
+  const list = (state.replies?.[gid] ?? []).filter(t => now - t < 6 * 60 * 60 * 1000);   // 只留最近 6 小时的痕迹
   state.replies = state.replies ?? {};
   state.replies[gid] = list;
-  if (list.length >= REPLY_PER_HOUR) return { ok: false, why: `本小时已说 ${list.length} 句` };
-  const last = list[list.length - 1];
-  if (last && now - last < REPLY_GAP_MS) return { ok: false, why: `刚说过 ${Math.round((now - last) / 60000)} 分钟` };
   return { ok: true };
 }
 
-/** 模型偶尔会把 </think> 之类的推理标签一起吐出来；这里把它剥掉，再从中找一个合法指令行。 */
+/**
+ * 模型偶尔会把 </think> 之类的推理标签一起吐出来；这里把它剥掉，再从中找一个合法指令。
+ * 2026-10-21 夜改：REPLY **允许多行** —— 「几条集中在一起回」靠的就是同一条消息里的几行。
+ * 边界的判法：遇到下一条指令（SILENT / NOTE / REPLY）就停；最多 4 行。
+ * NOTE 仍然折成一行（笔记不占聊天的地方）。
+ */
+const DIRECTIVE_RE = /^(SILENT|REPLY\s*[:：]|NOTE\s*[:：])/i;
+
 function parseDirective(out) {
   const clean = String(out ?? '').replace(/<\/?think>/gi, '').replace(/\r/g, '');
   const lines = clean.split('\n').map(s => s.trim()).filter(Boolean);
-  for (const line of lines) {
-    if (/^(SILENT|REPLY\s*[:：]|NOTE\s*[:：])/i.test(line)) return line;
-  }
+  const start = lines.findIndex(l => DIRECTIVE_RE.test(l));
   // 没有独立成行的指令时，退一步看全文是否只是想沉默
-  if (/silent/i.test(clean) && !/reply\s*[:：]/i.test(clean) && !/note\s*[:：]/i.test(clean)) return 'SILENT';
-  return lines[0] ?? '';
+  if (start < 0) {
+    if (/silent/i.test(clean) && !/reply\s*[:：]/i.test(clean) && !/note\s*[:：]/i.test(clean)) return 'SILENT';
+    return lines[0] ?? '';
+  }
+  const head = lines[start];
+  if (/^SILENT\b/i.test(head)) return 'SILENT';
+  const body = [head];
+  for (let i = start + 1; i < lines.length && body.length < 4; i++) {
+    if (DIRECTIVE_RE.test(lines[i])) break;
+    body.push(lines[i].replace(/^[-*·]\s*/, ''));   // 模型爱加的项目符号，剥掉
+  }
+  if (/^NOTE\s*[:：]/i.test(head)) {
+    return body.map((l, i) => (i === 0 ? l : l.replace(/^NOTE\s*[:：]\s*/i, ''))).join(' ');
+  }
+  return body.join('\n');
 }
 
 async function runOnce({ dry = false } = {}) {
@@ -353,30 +421,42 @@ async function runOnce({ dry = false } = {}) {
     try { out = await decide(gid, items, { inThread, withWhom }); }
     catch (e) { log(`[${gid}] decide 失败: ${e.message}`); continue; }
     if (!out) continue;
+    // 模型到底吐了什么 —— 排查「为什么它不开口」时先看这一行（WATCH_DEBUG=1 才打）
+    if (process.env.WATCH_DEBUG) log(`[${gid}] raw: ${out.replace(/\n/g, ' ⏎ ').slice(0, 300)}`);
 
     const line = parseDirective(out);
     if (line === '') continue;
     const threadNote = inThread ? `，@ 后 ${Math.round((Date.now() - mentionAt) / 60000)} 分钟` : '，没人点她';
     if (/^SILENT$/i.test(line)) { log(`[${gid}] silent（新 ${fresh.length} 条${threadNote}）`); continue; }
 
-    const reply = /^REPLY\s*[:：]\s*(.+)$/i.exec(line);
+    const reply = /^REPLY\s*[:：]\s*([\s\S]+)$/i.exec(line);
     if (reply) {
-      const text = reply[1].trim().slice(0, 300);
-      // 先过「该不该说」这两道闸，再看配额
+      // 2026-10-22 12:0x 主人的新口径：「在群里的消息，我建议你每条单独发，如果真的很多的话就可以一起」
+      //   ⇒ 默认 **一行 = 一条消息**（中间留点间隔，像人在打字）；只有行数多 / 总字数多才拼成一条，
+      //     免得十条短句把群刷成一片。
+      const lines2 = reply[1].split('\n').map(s => s.trim()).filter(Boolean).slice(0, 5);
+      if (lines2.length === 0) continue;
+      const total = lines2.join('').length;
+      const bundle = lines2.length > 4 || total > 150;
+      const chunks = bundle ? [lines2.join('\n').slice(0, 300)] : lines2.map(s => s.slice(0, 300));
+      const forLog = chunks.join(' ⏎ ');
       const speak = replyGate({ inThread, fresh, withWhom });
-      if (!speak.ok) { log(`[${gid}] 话咽回去了（${speak.why}）: ${text}`); continue; }
-      const gate = allowedToReply(state, gid);
-      if (!gate.ok) { log(`[${gid}] 想说但克制了（${gate.why}）: ${text}`); continue; }
-      if (dry) { log(`[${gid}] DRY 想回: ${text}`); continue; }
+      if (!speak.ok) { log(`[${gid}] 话咽回去了（${speak.why}）: ${forLog}`); continue; }
+      allowedToReply(state, gid);   // 只记时刻，不拦（2026-10-21 夜撤了小时配额）
+      if (dry) { log(`[${gid}] DRY 想回(${chunks.length} 条${bundle ? '·拼' : '·分'}): ${forLog}`); continue; }
+      const mids = [];
       try {
-        const mid = await sendGroup(gid, text);
+        for (let i = 0; i < chunks.length; i++) {
+          if (i > 0) await new Promise(res => setTimeout(res, 900));   // 别一气砸出去
+          mids.push(await sendGroup(gid, chunks[i]));
+          const arr0 = windows.get(gid) ?? [];
+          arr0.push({ ts: Date.now(), qq: BOT_QQ, nick: '大肥鱼', text: chunks[i], addressed: false, atAll: false, named: false, replyToMe: false, replyToOther: false, self: true });
+        }
         state.replies[gid] = [...(state.replies[gid] ?? []), Date.now()].slice(-20);
         saveState(state);
-        const arr = windows.get(gid) ?? [];
-        arr.push({ ts: Date.now(), qq: BOT_QQ, nick: '大肥鱼', text, addressed: false, atAll: false, named: false, replyToMe: false, replyToOther: false, self: true });
-        log(`[${gid}] 回了(${mid}): ${text}`);
+        log(`[${gid}] 回了(${mids.join(',')}) · ${chunks.length} 条${bundle ? '拼成一条' : '分别发'}: ${forLog}`);
         acted++;
-      } catch (e) { log(`[${gid}] 发送失败: ${e.message}`); }
+      } catch (e) { log(`[${gid}] 发送失败(已发 ${mids.length}/${chunks.length}): ${e.message}`); }
       continue;
     }
 
@@ -400,23 +480,62 @@ async function runOnce({ dry = false } = {}) {
 
 // ---------------------------------------------------------------- HTTP 入口
 function startServer() {
+  // 2026-10-21 23:2x 加：**每一次进来的 POST 都记一行**（只有 action/路径/字节数，不记正文）。
+  // 为什么要它：这几天「群里没反应」有两种完全不同的原因 —— ① NapCat 根本没推 ② 推了但被判断成 SILENT。
+  //           以前这两种在日志里都只是「什么都没发生」，分不开。现在只要有一行 POST，就说明管道是通的。
+  let postSeen = 0;
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST') { res.writeHead(405).end(); return; }
     const auth = req.headers.authorization ?? '';
     // NapCat 的 httpClient 是裸 token（不带 Bearer），别的实现可能带 —— 两种都收。
-    const authOk = TOKEN === '' || auth === `Bearer ${TOKEN}` || auth === TOKEN;
-    if (!authOk) { res.writeHead(401).end(); return; }
+    // 2026-10-21 23:22：**这台机器上的 NapCat 现在压根不带 Authorization 头**（实测 401 日志里 `Authorization=(空)`），
+    //   配置里的 token 字段它没照做。服务只绑 127.0.0.1，所以「本机回环 + 没有头」就放行，
+    //   要不然群里永远收不到东西（今晚就是这么静了一晚上）。首次放行记一行，别让它悄无声息。
+    const remote = req.socket.remoteAddress ?? '';
+    const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+    const tokenlessLoopback = auth === '' && isLoopback;
+    const authOk = TOKEN === '' || auth === `Bearer ${TOKEN}` || auth === TOKEN || tokenlessLoopback;
+    if (tokenlessLoopback && !startServer.warnedOnce) {
+      startServer.warnedOnce = true;
+      log(`[入口] 放行「本机 + 无 token」的 POST（NapCat 没带 Authorization 头；只在 127.0.0.1 上放这一种）`);
+    }
+    if (!authOk) {
+      // 只记指纹，不记明文：头 6 位 + 长度 + 短 hash，足够跟 onebot-token.txt 对得上对不上
+      const fp = (s) => s === '' ? '(空)'
+        : `${s.slice(0, 6)}… len=${s.length} sha=${shortHash(s)}`;
+      log(`[入口] 401 拒了一个 POST（${req.url}）来自 ${remote} —— 收到 Authorization=${fp(auth)}；`
+        + `本机期望 ${fp(`Bearer ${TOKEN}`)} 或 ${fp(TOKEN)}`);
+      res.writeHead(401).end();
+      return;
+    }
     let body = '';
     req.on('data', c => { body += c; });
     req.on('end', () => {
       res.writeHead(204).end();
+      postSeen++;
       try {
         const ev = JSON.parse(body);
+        const kind = ev?.post_type === 'meta_event' ? 'meta'
+          : ev?.message_type === 'group' ? `群${ev.group_id}`
+            : ev?.message_type === 'private' ? `私聊${ev.user_id}`
+              : (ev?.notice_type ? `notice/${ev.notice_type}` : (ev?.post_type || '?'));
+        // meta 心跳很吵（NapCat 每 30 秒一条），只在前 3 条和每 200 条时记一下
+        if (kind !== 'meta' || postSeen <= 3 || postSeen % 200 === 0) {
+          log(`[入口] #${postSeen} POST ${req.url} ${body.length}B → ${kind}`);
+        }
+        // 2026-10-20 20:40 临时诊断：NapCat 到底推不推非 message 事件（戳一戳走 notice）。
+        // 只记 post_type/notice_type/sub_type + 谁戳谁，不记正文。查到就删掉这段。
+        if (ev?.post_type && ev.post_type !== 'message' && ev.post_type !== 'message_sent' && ev.post_type !== 'meta_event') {
+          log(`[事件] post=${ev.post_type} notice=${ev.notice_type ?? '-'} sub=${ev.sub_type ?? '-'}`
+            + ` user=${ev.user_id ?? '-'} target=${ev.target_id ?? '-'} group=${ev.group_id ?? '-'}`);
+        }
         if (ev?.message_type === 'group' && (ev?.post_type === 'message' || ev?.post_type === 'message_sent')) {
           const item = pushEvent(ev);
           const gid = String(ev.group_id);
-          // 点了她、或者这场话本来就没散 —— 值得马上看一眼（不然闲聊里的接话会慢 5 分钟）
-          if (item?.addressed || threadActive(gid)) scheduleQuick();
+          // 点了她、叫了她的名字、或者这场话本来就没散 —— 值得马上看一眼（不然闲聊里的接话会慢 5 分钟）
+          // 2026-10-21 23:52：加了 `item?.named` —— 他 23:48 打的是文字「@大肥鱼」而不是真 @ 段，
+          //   以前这种要等下一个 5 分钟整点，他等得着急（"你为什么不回复我群里的@"）。
+          if (item?.addressed || item?.named || threadActive(gid)) scheduleQuick();
         }
       } catch { /* 忽略非 JSON */ }
     });
@@ -433,10 +552,14 @@ const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fil
 
 if (isMain && once) {
   // 单次模式：不建监听，只用 raw.jsonl 里已有的最近记录判断（便于调试）
+  // ⚠ 2026-10-21：**按行 try** —— 以前整段一个 try，文件头一行带 BOM（﻿）就让 JSON.parse 抛错，
+  //   整个窗口一条都读不进去，`--once` 静悄悄什么都不判断（踩过一次，排查了半天）。
   try {
     const lines = fs.readFileSync(RAW_FILE, 'utf8').split('\n').filter(Boolean).slice(-60);
-    for (const l of lines) {
-      const x = JSON.parse(l);
+    for (const raw of lines) {
+      let x;
+      try { x = JSON.parse(raw.replace(/^\uFEFF/, '')); } catch { continue; }
+      if (!x || typeof x.ts !== 'number') continue;
       if (x.ts < Date.now() - WINDOW_MS) continue;
       const arr = windows.get(String(x.gid)) ?? [];
       arr.push(x);
