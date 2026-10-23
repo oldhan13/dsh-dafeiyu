@@ -43,6 +43,24 @@ Trace '--- start (winforms, animated)'
 # 画法：dot-source 进来，Draw-Fish / New-FishFrame 都出自那里
 . (Join-Path $PET 'fish-draw.ps1')
 
+# ---- 皮肤（2026-10-23 加）----
+# 有 pet\skin\<name>.png 就用那张图；没有、或 state.json 里没写 skin ⇒ **默认**，
+# 也就是 fish-draw.ps1 里那套代码画的几何（现在这条鱼）。「能退回」是这条的全部意义：
+# 删掉文件、或把 skin 清空，她就还是原来那条，不用改一行代码。
+$script:skinImage = $null
+try {
+  $skinState = Join-Path $PET 'state.json'
+  if (Test-Path $skinState) {
+    $stateJson = Get-Content $skinState -Raw -Encoding UTF8 | ConvertFrom-Json
+    $skinName = [string]$stateJson.skin
+    if ($skinName) {
+      $skinFile = Join-Path (Join-Path $PET 'skin') ($skinName + '.png')
+      if (Test-Path $skinFile) { $script:skinImage = [System.Drawing.Image]::FromFile($skinFile) }
+    }
+  }
+} catch { $script:skinImage = $null }
+Trace ('skin: ' + $(if ($script:skinImage) { 'png' } else { 'default (code)' }))
+
 # 双击鱼时展开的对话框：同一个进程、同一个作用域（2026-10-20 中午他不要"另开一个浮窗"了）。
 # 它自带 Show-Panel / Hide-Panel / Test-PanelOpen，鱼窗藏起来、面板从鱼的位置长出来。
 . (Join-Path $PET 'panel.ps1')

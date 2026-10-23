@@ -108,6 +108,18 @@ function Draw-Fish {
     $G.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $G.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
 
+    # ---- 皮肤（2026-10-23 加）----
+    # 有图就用图，然后直接 return；没有就往下走原来那套几何 ⇒ **默认还是现在这条鱼**。
+    # 坐标是设计稿的 512 空间（transform 已经套好了），所以这里写死的框在哪个缩放都能对上。
+    # 代价说清楚：换成图之后，眨眼 / 眼珠跟鼠标 / 吐泡这些就没了 —— 图是静的。
+    # 想把她换回来：删掉 pet\skin\ 里那张，或把 state.json 的 skin 清掉。
+    if ($script:skinImage) {
+      $skinRect = New-Object System.Drawing.RectangleF(56.0, 56.0, 400.0, 400.0)
+      $G.DrawImage($script:skinImage, $skinRect)
+      $G.Restore($saved)
+      return
+    }
+
     # Tint：往暖红里混 —— 不是换色，是"气色变了"。混太多会像受伤，所以上限靠调用方夹在 0.35。
     #
     # 2026-10-22：从平涂改成**竖直渐变**（上浅下深）。两件事要注意：

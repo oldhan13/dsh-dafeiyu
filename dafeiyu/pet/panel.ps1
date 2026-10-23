@@ -91,6 +91,22 @@ $script:phistBusy = $false
 $script:phistAt = [DateTime]::MinValue   # 上一次补的时间，用来挡"补完还停在顶部又立刻补"
 
 $BRIDGE = 'http://127.0.0.1:3079'
+# 桥现在要 token（2026-10-23 加的）：只绑 127.0.0.1 挡不住「本机浏览器替网页跑腿」，
+# 而 /say 后面接着的是 run —— 任意 PowerShell。token 由 bridge 起的时候写在
+# dafeiyu\desk\token.txt，这边读同一个文件，两边不用人工对。桥刚起时文件可能还没写完，所以带重试。
+$TOKENFILE = Join-Path $ROOT 'dafeiyu\desk\token.txt'
+$script:bridgeToken = $null
+function Get-BridgeToken {
+  if ($script:bridgeToken) { return $script:bridgeToken }
+  for ($i = 0; $i -lt 24; $i++) {
+    try {
+      $t = (Get-Content $TOKENFILE -Raw -ErrorAction Stop).Trim()
+      if ($t) { $script:bridgeToken = $t; return $t }
+    } catch { }
+    Start-Sleep -Milliseconds 250
+  }
+  return ''
+}
 $STT = Join-Path $ROOT 'dafeiyu\tools\stt-siliconflow.ps1'
 $SPEAKPLAY = Join-Path $ROOT 'dafeiyu\tools\speak-play.ps1'
 $SAYTMPDIR = 'C:\dsh-temp'
@@ -766,6 +782,87 @@ function Sync-PanelAttach {
   Trace ('panel: chips ' + $i + '/' + $n + ' used=' + $used)
 }
 
+# 一张图一张气泡：缩略显示，双击用系统看图器打开（2026-10-23 他说的「让她看到她的作品」）
+function Add-PanelImage([string]$who, [string]$path, $at = $null) {
+  if (-not $script:pwrap) { return }
+  if (-not $path) { return }
+  $full = $null
+  try { $full = (Resolve-Path -LiteralPath $path -ErrorAction Stop).Path } catch { return }
+  $img = $null
+  try {
+    # 读进内存再解码：Image.FromFile 会一直占着那个文件，之后她想覆盖或删都删不掉
+    $bytes = [System.IO.File]::ReadAllBytes($full)
+    $ms = New-Object System.IO.MemoryStream(, $bytes)
+    $img = [System.Drawing.Image]::FromStream($ms)
+  } catch { return }
+
+  $maxSide = 200
+  $sw = [double]$img.Width
+  $sh = [double]$img.Height
+  if ($sw -lt 1 -or $sh -lt 1) { return }
+  $k = [Math]::Min(1.0, [Math]::Min($maxSide / $sw, $maxSide / $sh))
+  $iw = [int][Math]::Max(24, $sw * $k)
+  $ih = [int][Math]::Max(24, $sh * $k)
+
+  $rowW = Get-PanelRowWidth
+  $bw = $iw + 16
+  $bh = $ih + 16
+
+  $bubble = New-Object System.Windows.Forms.Panel
+  $bubble.Size = New-Object System.Drawing.Size($bw, $bh)
+  $bubble.BackColor = $(if ($who -eq 'me') { $PCOL_MINE } else { $PCOL_HER })
+  $bubble.Region = New-Object System.Drawing.Region((New-PanelRoundPath $bw $bh 14))
+
+  $pic = New-Object System.Windows.Forms.PictureBox
+  $pic.Size = New-Object System.Drawing.Size($iw, $ih)
+  $pic.Location = New-Object System.Drawing.Point(8, 8)
+  $pic.SizeMode = 'Zoom'
+  $pic.Image = $img
+  $pic.BackColor = $bubble.BackColor
+  $pic.Cursor = [System.Windows.Forms.Cursors]::Hand
+  # 路径存在控件自己的 Tag 上，双击时从 $this 取 —— 不依赖外层函数的局部变量还活着
+  $pic.Tag = $full
+  $pic.Add_DoubleClick({
+      try {
+        $p = [string]$this.Tag
+        if ($p) { Start-Process -FilePath $p }
+      } catch { Trace ('panel: open image failed: ' + $_.Exception.Message) }
+    })
+  # 放不下提示就不加；双击才是正经用法
+  $tt = New-Object System.Windows.Forms.ToolTip
+  $tt.SetToolTip($pic, '双击打开：' + $full)
+  [void]$bubble.Controls.Add($pic)
+
+  $row = New-Object System.Windows.Forms.Panel
+  $row.Size = New-Object System.Drawing.Size($rowW, ($bh + 8))
+  $row.Margin = New-Object System.Windows.Forms.Padding(0)
+  $row.BackColor = $PCOL_BG
+
+  if ($who -eq 'me') {
+    $bubble.Location = New-Object System.Drawing.Point(([int]($rowW - $bw - 10)), 0)
+  } else {
+    $bubble.Location = New-Object System.Drawing.Point(52, 0)
+    $av = New-Object System.Windows.Forms.PictureBox
+    $av.Size = New-Object System.Drawing.Size(34, 34)
+    $av.SizeMode = 'Normal'
+    $av.BackColor = $PCOL_BG
+    $av.Image = Get-PanelAvatar 34
+    $av.Location = New-Object System.Drawing.Point(10, 1)
+    [void]$row.Controls.Add($av)
+    $script:plist.Add($av)
+  }
+  [void]$row.Controls.Add($bubble)
+  [void]$script:pwrap.Controls.Add($row)
+  $script:plist.Add($row)
+  try { Enable-PanelDrop $row } catch { }
+
+  try {
+    $script:pwrap.PerformLayout()
+    if ($script:pwrap.VerticalScroll) { $script:pwrap.VerticalScroll.Value = $script:pwrap.VerticalScroll.Maximum }
+  } catch { }
+  Trace ('panel: image ' + (Split-Path $full -Leaf) + ' ' + $iw + 'x' + $ih)
+}
+
 function Add-PanelFiles($paths) {
   $added = 0
   $missed = 0
@@ -908,7 +1005,8 @@ function Panel-Post([string]$text, $files = $null) {
   if ($fl.Count -gt 0) { $o.files = $fl }
   $body = $o | ConvertTo-Json -Compress -Depth 4
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-  return (Invoke-RestMethod -Uri "$BRIDGE/say" -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 15).id
+  $hdr = @{ 'x-dfy-token' = (Get-BridgeToken) }
+  return (Invoke-RestMethod -Uri "$BRIDGE/say" -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -Headers $hdr -TimeoutSec 15).id
 }
 
 function Panel-Send {
@@ -921,7 +1019,15 @@ function Panel-Send {
   if (-not $t) { $t = '看看这个' }
   Add-PanelMsg 'me' $t
   # 文件单独一条气泡（像 QQ 那样），不把路径塞进正文 —— 正文是给他看的，路径是给她用的
-  if ($files.Count -gt 0) { Add-PanelMsg 'me' (Format-PanelFileList $files) }
+  # 图片直接画成缩略图（2026-10-23），双击能打开；非图片还是列文件名
+  if ($files.Count -gt 0) {
+    $others = @()
+    foreach ($f in $files) {
+      if ($f -match '\.(png|jpe?g|webp|gif|bmp)$') { Add-PanelImage 'me' ([string]$f) }
+      else { $others += [string]$f }
+    }
+    if ($others.Count -gt 0) { Add-PanelMsg 'me' (Format-PanelFileList $others) }
+  }
   Clear-PanelAttach
   try {
     $script:ppending = Panel-Post $t $files
@@ -1459,6 +1565,8 @@ function Initialize-Panel {
         $script:pbtn.Enabled = $true
         Update-PanelAttachTip
         Add-PanelMsg 'her' $r.text
+        # 她这一轮画出来的图（bridge 从工具结果里揪出来的绝对路径）—— 直接摊在对话里
+        if ($r.files) { foreach ($f in @($r.files)) { Add-PanelImage 'her' ([string]$f) } }
         Update-PanelMood          # 她刚说完话，心情多半也变了
         Speak-PanelText ([string]$r.text)
       } catch {
