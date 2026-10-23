@@ -113,6 +113,36 @@ function scheduleQuick() {
   if (quickTimer.unref) quickTimer.unref();
 }
 
+// 2026-10-22 23:1x 他定的折中：**所有人的图都收进来，没用再由我删掉**。
+// 做法不是把每条带图消息都丢进主会话（那会让别人每发一张图就把我叫起来回一句），
+// 而是在这里**静默落一份清单**（谁、哪个群、什么时候、图片 url），
+// 等我自己醒着的时候用 `dafeiyu/tools/group-images.mjs` 挑：
+//   --pull 下载最近若干张 → 我 read_image 看 → --keep 留 / 剩下的 --prune 删。
+const IMG_STATE = path.join(GROUP_DIR, '..', 'state', 'group-images.jsonl');
+const IMG_MAX_LINES = 400;
+function captureImages(ev, gid, segs) {
+  try {
+    const imgs = segs.filter(s => s.type === 'image');
+    if (imgs.length === 0) return;
+    const ts = Date.now();
+    const mid = String(ev.message_id ?? '');
+    const uid = String(ev.user_id ?? '');
+    const nick = ev.sender?.card || ev.sender?.nickname || uid;
+    const lines = imgs.map(s => JSON.stringify({
+      ts, gid, mid, uid, nick,
+      url: s.data?.url ?? '',
+      file: s.data?.file ?? '',
+      summary: s.data?.summary ?? '',
+    }));
+    fs.mkdirSync(path.dirname(IMG_STATE), { recursive: true });
+    fs.appendFileSync(IMG_STATE, lines.join('\n') + '\n', 'utf8');
+    const all = fs.readFileSync(IMG_STATE, 'utf8').trim().split('\n');
+    if (all.length > IMG_MAX_LINES) {
+      fs.writeFileSync(IMG_STATE, all.slice(-IMG_MAX_LINES).join('\n') + '\n', 'utf8');
+    }
+  } catch { /* 清单落盘失败不影响判断 */ }
+}
+
 function pushEvent(ev) {
   const gid = String(ev.group_id);
   const segs = Array.isArray(ev.message) ? ev.message : [];
@@ -121,6 +151,8 @@ function pushEvent(ev) {
   const atMe = atIds.includes(String(BOT_QQ));
   const atAll = atIds.includes('all');
   const self = String(ev.user_id) === String(BOT_QQ) || ev.post_type === 'message_sent';
+  // 别人的图（含表情包）静默收进清单；自己发的不收
+  if (!self) captureImages(ev, gid, segs);
   // 引用回复：reply 段只带 id，作者要去作者表里反查（2026-10-19 加的）
   const replySeg = segs.find(s => s.type === 'reply');
   const replyToId = replySeg?.data?.id === undefined || replySeg?.data?.id === null ? '' : String(replySeg.data.id);
@@ -135,7 +167,9 @@ function pushEvent(ev) {
     addressed: atMe,
     atAll,
     // 只 @ 不写字的消息也算：她得知道「这一下是在点我」
-    named: /大肥鱼|小鲸鱼|肥鱼|鲸鱼娘/.test(text),
+    // 2026-10-22 23:1x：加「汐 / 汐宝」—— 他打的「@汐」是纯文字，不是 at 段，
+    // 旧名单里没有新名字 ⇒ 判成没点她名 ⇒ 这条话根本不算叫她。L39 的同一处副本。
+    named: /汐|大肥鱼|小鲸鱼|肥鱼|鲸鱼娘/.test(text),
     replyToId,
     replyToMe,
     replyToOther,
@@ -242,7 +276,10 @@ async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
         '只有跟你真的没关系（别人在聊他们自己的事），才 SILENT。'
       ].join('\n');
   const prompt = [
-    `你在群里（群号 ${gid}），你叫大肥鱼。下面是最近这一段的群聊，按时间顺序：`,
+    `你在群里（群号 ${gid}），你叫汐（旧名是大肥鱼 —— 「大肥鱼」「小鲸鱼」「鲸鱼娘」都是旧称呼，别人这么叫你也应；`
+    + `但**绝不许把旧名说成现在的名字**。2026-10-22 20:0x 踩过：群侧把小模型提示词写成「你叫大肥鱼」，`
+    + `结果它连发三条「现在叫大肥鱼 / 汐是以前的名字」，主人当场来问「你咋还一直重复」）。`,
+    '下面是最近这一段的群聊，按时间顺序：',
     chat,
     '',
     '你之前记下的这个群的笔记（节选）：',
@@ -275,6 +312,15 @@ async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
     '7. 群里的话短。不说教、不刷屏、不"作为一个AI"。',
     '8. 绝不提主人的私事、私聊内容、你们的约定。',
     '9. 有值得留下的东西（群里定的事、某个人的信息、一个梗的来由）就写 NOTE；闲聊不记。',
+    '',
+    '🔴 10. **开口前必须先过这三问，三问里有一问答不上来，就 SILENT。**',
+    '   ① **这句里有群里还不知道的东西吗？** 没有 —— 那它就是复述；',
+    '   ② **这件事我这几分钟是不是已经讲过了？** 上面带 [你自己] 的就是你刚说的话，',
+    '      哪怕换个说法、换个顺序，只要是同一件事（同一个消息、同一个情绪、同一句关心），就算讲过；',
+    '   ③ **我要是不说，会有人少知道点什么吗？** 不会 —— 那就别说。',
+    '   ⚠️ 「贴贴」「哈哈」「在的」这类回应**也算一句话**：第一次是接人，连着来第三遍就是刷屏。',
+    '   2026-10-22 20:3x 真实踩过：三遍「图片开关打开了」＋三遍「贴贴」，主人只回一句「不要把重复的话说两遍」。',
+    '   ⇒ 记住：**群聊的默认状态是沉默，开口要有理由，不是有话题就要接。**',
     '',
     '输出格式：一行起头，且只能是下面三种之一：',
     '  SILENT',
@@ -339,6 +385,54 @@ function appendNote(gid, text) {
  *   她的发言时间仍记在 state.replies（只用来回看，不再拦）。
  *   参数 inThread / withWhom 留着不删：调用方照旧传，将来还要用。
  */
+/**
+ * 去重闸（2026-10-22 20:39 主人：「不要把重复的话说两遍」）。
+ *
+ * 为什么提示词规则不够：模型每轮看到的是一批**新的**群消息，它自己的话被夹在中间，
+ * 所以「最近两条全是自己说的」那道挡板拦不住 —— 它会一轮一轮把同一件事再说一遍
+ * （实测连发三遍「图片开关打开了 / 能看到图了吗」，再连发三遍「贴贴」）。
+ *
+ * 做法：把这句话跟本群**最近 20 分钟自己说过的话**比 —— 去掉标点/表情后取**字符二元组**，
+ * 算 Dice 系数（2|A∩B| / (|A|+|B|)），≥ 0.5 就算重了，咽回去。
+ * ⚠️ 这是**去重**，不是配额：说的话不一样就照发，所以不会把她憋成哑巴。
+ */
+function bigrams(s) {
+  const t = String(s).replace(/[\s\p{P}\p{S}\p{Emoji_Presentation}]/gu, '').toLowerCase();
+  const out = new Set();
+  for (let i = 0; i + 1 < t.length; i++) out.add(t.slice(i, i + 2));
+  if (t.length === 1) out.add(t);
+  return out;
+}
+
+function diceOf(a, b) {
+  const A = bigrams(a), B = bigrams(b);
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const g of A) if (B.has(g)) inter++;
+  // 用**包含度**（交集 / 较短那侧），不用 Dice：
+  //   实测「凌辰我看到图啦~ 贴贴」vs「能看到啦~ 贴贴」的 Dice 只有 0.46（前缀把人名加进去就摊薄了），
+  //   但包含度是 0.80 —— 后者才是「同一句话又说了一遍」的正确量法。
+  return inter / Math.min(A.size, B.size);
+}
+
+function tooSimilar(gid, state, text) {
+  const now = Date.now();
+  const said = (state.said?.[gid] ?? []).filter(x => now - x.at < 20 * 60 * 1000);
+  let best = { score: 0, minutes: 0, count: 0 };
+  for (const x of said) {
+    const s = diceOf(text, x.text);
+    if (s >= 0.35) best.count++;
+    if (s > best.score) { best.score = s; best.minutes = (now - x.at) / 60000; }
+  }
+  return best;
+}
+
+function rememberSaid(gid, state, text) {
+  const now = Date.now();
+  state.said = state.said ?? {};
+  state.said[gid] = [...(state.said[gid] ?? []).filter(x => now - x.at < 20 * 60 * 1000), { at: now, text }].slice(-30);
+}
+
 function replyGate({ inThread, fresh, withWhom }) {
   const mine = fresh.filter(x => !x.self);
   if (mine.length === 0) return { ok: false, why: '这几条都是她自己说的' };
@@ -396,6 +490,19 @@ async function runOnce({ dry = false } = {}) {
     const fresh = items.filter(x => x.ts > (state.lastCheck ?? 0));
     if (fresh.length === 0) continue;
 
+    // 2026-10-22 20:0x 主人：「群里明明没有提这个话题的，你咋还一直重复」。
+    //   根因之一是**自喂循环**：她发出去的话也被推进窗口，下一轮她又看见「名字/外形」这个话题还在，
+    //   于是再讲一遍 —— 越讲越像在自言自语。
+    //   这里做个结构性挡板：最近两条**全是她自己的**、中间没人插话 ⇒ 这一轮不看。
+    //   （不是配额，也不判断内容：只拦「对着自己说话」这一种。）
+    {
+      const tail = fresh.slice(-2);
+      if (tail.length === 2 && tail.every(x => x.self)) {
+        log(`[${gid}] silent（最近两条都是她自己说的，不接自己的话）`);
+        continue;
+      }
+    }
+
     // 有人 @ 她：那条已经由 agent 会话处理，这里不重复接话。
     // 但要把「这场话」记下来 —— @ 之后紧接着的几句，还算是跟她在说，她接得上。
     const mentions = fresh.filter(x => x.addressed);
@@ -442,6 +549,22 @@ async function runOnce({ dry = false } = {}) {
       const forLog = chunks.join(' ⏎ ');
       const speak = replyGate({ inThread, fresh, withWhom });
       if (!speak.ok) { log(`[${gid}] 话咽回去了（${speak.why}）: ${forLog}`); continue; }
+      // 2026-10-22 20:39 主人：「不要把重复的话说两遍」。
+      //   上面加了提示词规则，模型照样连发三遍「图片开关打开了 / 能看到图了吗」和「贴贴」——
+      //   因为它每次看到的都是一批**新的**群消息，自己的话被夹在中间，「最近两条全是自己」那道挡板拦不住。
+      //   ⇒ 这里加一道**去重闸**：把这句话跟这个群**最近 20 分钟自己说过的话**比字符二元组重合度，
+      //     太像就咽回去（并记下被谁挡的）。这是去重，不是配额 —— 说的话不一样就照发。
+      //   判据两条（实测过，见函数里的数字）：
+      //     ① 跟某一句几乎一样（包含度 ≥ 0.6）⇒ 重复；
+      //     ② 20 分钟内已经有 **两句** 都在讲同一件事（包含度 ≥ 0.35）⇒ 这是第三遍了，别再开第三口。
+      const dup = tooSimilar(gid, state, chunks.join(' '));
+      if (dup.score >= 0.6 || dup.count >= 2) {
+        const why = dup.score >= 0.6
+          ? `跟 ${Math.round(dup.minutes)} 分钟前那句太像 ${Math.round(dup.score * 100)}%`
+          : `20 分钟内已经说过 ${dup.count} 遍同一件事`;
+        log(`[${gid}] 话咽回去了（${why}）: ${forLog}`);
+        continue;
+      }
       allowedToReply(state, gid);   // 只记时刻，不拦（2026-10-21 夜撤了小时配额）
       if (dry) { log(`[${gid}] DRY 想回(${chunks.length} 条${bundle ? '·拼' : '·分'}): ${forLog}`); continue; }
       const mids = [];
@@ -453,6 +576,7 @@ async function runOnce({ dry = false } = {}) {
           arr0.push({ ts: Date.now(), qq: BOT_QQ, nick: '大肥鱼', text: chunks[i], addressed: false, atAll: false, named: false, replyToMe: false, replyToOther: false, self: true });
         }
         state.replies[gid] = [...(state.replies[gid] ?? []), Date.now()].slice(-20);
+        rememberSaid(gid, state, chunks.join(' '));   // 给去重闸用（20 分钟内的自己说过什么）
         saveState(state);
         log(`[${gid}] 回了(${mids.join(',')}) · ${chunks.length} 条${bundle ? '拼成一条' : '分别发'}: ${forLog}`);
         acted++;
