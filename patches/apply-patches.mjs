@@ -121,6 +121,92 @@ const SPLIT_SEND_BLOCK = [
     '                }',
 ].join('\n');
 
+// ── 补丁 3：群消息镜像进 raw.jsonl（2026-10-23）─────────────────────
+// 为什么：群里有两条嘴 —— watch 自己发的它记得（sendGroup 发完就补一行 self:true），
+// 而主会话经插件发进群的话，raw.jsonl 里没有、watch 的窗口也没有；这台机器的 NapCat
+// 又不推 message_sent（5444 条里 self 一直是 0）。于是 watch 看见「有人 @ 过她、却没看见
+// 她的回话」，过几分钟可能再答一遍。把插件发出的群消息也补记一行，字段与 watch 完全对齐。
+const MIRROR_MARKER = 'mirrorGroupSend';
+const MIRROR_HELPER_ANCHOR = [
+    '/** Max queued final replies per chat; the oldest is dropped beyond this (M1-B6). */',
+    'const PENDING_SEND_MAX = 20;',
+].join('\n');
+const MIRROR_HELPER_BLOCK = [
+    '/** Max queued final replies per chat; the oldest is dropped beyond this (M1-B6). */',
+    'const PENDING_SEND_MAX = 20;',
+    '/** Local patch (dafeiyu 2026-10-23) · 群消息镜像（mirrorGroupSend）。',
+    ' *  群里有两条嘴：watch 发完会自己往 raw.jsonl 补一行 self:true，所以它记得自己说过什么；',
+    ' *  而主会话经插件发进群的话，raw.jsonl 里没有、watch 的窗口也没有，NapCat 也不推 message_sent。',
+    ' *  ⇒ watch 看见「有人 @ 过她、却没看见她的回话」，过几分钟可能再答一遍。',
+    ' *  这里把插件发出去的群消息也补记一行，字段与 watch 的 sendGroup() 一一对齐',
+    ' *  （preloadWindow 直接读这几列：ts/qq/nick/text/self/gid/mid + 那几个布尔）。',
+    ' *  边界：只对群生效；目录不存在（不是她那台机器）静默跳过；失败绝不影响发送。',
+    ' *  局限：t2i 文字图卡片那边靠调用方传 mirrorText 把原文带过来，否则只能记 [图片]。 */',
+    'const MIRROR_RAW_FILE = process.env.DAFEIYU_GROUP_RAW',
+    "    || join(process.env.USERPROFILE || process.env.HOME || '', 'Documents', 'deepseek-harness', 'default-workspace', 'dafeiyu', 'group', 'raw.jsonl');",
+    'function mirrorTextOf(segments) {',
+    '    const parts = [];',
+    '    for (const seg of Array.isArray(segments) ? segments : []) {',
+    "        if (seg?.type === 'text')",
+    "            parts.push(String(seg.data?.text ?? ''));",
+    "        else if (seg?.type === 'image')",
+    "            parts.push('[图片]');",
+    "        else if (seg?.type === 'at')",
+    "            parts.push('@' + String(seg.data?.qq ?? ''));",
+    "        else if (seg?.type === 'face')",
+    "            parts.push('[表情]');",
+    '    }',
+    "    return parts.join('').trim();",
+    '}',
+    'async function mirrorGroupSend(chatId, segments, messageId, selfId, overrideText) {',
+    '    try {',
+    '        const ref = splitChatId(chatId);',
+    "        if (ref.kind !== 'group')",
+    '            return;',
+    '        const text = String(overrideText ?? mirrorTextOf(segments)).trim();',
+    "        if (text === '')",
+    '            return;',
+    '        const line = JSON.stringify({',
+    "            ts: Date.now(), qq: String(selfId ?? ''), nick: '汐', text: text.slice(0, 500),",
+    '            addressed: false, atAll: false, named: false,',
+    "            replyToId: '', replyToMe: false, replyToOther: false, replyToNick: '', replyUnknown: false,",
+    "            self: true, gid: String(ref.target), mid: String(messageId ?? ''),",
+    "        }) + '\\n';",
+    "        await appendFile(MIRROR_RAW_FILE, line, 'utf8');",
+    '    }',
+    '    catch {',
+    '        /* 镜像只是给 watch 看，失败不影响发送 */',
+    '    }',
+    '}',
+].join('\n');
+
+const MIRROR_CARD_ANCHOR = [
+    "                        const id = await this.sendMsg(chatId, [{ type: 'image', data: { file: b64 } }], options);",
+].join('\n');
+const MIRROR_CARD_BLOCK = [
+    '                        // Local patch (dafeiyu 2026-10-23): 文字图卡片发的是 [图片]，原文要一起带过去，',
+    '                        // 不然 raw.jsonl 里只剩 [图片]，watch 不知道那句话说过没有。',
+    "                        const id = await this.sendMsg(chatId, [{ type: 'image', data: { file: b64 } }], { ...options, mirrorText: body });",
+].join('\n');
+
+const MIRROR_SEND_ANCHOR = [
+    "        const data = await this.ctx.call('send_msg', params, chatId);",
+    '        return data.message_id !== undefined ? String(data.message_id) : undefined;',
+].join('\n');
+const MIRROR_SEND_BLOCK = [
+    "        const data = await this.ctx.call('send_msg', params, chatId);",
+    '        const messageId = data.message_id !== undefined ? String(data.message_id) : undefined;',
+    '        // Local patch (dafeiyu 2026-10-23): 群消息也镜像一份给 watch（见 mirrorGroupSend 注释）',
+    '        // ⚠ 参数求值也必须兜住：这里一旦抛，发送就失败了 —— 镜像只是锦上添花，绝不能反向伤到发送。',
+    '        try {',
+    '            await mirrorGroupSend(chatId, segments, messageId, this.ctx.selfId() || this.ctx.config.botQQ, options === null || options === void 0 ? void 0 : options.mirrorText);',
+    '        }',
+    '        catch {',
+    '            /* 镜像失败绝不影响发送 */',
+    '        }',
+    '        return messageId;',
+].join('\n');
+
 /** @type {{id:string, file:string, marker:string, ops:{find:string, replace:string}[]}[]} */
 const PATCHES = [
     {
@@ -136,6 +222,16 @@ const PATCHES = [
         ops: [
             { find: SPLIT_HELPER_ANCHOR, replace: SPLIT_HELPER_BLOCK },
             { find: SPLIT_SEND_ANCHOR, replace: SPLIT_SEND_BLOCK },
+        ],
+    },
+    {
+        id: 'mirror-group-send',
+        file: 'outbound.js',
+        marker: MIRROR_MARKER,
+        ops: [
+            { find: MIRROR_HELPER_ANCHOR, replace: MIRROR_HELPER_BLOCK },
+            { find: MIRROR_CARD_ANCHOR, replace: MIRROR_CARD_BLOCK },
+            { find: MIRROR_SEND_ANCHOR, replace: MIRROR_SEND_BLOCK },
         ],
     },
 ];

@@ -497,6 +497,14 @@ function parseDirective(out) {
 }
 
 async function runOnce({ dry = false } = {}) {
+  // 2026-10-23 16:3x：**每轮都补一次窗口**。
+  //   插件（`dsh-onebot-qq` 的 `mirror-group-send` 补丁）把我从 QQ 主会话发进群的话
+  //   也写进了 raw.jsonl —— 但它推进不了这个进程的内存窗口。不补，watch 还是看不见
+  //   自己刚说过什么，又会对着已经答过的消息再答一遍。
+  //   幂等：ts+qq+text 完全相同的行不会重复进；补进来的都是旧消息（ts < lastCheck），
+  //   所以也不会触发新一轮判断，只是让模型看得见。
+  const healed = preloadWindow();
+  if (healed > 0) log(`窗口补齐 ${healed} 条（来自 raw.jsonl，含主会话发进群的话）`);
   const state = loadState();
   const groups = [...windows.keys()].filter(gid => recent(gid).length > 0);
   let acted = 0;
