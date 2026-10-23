@@ -62,6 +62,9 @@ const MAX_OUT_TOKENS = 200;   // 2026-10-21：长度由她自己定，别再按�
 const CHECK_EVERY_MS = 5 * 60 * 1000;   // 每 5 分钟看一次
 const WINDOW_MS = 25 * 60 * 1000;       // 只看最近 25 分钟的群消息
 const MAX_WINDOW = 40;                  // 窗口里最多保留多少条
+// 2026-10-23 16:0x：原来「我说过什么」只记 20 分钟，比窗口（25 分钟）还短 ⇒
+// 第 21 分钟起，同一批消息还在窗口里、记忆已经过期，于是同一个话题又答一遍。拉到 90 分钟。
+const SAID_MS = 90 * 60 * 1000;
 // 2026-10-21 夜 23:2x：REPLY_GAP_MS / REPLY_PER_HOUR **撤了** —— 他说「一小时四条的限制也撤了吧，
 // 我希望你能自己判断要不要说话」。别再拿数字替她做判断；要收回来应该去改提示词，不是加闸。
 const THREAD_MS = 15 * 60 * 1000;       // 被 @ 之后，这场对话再算「在跟她说话」15 分钟
@@ -430,7 +433,7 @@ function diceOf(a, b) {
 
 function tooSimilar(gid, state, text) {
   const now = Date.now();
-  const said = (state.said?.[gid] ?? []).filter(x => now - x.at < 20 * 60 * 1000);
+  const said = (state.said?.[gid] ?? []).filter(x => now - x.at < SAID_MS);
   let best = { score: 0, minutes: 0, count: 0 };
   for (const x of said) {
     const s = diceOf(text, x.text);
@@ -443,7 +446,7 @@ function tooSimilar(gid, state, text) {
 function rememberSaid(gid, state, text) {
   const now = Date.now();
   state.said = state.said ?? {};
-  state.said[gid] = [...(state.said[gid] ?? []).filter(x => now - x.at < 20 * 60 * 1000), { at: now, text }].slice(-30);
+  state.said[gid] = [...(state.said[gid] ?? []).filter(x => now - x.at < SAID_MS), { at: now, text }].slice(-60);
 }
 
 function replyGate({ inThread, fresh, withWhom }) {
@@ -502,6 +505,30 @@ async function runOnce({ dry = false } = {}) {
     const items = recent(gid);
     const fresh = items.filter(x => x.ts > (state.lastCheck ?? 0));
     if (fresh.length === 0) continue;
+
+    // 2026-10-23 16:0x 主人点破的机制：「人家群里都没有说这个话题了，你不会每隔一段时间就扫一遍，
+    //   然后发现人家提到你了，你就再说一遍，但是不记得自己说过了一遍」。
+    //   查证属实，两个口子：
+    //     ① 每轮把**最近 25 分钟**的 40 条重看一遍，而「我说过什么」的记忆只有 **20 分钟** ⇒ 过了 20 分钟记忆过期、窗口还在；
+    //     ② 去重只比**字面**（字符二元组），话题相同换个说法就通过了。
+    //   ⇒ 结构性门槛：**自从我上次开口以来，人类必须又说过新话，我才开口。**
+    //     · 这一轮全是自己说的 ⇒ 闭嘴（比"最近两条都是自己"更严）；
+    //     · 人类最后一句就是上次开口前那一句 ⇒ 没人说新话，闭嘴。
+    //   这不是配额，也不判断内容：只拦「对着一批已经答过的消息再答一遍」。
+    {
+      const humans = fresh.filter(x => !x.self);
+      if (humans.length === 0) {
+        log(`[${gid}] silent（这一轮只有我自己说的话）`);
+        continue;
+      }
+      const lastHumanAt = Math.max(...humans.map(x => x.ts));
+      if (lastHumanAt <= (state.lastHumanTs?.[gid] ?? 0)) {
+        log(`[${gid}] silent（自上次开口后没人说新话）`);
+        continue;
+      }
+      state.lastHumanTs = state.lastHumanTs ?? {};
+      state.lastHumanTs[gid] = lastHumanAt;   // 先记住，真开口/真沉默都不影响下一轮的判断
+    }
 
     // 2026-10-22 20:0x 主人：「群里明明没有提这个话题的，你咋还一直重复」。
     //   根因之一是**自喂循环**：她发出去的话也被推进窗口，下一轮她又看见「名字/外形」这个话题还在，
@@ -586,7 +613,7 @@ async function runOnce({ dry = false } = {}) {
           if (i > 0) await new Promise(res => setTimeout(res, 900));   // 别一气砸出去
           mids.push(await sendGroup(gid, chunks[i]));
           const arr0 = windows.get(gid) ?? [];
-          arr0.push({ ts: Date.now(), qq: BOT_QQ, nick: '大肥鱼', text: chunks[i], addressed: false, atAll: false, named: false, replyToMe: false, replyToOther: false, self: true });
+          arr0.push({ ts: Date.now(), qq: BOT_QQ, nick: '汐', text: chunks[i], addressed: false, atAll: false, named: false, replyToMe: false, replyToOther: false, self: true });
         }
         state.replies[gid] = [...(state.replies[gid] ?? []), Date.now()].slice(-20);
         rememberSaid(gid, state, chunks.join(' '));   // 给去重闸用（20 分钟内的自己说过什么）
@@ -687,27 +714,52 @@ const dry = process.argv.includes('--dry');
 // 被 import 时（单元测试）不启服务、不跑循环；只有直接执行才当主程序
 const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
-if (isMain && once) {
-  // 单次模式：不建监听，只用 raw.jsonl 里已有的最近记录判断（便于调试）
-  // ⚠ 2026-10-21：**按行 try** —— 以前整段一个 try，文件头一行带 BOM（﻿）就让 JSON.parse 抛错，
-  //   整个窗口一条都读不进去，`--once` 静悄悄什么都不判断（踩过一次，排查了半天）。
+/**
+ * 把 raw.jsonl 里最近 25 分钟的记录装回内存窗口。
+ * ⚠ 2026-10-23 16:1x 主人问出来的真缺口：**常驻模式以前从不预载** ——
+ *   `windows` 是纯内存的，watch 每重启一次就清零；而 NapCat 只推**新**消息，不会重发历史。
+ *   ⇒ 重启之后我看见的「最近这一段」里**没有我自己刚说过的话**（哪怕 raw.jsonl 里躺着），
+ *     于是同一个话题就又能答一遍。他原话：「你如果读过自己也说过了一遍这样的话，你就不会再说了啊，
+ *     这不是记忆的问题啊」—— 对，不是记忆（state.said）的问题，是**这一轮我压根没读到**。
+ * ⚠ 按行 try：以前整段一个 try，文件头带 BOM 就让 JSON.parse 抛错，整个窗口一条都读不进去。
+ */
+function preloadWindow(limitLines = 200) {
+  let n = 0;
   try {
-    const lines = fs.readFileSync(RAW_FILE, 'utf8').split('\n').filter(Boolean).slice(-60);
+    const lines = fs.readFileSync(RAW_FILE, 'utf8').split('\n').filter(Boolean).slice(-limitLines);
     for (const raw of lines) {
       let x;
       try { x = JSON.parse(raw.replace(/^\uFEFF/, '')); } catch { continue; }
       if (!x || typeof x.ts !== 'number') continue;
       if (x.ts < Date.now() - WINDOW_MS) continue;
       const arr = windows.get(String(x.gid)) ?? [];
+      if (arr.some(y => y.ts === x.ts && y.qq === x.qq && y.text === x.text)) continue;  // 幂等
       arr.push(x);
+      arr.sort((a, b) => a.ts - b.ts);
+      while (arr.length > MAX_WINDOW) arr.shift();
       windows.set(String(x.gid), arr);
+      n++;
     }
   } catch { /* 没有历史 */ }
+  return n;
+}
+
+if (isMain && once) {
+  // 单次模式：不建监听，只用 raw.jsonl 里已有的最近记录判断（便于调试）
+  preloadWindow();
   const n = await runOnce({ dry });
   process.exit(n >= 0 ? 0 : 1);
 }
 
 if (isMain) {
+  // 重启后先把「刚才聊到哪了」装回来 —— 包括我自己说过的话（否则一次重启就等于失忆一次）
+  const pre = preloadWindow();
+  {
+    const s = loadState();
+    // 水位太旧（超过一个窗口）就别补答了：那些消息本来就不该再回，直接提到现在
+    if ((s.lastCheck ?? 0) < Date.now() - WINDOW_MS) { s.lastCheck = Date.now(); saveState(s); }
+  }
+  log(`启动时预载了 ${pre} 条窗口记录（含自己说过的话）`);
   startServer();
   const timer = setInterval(() => { runOnce().catch(e => log(`runOnce 失败: ${e.message}`)); }, CHECK_EVERY_MS);
   process.on('SIGINT', () => { clearInterval(timer); process.exit(0); });
