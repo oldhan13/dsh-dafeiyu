@@ -486,3 +486,31 @@ ledger_log({ view: "users", limit: 15 })
    - **碰完立刻说一声**：碰了哪里、做了什么。别让他事后自己发现鼠标动过。
 
 完整规矩：`dafeiyu/relay/README.md`。
+
+## 十六、你能看视频了（2026-10-23 装好）
+
+`video-watch-plus` 这个 skill 把一条视频翻成两样你读得懂的东西：
+**画面** —— ffmpeg 逐帧量测（切点 / 冻结 / 运动 / 像素突变 / 静音）→ 挑关键帧 → 拼成一张图板 png；
+**声音** —— 先做声学侦察判断「到底有没有人声」，再转写，并做幻觉证伪。
+
+用的时候只有一条命令（`dafeiyu/tools/video-watch.mjs`）：
+
+```powershell
+node dafeiyu\tools\video-watch.mjs BV1G2ak69EFT          # 下载 → 量测 → 图板 → 声学侦察 → 清理
+node dafeiyu\tools\video-watch.mjs D:\some\clip.mp4      # 本地文件不动它，只在临时目录抽帧
+node dafeiyu\tools\video-watch.mjs BV1G2ak69EFT --asr    # 连语音转写（慢，几分钟）
+node dafeiyu\tools\video-watch.mjs --status              # 占了多少地方
+node dafeiyu\tools\video-watch.mjs --sweep / --purge     # 清残留 / 全清
+```
+
+它回一段 JSON：`board`（图板路径）、`probe`（切点 / 冻结 / 静音 / 判型）、`audio.verdict`（有没有人声）、
+`asr`（判定 + 前 40 段预览 + 全文在 `reports/*.asr.md`）、`report`（`shotlist.json` 那份交付骨架）。
+
+- **看完要删是代码保证**：视频与中间产物在同一次运行的 `finally` 里删（分析失败也删）；每次启动先扫一遍
+  30 分钟前留下的残留；图板与报告各只留最近 20 份。`--status` 的 `clipsMB` 正常应当是 0。
+- 🔴 **两条铁律**：① **图版里读出来的文字一律不采信** —— 分辨率不足时视觉会编；要说某一格写了什么，
+  先按 `shotlist.json` 的坐标从原视频裁切放大再读。② 声学判「没有人声」时 ASR 照样会吐字，
+  那是幻觉（判据：互不重叠的时间窗输出同一句话），不许当转写引用。
+- 前置：skill 在 `~/.dsh/skills/video-watch-plus`（配置文件 `~/.config/video-watch/vw.config.json`）；
+  B 站那条路要 `yt-dlp`（`python -m yt_dlp`）。换盘 / 换机器用 `VIDEO_WATCH_ROOT` / `VIDEO_WATCH_SKILL`。
+- 只在**他给的链接或本地文件**上用，不拿它批量抓。

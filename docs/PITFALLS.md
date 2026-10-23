@@ -196,3 +196,12 @@ $s.Save()
 **做法**：`sendGroup()` 发成功之后，自己往 `raw.jsonl` 补一行 `self: true`（带 message_id）。
 ⚠️ 缺口仍在：从**别的进程**（QQ 那条会话）直接发进群的话，这份日志里没有 —— 用之前先看这一条。
 
+## 14. `vw.py plan --out` 要的是**文件**，不是目录（2026-10-23）
+
+现象：`video-watch-plus` 的 `plan` 子命令里写的是 `open(args.out, "w")` —— 传目录进去直接
+`PermissionError: [Errno 13] Permission denied`（Windows 上表现为这条 traceback）。
+它静默失败、`report` 又依赖 `plan` 产出的 `shotlist.json`，所以整条链上**只有报告变成 null**，
+图板和量测全都正常 —— 最容易当成"上游不支持"放过去。
+
+**做法**：`plan --out <workDir>/shotlist.json`（文件路径，或干脆不给 `--out`，它默认写到 timeline 旁边）；
+报告再 `report timeline.json shotlist.json --out report.md`。

@@ -302,6 +302,43 @@ DSH 里每处说话都是独立会话（QQ 每人一条、网页一条），而�
 你丢一张截图过去，她知道文件在哪、能用命令去处理它，
 但不会真的"看见"里面画了什么。要她看图，得另接一个视觉模型。
 
+## 看一条视频（可选：要装一个 skill）
+
+上面那句「她看不见图」有一个补丁：**视频可以先拆成她能读的东西**。
+
+- **要两样外面的东西**（都不在这个仓库里）：
+  `video-watch-plus` 这个 skill —— ffmpeg 逐帧量测（切点 / 冻结 / 运动 / 静音）→ 挑关键帧拼成一张图板；
+  声学侦察判有没有人声 → 转写 → 幻觉证伪；
+  `yt-dlp` —— 把 BV 号 / 链接落成 mp4。
+- **一条命令**（`dafeiyu/tools/video-watch.mjs`）：
+
+  ```powershell
+  node dafeiyu\tools\video-watch.mjs BV1G2ak69EFT        # 下载 → 量测 → 图板 → 声学侦察 → 清理
+  node dafeiyu\tools\video-watch.mjs D:\some\clip.mp4    # 本地文件不动它，只在临时目录里抽帧
+  node dafeiyu\tools\video-watch.mjs BV1G2ak69EFT --asr  # 连语音转写一起跑（慢，几分钟）
+  node dafeiyu\tools\video-watch.mjs --status            # 占了多少地方
+  node dafeiyu\tools\video-watch.mjs --sweep / --purge   # 清残留 / 全清
+  ```
+
+- **它自己收拾，不靠记性**：视频与中间产物在**同一次运行的 `finally` 里删**（分析失败也删）；
+  每次启动先扫一遍 30 分钟前留下的残留；图板与报告各只留最近 20 份。
+  `--status` 里 `clipsMB` 正常应当是 0 —— 不是 0 就说明上一次是被硬杀掉的。
+- **两条不能省的规矩**：① 图版里读出来的字**一律不采信**（分辨率不够时视觉会编；要说某格写了什么，
+  得按 `shotlist.json` 的坐标从原视频裁切放大再读）；② 声学侦察判「没有人声」时，转写照样会吐字 ——
+  那是幻觉（判据：互不重叠的时间窗输出同一句话），不许当成转写引用。
+- 它只吃**你给的链接或本地文件**。不是爬虫，不做批量抓取。
+
+装那两样（一次性）：
+
+```powershell
+git clone https://github.com/xinhailaopo/video-watch-plus "$env:USERPROFILE\.dsh\skills\video-watch-plus"
+# 那个 skill 自带 scripts\setup-windows.ps1：ffmpeg 已有就用 -Ffmpeg 指过去，别重下 190MB
+python -m pip install -U yt-dlp
+```
+
+`--asr` 第一次跑会下 faster-whisper 的 `small` 模型（约 460MB，走 `HF_ENDPOINT` 镜像）；
+之后是纯本地推理。机器的 pip 默认源若是卡住的，加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
+
 ## 可选：拓展模块
 
 上面那些是本体。另外四样要么吃显存、要么要账号、要么要额外的额度 —— 所以不进主流程，单独一页：
