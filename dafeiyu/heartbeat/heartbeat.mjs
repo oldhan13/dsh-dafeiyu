@@ -46,10 +46,33 @@ try {
   log('[llm] ' + s.label + ' · ' + s.model + ' · ' + (s.hasKey ? 'key ok' : 'NO KEY (' + s.keyFile + ')'));
 } catch { }
 
+// NapCat 的反向 WS 走本地 HTTP —— 但它一挂，fetch 就一直挂着不返回，
+// 整个 wake() 吊死在那儿：不报错、不主动说话、信箱也不清。
+// 所以每个请求都带一个上限（2026-10-23 加的）。
+const NAPCAT_TIMEOUT_MS = Number(process.env.DAFEIYU_NAPCAT_TIMEOUT_MS) || 20000;
+
 function readState() {
   try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch { return { sent: [], } }
 }
-function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2)); }
+function writeState(s) {
+  // 原来直接 writeFileSync —— 那是「先截断、再写」。写一半崩掉，文件就成了半截 JSON，
+  // readState 只好退回空 ⇒ 当天发过几条的配额历史全丢（等于她那天可以无限次开口）。
+  // 改成写临时文件再改名。⚠️ Windows 上改名撞到别人正在读会失败，所以带退避重试：
+  // 不重试反而比原来更容易丢。
+  const body = JSON.stringify(s, null, 2);
+  const tmp = STATE + '.tmp';
+  try { fs.writeFileSync(tmp, body, 'utf8'); } catch { return; }
+  for (let i = 0; i < 6; i++) {
+    try { fs.renameSync(tmp, STATE); return; } catch { }
+    sleepSync(20 * (i + 1));
+  }
+  try { fs.writeFileSync(STATE, body, 'utf8'); } catch { }
+  try { fs.unlinkSync(tmp); } catch { }
+}
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+  catch { const t = Date.now(); while (Date.now() - t < ms) { } }
+}
 
 function tailFile(file, maxLines) {
   try {
@@ -101,6 +124,7 @@ async function send(text, to = OWNER) {
   const body = { user_id: to, message: [{ type: 'text', data: { text } }], auto_escape: false };
   const r = await fetch('http://127.0.0.1:3000/send_private_msg', {
     method: 'POST',
+    signal: AbortSignal.timeout(NAPCAT_TIMEOUT_MS),
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ONEBOT}` },
     body: JSON.stringify(body)
   });
@@ -114,6 +138,7 @@ async function sendVoice(file, to = OWNER) {
   const body = { user_id: to, message: [{ type: 'record', data: { file } }], auto_escape: false };
   const r = await fetch('http://127.0.0.1:3000/send_private_msg', {
     method: 'POST',
+    signal: AbortSignal.timeout(NAPCAT_TIMEOUT_MS),
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ONEBOT}` },
     body: JSON.stringify(body)
   });
@@ -127,6 +152,7 @@ async function postQzone(text) {
   const body = { content: text, images: [], ugc_right: 1 };
   const r = await fetch('http://127.0.0.1:3000/send_qzone_msg', {
     method: 'POST',
+    signal: AbortSignal.timeout(NAPCAT_TIMEOUT_MS),
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ONEBOT}` },
     body: JSON.stringify(body)
   });
@@ -226,6 +252,7 @@ const DM_SEEN_FILE = path.join(ROOT, 'dafeiyu', 'state', 'dm-seen.json');
 async function napcat(action, payload) {
   const r = await fetch(`http://127.0.0.1:3000/${action}`, {
     method: 'POST',
+    signal: AbortSignal.timeout(NAPCAT_TIMEOUT_MS),
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ONEBOT}` },
     body: JSON.stringify(payload)
   });
@@ -354,7 +381,11 @@ async function wake() {
   const lastSent = state.sent?.length ? new Date(state.sent[state.sent.length - 1].at) : null;
   const minutesSince = lastSent ? Math.round((now - lastSent) / 60000) : null;
 
-  const persona = `你在扮演"大肥鱼"，一个住在主人电脑里的同伴。以下是你的常驻设定，必须遵守：\n\n${fs.readFileSync(AGENTS, 'utf8')}`;
+  // 2026-10-22 20:0x 改：这里原来写的是「你在扮演"大肥鱼"」—— 名字 10-22 12:00 已经改成「汐」，
+  // 而写死在这一行里的旧名没跟着改，于是好几个侧线（群 / 心跳 / 面板）会一本正经地把旧名当现在的名字讲。
+  // 见 LESSONS L39：改了一条事实，要把所有副本一起找出来。
+  const persona = `你在扮演"汐"（旧名大肥鱼 / 小鲸鱼 / 鲸鱼娘，别人这么叫你也应 —— 但自己的名字是汐），`
+    + `一个住在主人电脑里的同伴。以下是你的常驻设定，必须遵守：\n\n${fs.readFileSync(AGENTS, 'utf8')}`;
   let situation = [
     `现在是 ${now.toLocaleString('zh-CN', { timeZone: 'Asia/Hong_Kong', hour12: false })}（周${'日一二三四五六'[now.getDay()]}）。`,    presenceLine(pres),
     minutesSince === null ? '你还没有主动找过他。' : `你上一次主动发消息是 ${minutesSince} 分钟前。`,
