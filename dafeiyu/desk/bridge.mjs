@@ -45,6 +45,26 @@ const AGENT_TIMEOUT = (Number(process.env.DAFEIYU_AGENT_TIMEOUT_SEC) || 600) * 1
 // 模型端点不再写死在这儿：统一由 dafeiyu/lib/llm.mjs 决定
 // （dafeiyu/state/llm.json > 环境变量 > 有 DeepSeek key 就用官方，否则退回硅基流动）。
 const PORT = 3079;
+
+// ---- 鉴权：桥只给面板用 ----
+// 只绑 127.0.0.1 挡不住一件真事：**本机的浏览器会替网页跑腿**。
+// /say 和 /delegate 原来不看 Content-Type 就 JSON.parse(raw)，而跨站的 text/plain 属于
+// "简单请求"——不发预检就直接打进来，浏览器读不到回执，但副作用已经发生。
+// （2026-10-23 实测：POST text/plain 到 /say 立刻被受理，回的是 {"error":"empty"}。
+//   再往上就是 run：任意 PowerShell，以主人账户的权限。）
+const TOKEN_FILE = path.join(DESK, 'token.txt');
+function loadToken() {
+  try {
+    const t = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+    if (t) return t;
+  } catch { }
+  // 没有就现生成一个 —— 面板那边也读这个文件，所以两边不用人工对一次。
+  const t = Date.now().toString(36) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  try { fs.writeFileSync(TOKEN_FILE, t + '\n', 'utf8'); } catch { }
+  return t;
+}
+const TOKEN = loadToken();
+
 // 起来时打一行：现在用的是哪家、哪个模型、key 有没有 —— 免得以后再靠猜。
 try {
   const s = llmSummary();
@@ -58,6 +78,23 @@ fs.mkdirSync(DESK, { recursive: true });
 
 const jobs = new Map();
 let seq = 0;
+
+// ---- 连发合并 ----
+// 面板连着发几句时，别一句一句地过：等 COALESCE_MS，并成一轮，一次看全、一次回答。
+// 顺带把并发问题一起解决 —— 原来两个 /say 同时进来会各跑一个 agentLoop，
+// 而 agentLoop 靠「历史最后一条就是本轮」去重，并发时会剥错行（她就漏看半句话）。
+const COALESCE_MS = Math.max(300, Number(process.env.DAFEIYU_SAY_COALESCE_MS) || 1200);
+let pendingSay = null;   // { texts:[], files:[], quiet:bool, ids:[], timer }
+let runningSay = false;
+
+// 面板崩在「正在想」那一刻，job 就永远留在 Map 里 —— 内存事小，
+// 真麻烦是面板重启后拿旧 id 来问会 404。十分钟扫一次，超过半小时的条目扔掉。
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, j] of jobs) {
+    if (j && j.at && now - j.at > 30 * 60 * 1000) jobs.delete(id);
+  }
+}, 10 * 60 * 1000).unref?.();
 
 function readIf(p, cap) {
   try {
@@ -606,15 +643,16 @@ function wantsDraw(text) {
   return /(画一[张个幅下]|画个|画张|画画|画吧|来一张|来张图|绘制|用\s*draw|draw\s*工具)/i.test(String(text || ''));
 }
 
-async function agentLoop(text, files) {
+async function agentLoop(text, files, dropN = 1) {
   // 历史里带过文件的那几句，也要把路径再交给她一遍 —— 否则回头问"刚才那个文件"她一脸茫然。
   let recent = history(16).map(h => ({ role: h.role, content: String(h.text || '') + fileBlock(h.files) }));
   const userText = String(text) + fileBlock(files);
-  // /say 会先把这句写进历史、再调 agentLoop ⇒ 历史最后一条就是这句话本身。
+  // /say 会先把这些话写进历史、再调 agentLoop ⇒ 历史最后 dropN 条就是这一轮说的话本身。
   // 不剥掉的话模型每次都看见两条一样的话（实测：她连着几轮都在问"你怎么发了两次"）。
-  if (recent.length) {
-    const last = recent[recent.length - 1];
-    if (last.role === 'user' && last.content === userText) recent = recent.slice(0, -1);
+  // 2026-10-23：连发合并之后一轮可能是好几条，所以要按条数剥，不能只比最后一条相不相等。
+  for (let i = 0; i < dropN && recent.length; i++) {
+    if (recent[recent.length - 1].role !== 'user') break;
+    recent = recent.slice(0, -1);
   }
   const messages = [
     { role: 'system', content: systemPrompt() },
@@ -623,6 +661,19 @@ async function agentLoop(text, files) {
   ];
   traceAction('prompt ' + messages[0].content.length + ' chars / ' + recent.length + ' turns');
   const did = [];
+  // 她这一轮画出来 / 保存出来的图（面板要摊在对话里给他看，2026-10-23 加的）
+  const images = [];
+  const grabImages = (v) => {
+    try {
+      const m = String(v == null ? '' : v).match(/[A-Za-z]:\\[^\s"'<>|]+\.(?:png|jpe?g|webp|gif)/gi);
+      if (!m) return;
+      for (const raw of m) {
+        const p = raw.trim();
+        if (!p || images.includes(p)) continue;
+        try { if (fs.statSync(p).isFile()) images.push(p); } catch { }
+      }
+    } catch { }
+  };
 
   for (let step = 0; step < MAX_STEPS; step++) {
     // 最后一步把工具摘掉，逼她用一句话收尾 —— 否则她会一直往外伸手
@@ -639,7 +690,7 @@ async function agentLoop(text, files) {
         traceAction('nudge draw');
         continue;
       }
-      return { reply, did };
+      return { reply, did, images };
     }
     messages.push({ role: 'assistant', content: msg.content || '', tool_calls: calls });
     for (const c of calls) {
@@ -652,15 +703,82 @@ async function agentLoop(text, files) {
         result = '工具出错：' + (e?.message || String(e));
       }
       did.push(name);
+      grabImages(result);
       traceAction(name + ' ' + String(c?.function?.arguments || '').slice(0, 300));
       messages.push({ role: 'tool', tool_call_id: c.id, content: clip(result, 8000) });
     }
   }
-  return { reply: '（动手动了太多步，我先停下。你说一句，我接着做。）', did };
+  return { reply: '（动手动了太多步，我先停下。你说一句，我接着做。）', did, images };
 }
 
 function say(msg) {
   try { fs.writeFileSync(SAY, msg.replace(/\s+/g, ' ').slice(0, 80), 'utf8'); } catch { }
+}
+
+// 把攒下的几句一起跑完，再一次性把结果放回 job 里。
+async function flushSay() {
+  if (runningSay) { setTimeout(flushSay, COALESCE_MS); return; }
+  const batch = pendingSay;
+  pendingSay = null;
+  if (!batch || !batch.texts.length) return;
+  runningSay = true;
+  const job = batch.job;
+  activity('thinking', '');
+  for (const t of batch.texts) {
+    append({ role: 'user', text: t, at: Date.now(), ...(batch.files.length ? { files: batch.files } : {}) });
+  }
+  try {
+    const { reply, did, images } = await agentLoop(batch.texts.join('\n'), batch.files, batch.texts.length);
+    append({ role: 'assistant', text: reply, at: Date.now(), ...(images && images.length ? { files: images } : {}) });
+    if (images && images.length) job.files = images.slice(0, 12);
+    traceAction('done (' + (did.length ? did.join(',') : '没动手') + '): ' + reply.slice(0, 120));
+    activity('idle', '');
+    // 面板发来的（quiet）：回复直接进面板，别再写 say.txt ——
+    // 写了会被鱼头顶的气泡监听再递一遍，一次发送显示两条
+    if (!batch.quiet) say(reply);
+    job.status = 'done'; job.text = reply; job.at = Date.now();
+  } catch (err) {
+    const reason = String(err && err.message ? err.message : err);
+    // 前缀契约跟着 lib/llm.mjs 的 mapError 走：BALANCE / KEY / RATE 后面都带冒号和细节。
+    // 以前这里判的是 raw === 'BALANCE'，而 llm.mjs 返回的是 'BALANCE: <家名>…'
+    // ⇒ 余额不足会被显示成「我这边卡住了」，2026-10-21 顺手修掉。
+    const msg =
+      reason.startsWith('BALANCE:') ? '（我这边账户没钱了 —— ' + reason.slice(9).trim() + '。充上就好，别的一句都没丢）' :
+      reason.startsWith('KEY:') ? '（key 不对：' + reason.slice(4).trim() + '）' :
+      reason.startsWith('RATE:') ? '（被限流了：' + reason.slice(5).trim() + '）' :
+      reason.startsWith('TIMEOUT:') ? '（等太久没回音了：' + reason.slice(8).trim() + '。你再说一句，我重来）' :
+      reason.startsWith('NET:') ? '（网络没通：' + reason.slice(4).trim() + '。你再说一句，我重来）' :
+      '（我这边出错了：' + reason.slice(0, 200) + '）';
+    traceAction('error: ' + msg);
+    activity('error', reason.startsWith('BALANCE:') ? '余额不足' : reason.slice(0, 60));
+    job.status = 'error'; job.text = msg; job.at = Date.now();
+  } finally {
+    runningSay = false;
+  }
+}
+
+function enqueueSay(text, files, quiet) {
+  const id = String(++seq);
+  if (!pendingSay) {
+    pendingSay = {
+      texts: [], files: [], quiet: true, ids: [], timer: null,
+      // 同一批共用一个 job 对象：面板轮询这批里的哪个 id，拿到的都是同一份结果
+      job: { status: 'thinking', text: '', at: Date.now() },
+    };
+  }
+  pendingSay.job.at = Date.now();
+  pendingSay.texts.push(text);
+  if (files && files.length) pendingSay.files.push(...files);
+  pendingSay.quiet = pendingSay.quiet && quiet;
+  pendingSay.ids.push(id);
+  // 🔴 先把 job 挂进 jobs **再**把 id 回给面板。
+  // 2026-10-23 踩过：晚 1.2 秒注册，面板拿到 id 立刻来轮询，就吃到 404「没有这个 id」，
+  // 面板当场放弃 —— 而那一轮其实还在后台好好跑着，只是没人接。
+  jobs.set(id, pendingSay.job);
+  if (pendingSay.timer) clearTimeout(pendingSay.timer);
+  // 每来一句就把窗口往后推：他连发的时候，等的是「手停下来」，不是「第一句之后 1.2 秒」
+  pendingSay.timer = setTimeout(flushSay, COALESCE_MS);
+  return id;
 }
 
 const server = http.createServer((req, res) => {
@@ -669,6 +787,16 @@ const server = http.createServer((req, res) => {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(obj));
   };
+
+  // 会改状态的入口一律要面板带的那把 token；/health 留着开放（鱼每几秒探一次，只回工具个数）。
+  // 两道都留着：token 挡人，Content-Type 挡浏览器 —— 跨站发 application/json 会先问预检，
+  // 而这个服务不答预检（OPTIONS 回 404），于是浏览器自己就把请求掐了。
+  if (url.pathname === '/say' || url.pathname === '/delegate') {
+    if (String(req.headers['x-dfy-token'] || '') !== TOKEN) return json(401, { error: 'unauthorized' });
+    if (!String(req.headers['content-type'] || '').includes('application/json')) {
+      return json(415, { error: 'content-type must be application/json' });
+    }
+  }
 
   if (url.pathname === '/health') return json(200, { ok: true, tools: TOOLS.length });
 
@@ -709,13 +837,14 @@ const server = http.createServer((req, res) => {
     if (!job) return json(404, { status: 'error', text: '没有这个 id' });
     if (job.status === 'thinking') return json(200, { status: 'thinking', text: '' });
     jobs.delete(id);
-    return json(200, { status: job.status, text: job.text });
+    // files：她这一轮画出来的图 —— 面板拿去画缩略图，双击能打开
+    return json(200, { status: job.status, text: job.text, files: job.files || [] });
   }
 
   if (url.pathname === '/say' && req.method === 'POST') {
     let raw = '';
     req.on('data', c => { raw += c; });
-    req.on('end', async () => {
+    req.on('end', () => {
       let text = '', quiet = false, files = [];
       try {
         const b = JSON.parse(raw || '{}');
@@ -726,36 +855,8 @@ const server = http.createServer((req, res) => {
       } catch { }
       if (!text && !files.length) return json(400, { error: 'empty' });
       if (!text) text = '看看这个';
-      const id = String(++seq);
-      jobs.set(id, { status: 'thinking', text: '' });
-      activity('thinking', '');
-      append({ role: 'user', text, at: Date.now(), ...(files.length ? { files } : {}) });
-      json(200, { id });
-      try {
-        const { reply, did } = await agentLoop(text, files);
-        append({ role: 'assistant', text: reply, at: Date.now() });
-        traceAction('done (' + (did.length ? did.join(',') : '没动手') + '): ' + reply.slice(0, 120));
-        activity('idle', '');
-        // 面板发来的（quiet）：回复直接进面板，别再写 say.txt ——
-        // 写了会被鱼头顶的气泡监听再递一遍，一次发送显示两条
-        if (!quiet) say(reply);
-        jobs.set(id, { status: 'done', text: reply });
-      } catch (err) {
-        const reason = String(err && err.message ? err.message : err);
-        // 前缀契约跟着 lib/llm.mjs 的 mapError 走：BALANCE / KEY / RATE 后面都带冒号和细节。
-        // 以前这里判的是 raw === 'BALANCE'，而 llm.mjs 返回的是 'BALANCE: <家名>…'
-        // ⇒ 余额不足会被显示成「我这边卡住了」，2026-10-21 顺手修掉。
-        const msg =
-          reason.startsWith('BALANCE:') ? '（我这边账户没钱了 —— ' + reason.slice(9).trim() + '。充上就好，别的一句都没丢）' :
-          reason.startsWith('KEY:') ? '（key 不对：' + reason.slice(4).trim() + '）' :
-          reason.startsWith('RATE:') ? '（被限流了：' + reason.slice(5).trim() + '）' :
-          reason.startsWith('TIMEOUT:') ? '（等太久没回音了：' + reason.slice(8).trim() + '。你再说一句，我重来）' :
-          reason.startsWith('NET:') ? '（网络没通：' + reason.slice(4).trim() + '。你再说一句，我重来）' :
-          '（我这边出错了：' + reason.slice(0, 200) + '）';
-        traceAction('error: ' + msg);
-        activity('error', reason.startsWith('BALANCE:') ? '余额不足' : reason.slice(0, 60));
-        jobs.set(id, { status: 'error', text: msg });
-      }
+      // 不在这儿开跑：先攒进 pending，手停下来（COALESCE_MS）再一起跑，见 flushSay()
+      json(200, { id: enqueueSay(text, files, quiet) });
     });
     return;
   }
