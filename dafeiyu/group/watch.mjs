@@ -358,11 +358,24 @@ async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
 async function sendGroup(gid, text) {
   const r = await fetch(`${NAPCAT}/send_group_msg`, {
     method: 'POST',
+    // 没上限的话，NapCat 一挂这条 fetch 就一直挂着，整轮 wake() 卡死在里面
+    signal: AbortSignal.timeout(20000),
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` },
     body: JSON.stringify({ group_id: Number(gid), message: [{ type: 'text', data: { text } }] })
   });
   const j = await r.json().catch(() => ({}));
   if (j.status !== 'ok') throw new Error(`send failed ${JSON.stringify(j).slice(0, 200)}`);
+  // 2026-10-23：**自己发出去的话也记进 raw.jsonl**。
+  // 为什么要补这一行：这台机器的 NapCat 压根不推 message_sent（5444 条里 self 一直是 0 条），
+  // 于是「群里刚才在聊什么」只剩别人的一侧 —— 她翻回去会以为自己没说过话，把同一句再说一遍。
+  try {
+    fs.appendFileSync(RAW_FILE, JSON.stringify({
+      ts: Date.now(), qq: String(BOT_QQ), nick: '汐', text: String(text),
+      addressed: false, atAll: false, named: false,
+      replyToId: '', replyToMe: false, replyToOther: false, replyToNick: '', replyUnknown: false,
+      self: true, gid: String(gid), mid: String(j.data?.message_id ?? '')
+    }) + '\n', 'utf8');
+  } catch { /* 记不上不影响发出去 */ }
   return j.data?.message_id;
 }
 

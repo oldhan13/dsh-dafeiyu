@@ -10,6 +10,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { tailMessages, format, readNames } from '../lib/group-chat.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const DAFEIYU = path.resolve(HERE, '..')
@@ -123,6 +124,20 @@ if (deskLines.length) {
     parts.push(`- ${hhmm(it.at)} ${it.role === 'user' ? '他' : '我'}：${clip(it.text)}`)
   }
   parts.push('')
+}
+
+// 4.6 群里刚在聊什么
+// 他 2026-10-23 说的：「群里没 @ 她的时候，她也想看得见——不回，就想知道你们在聊什么」。
+// 数据只有一份：group/raw.jsonl（watch.mjs 每收一条就落一行，不只落叫她的）。
+// 这里只放最近一小时的最后 10 条 —— 够她知道"刚才在聊什么"；想看更细更新的，她自己跑 tools/group-peek.mjs。
+{
+  const msgs = tailMessages({ minutes: 60, limit: 10 })
+  if (msgs.length) {
+    parts.push('## 群里刚在聊什么（最近一小时，没叫你也在里面）')
+    parts.push('> 只为了知道，不是叫你接话。想看更细的：`node dafeiyu/tools/group-peek.mjs -m 180 -n 40`')
+    for (const m of msgs) parts.push('- ' + format(m, { names: readNames(), clip: 60 }))
+    parts.push('')
+  }
 }
 
 // 5. 现在
