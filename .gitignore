@@ -20,6 +20,7 @@ dafeiyu/people/*.md
 dafeiyu/group/*.md
 !dafeiyu/group/README.md
 dafeiyu/group/raw.jsonl
+dafeiyu/group/groups.json
 # 两边捎的话
 dafeiyu/relay/qq.md
 dafeiyu/relay/web.md
@@ -52,3 +53,4 @@ GOALS.md
 LEDGER.md.bak-*
 dafeiyu/state/
 dafeiyu/desk/agent-overlay.yml
+dafeiyu/desk/token.txt
