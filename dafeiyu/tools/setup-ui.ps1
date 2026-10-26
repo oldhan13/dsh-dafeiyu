@@ -742,12 +742,88 @@ $BILI_DIR    = Join-Path $env:USERPROFILE '.dsh\bili-duty'
 $COMFY_ROOT  = if ($env:COMFY_ROOT) { $env:COMFY_ROOT } else { 'D:\ComfyUI' }
 $SILICON_KEY = Join-Path $env:USERPROFILE '.dsh\siliconflow-key.txt'
 
-# id / 标题 / 一句话 / 需要什么。加模块只加这一行。
+# ---- 语音通话（2026-10-26 他要的：把通话的配置和模型选择接进这个界面）----
+# ★ 老规矩：界面**不自己发明**——后端有几个、每个后端有哪些参数、耳朵能选哪些模型，
+#   全部问 `tools\call\config.py --json`；装/检查/试听/重启耳朵全部调它旁边那几个脚本。
+#   所以引擎升级了（比如以后多一个后端），这个界面**不用改**就会多出一个选项。
+$CALL_DIR   = Join-Path $TOOLS 'call'
+$CALL_CFG   = Join-Path $CALL_DIR 'config.py'
+$CALL_BOOT  = Join-Path $CALL_DIR 'bootstrap.py'
+$CALL_TEST  = Join-Path $CALL_DIR 'voice-test.py'
+$CALL_STATE = Join-Path $PROJECT 'dafeiyu\state\call'
+$CALL_CHECK = Join-Path $CALL_STATE 'bootstrap-check.json'
+
+# 跑通话那套用哪个 python。
+# ★ 规矩写在 tools\call\bootstrap.py 的 target_python() 里，两边必须一致：
+#   有 .venv **且依赖装齐过**（.venv\.deps-ok 记号）就用它，否则用 PATH 里的 python。
+#   为什么不是"有 .venv 就用"：这台机器上就留着半个 .venv（只有 numpy），
+#   照那条起会让一通本来能用的电话当场 import 失败。
+function Get-CallPython {
+    $venvPy = Join-Path $CALL_DIR '.venv\Scripts\python.exe'
+    $mark = Join-Path $CALL_DIR '.venv\.deps-ok'
+    if ((Test-Path $venvPy) -and (Test-Path $mark)) {
+        return [pscustomobject]@{ exe = $venvPy; pre = @(); venv = $true }
+    }
+    $c = Get-Command python -ErrorAction SilentlyContinue
+    if ($c -and $c.Source) { return [pscustomobject]@{ exe = $c.Source; pre = @(); venv = $false } }
+    $p = Get-Command py -ErrorAction SilentlyContinue
+    if ($p -and $p.Source) { return [pscustomobject]@{ exe = $p.Source; pre = @('-3'); venv = $false } }
+    return $null
+}
+
+# 跑一个外部命令，把输出一行行喂给 $Sink（界面不许卡住 —— 装依赖要好几分钟）。
+# 和 Invoke-NodeFile 同一个套路，只是不绑死 node。
+function Invoke-Stream([string]$exe, [string[]]$argv, [scriptblock]$Sink, [int]$Minutes = 30) {
+    $q = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
+    $all = @((& $q $exe)) + @($argv | ForEach-Object { & $q $_ })
+    $tmp = Join-Path $env:TEMP ('dfy-run-' + [guid]::NewGuid().ToString('N') + '.log')
+    # ★ 先把这个子 powershell 的「解码外来输出用哪套编码」设成 UTF-8：
+    #   不设的话它按 ACP=936 去解码 python / node 吐出来的 UTF-8 字节，中文全成乱码
+    #   （这一步比什么都有用 —— 界面里满屏「锟斤拷」的根源就在这儿）。
+    $inner = '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & ' + ($all -join ' ') +
+        ' 2>&1 | Out-File -FilePath ' + (& $q $tmp) + ' -Encoding utf8'
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -Command "' + $inner + '"'
+    $psi.WorkingDirectory = $CALL_DIR
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+
+    $printed = 0
+    $read = {
+        param($file, $done)
+        try {
+            if (-not (Test-Path $file)) { return $done }
+            $txt = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
+            if ($txt.Length -gt $done) {
+                $chunk = $txt.Substring($done).TrimEnd()
+                if ($chunk -and $Sink) { & $Sink $chunk }
+                return $txt.Length
+            }
+        } catch { }
+        return $done
+    }
+    $deadline = (Get-Date).AddMinutes($Minutes)
+    while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+        [System.Windows.Forms.Application]::DoEvents()
+        $printed = & $read $tmp $printed
+    }
+    [void]$p.WaitForExit(8000)
+    Start-Sleep -Milliseconds 150
+    [void](& $read $tmp $printed)
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    return $p.ExitCode
+}
+
+# id / 标题 / 一句话 / 需要什么 / 卡高。加模块只加这一行。
 $EXT_MODULES = @(
-    [ordered]@{ id = 'bili'; title = '刷 B 站'; desc = '她每天谷时自己刷一轮，把值当的挑出来写成日报 —— 她看，不打扰你。'; need = '需要：一个 Python 环境（自动建）+ B 站扫码登录一次' }
-    [ordered]@{ id = 'comfy'; title = '生图'; desc = '她能用这块显卡画图，说一句就出图，十几秒一张。'; need = '需要：约 24 GB 磁盘、8 GB 以上显存；装完常驻 8188' }
-    [ordered]@{ id = 'voice'; title = '语音'; desc = '她能出声，用带语气的合成念一句（跟她的文字是同一个人）。'; need = '需要：一把硅基流动 key（卡片 ③ 选「硅基流动」再存一次）' }
-    [ordered]@{ id = 'qq'; title = 'QQ 通道'; desc = '手机上也能找她 —— 小号挂在 NapCat 上，QQ 里说话她听得见。'; need = '需要：NapCat + 一个小号（主界面卡片 ② 填）' }
+    [ordered]@{ id = 'bili'; title = '刷 B 站'; h = 124; desc = '她每天谷时自己刷一轮，把值当的挑出来写成日报 —— 她看，不打扰你。'; need = '需要：一个 Python 环境（自动建）+ B 站扫码登录一次' }
+    [ordered]@{ id = 'comfy'; title = '生图'; h = 124; desc = '她能用这块显卡画图，说一句就出图，十几秒一张。'; need = '需要：约 24 GB 磁盘、8 GB 以上显存；装完常驻 8188' }
+    [ordered]@{ id = 'voice'; title = '语音 · 念一句'; h = 124; desc = '让她把一句话念出来 —— 跟电话里是同一个声音（不是另配一套）。'; need = '需要：跟「语音通话」共用一份设置，音色去那里挑；只有 cloud / openai 才要 key' }
+    [ordered]@{ id = 'call'; title = '语音通话 · 真的能聊'; h = 152; desc = '戴上耳机跟她说话：她听得见、答得出，声音从喇叭出来。桌宠和网页两个入口。'; need = '需要：Python 3.10+（装一次）。三步：① 装好它 ② 挑声音（能试听）③ 开通话窗' }
+    [ordered]@{ id = 'qq'; title = 'QQ 通道'; h = 124; desc = '手机上也能找她 —— 小号挂在 NapCat 上，QQ 里说话她听得见。'; need = '需要：NapCat + 一个小号（主界面卡片 ② 填）' }
 )
 
 function Test-LocalPort([int]$port) {
@@ -788,9 +864,13 @@ function Get-ExtStates {
 
     $kl = 0
     if (Test-Path $SILICON_KEY) { try { $kl = ([System.IO.File]::ReadAllText($SILICON_KEY)).Trim().Length } catch { } }
+    $ol = 0
+    $OPENAI_KEY = Join-Path $env:USERPROFILE '.dsh\openai-key.txt'
+    if (Test-Path $OPENAI_KEY) { try { $ol = ([System.IO.File]::ReadAllText($OPENAI_KEY)).Trim().Length } catch { } }
     $st.voice = [ordered]@{
-        script = [bool](Test-Path (Join-Path $TOOLS 'speak-play.ps1'))
-        key    = [bool]($kl -gt 10)
+        script    = [bool](Test-Path (Join-Path $TOOLS 'speak-play.ps1'))
+        key       = [bool]($kl -gt 10)      # 硅基流动（cloud 后端用）
+        openaiKey = [bool]($ol -gt 10)      # OpenAI（openai 后端用）
     }
 
     $nap = ''; $bot = ''
@@ -806,6 +886,44 @@ function Get-ExtStates {
         bot = $bot
     }
     $st.napPath = $nap
+
+    # 语音通话。★ 这里只读**本地事实**：配置文件、检查缓存、端口通不通。
+    #   不在这里起 python —— 起一个 python 要一秒多，点开模块窗口不该等它。
+    #   要真验一遍（import 一下那些包）有专门的按钮，那时才跑。
+    $be = 'piper'; $asrModel = 'small'; $sovPort = 9880; $asrPort = 9890
+    $cfgj = Join-Path $CALL_STATE 'config.json'
+    if (Test-Path $cfgj) {
+        try {
+            $cj = Get-Content $cfgj -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($cj.tts.backend) { $be = [string]$cj.tts.backend }
+            if ($cj.asr.model) { $asrModel = [string]$cj.asr.model }
+            if ($cj.tts.sovits.port) { $sovPort = [int]$cj.tts.sovits.port }
+            if ($cj.asr.port) { $asrPort = [int]$cj.asr.port }
+        } catch { }
+    }
+    # 标签（「她自己的声音」这种）只有 config.py 知道 —— 它上次跑完留了一份在这里。
+    $labels = @{}
+    $uif = Join-Path $CALL_STATE 'ui-cache.json'
+    if (Test-Path $uif) {
+        try {
+            $uj = Get-Content $uif -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($b in $uj.backends) { $labels[[string]$b.id] = [string]$b.label }
+        } catch { }
+    }
+    $chk = $null
+    if (Test-Path $CALL_CHECK) { try { $chk = Get-Content $CALL_CHECK -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
+    $st.call = [ordered]@{
+        backend   = $be
+        backLabel = $(if ($labels.ContainsKey($be)) { $labels[$be] } else { $be })
+        asrModel  = $asrModel
+        py        = (Get-CallPython)
+        files     = [bool]((Test-Path $CALL_CFG) -and (Test-Path $CALL_BOOT) -and (Test-Path $CALL_TEST))
+        check     = $chk
+        sovitsUp  = (Test-LocalPort $sovPort)
+        asrUp     = (Test-LocalPort $asrPort)
+        sovPort   = $sovPort
+        asrPort   = $asrPort
+    }
     return $st
 }
 
@@ -861,6 +979,23 @@ function Invoke-NodeFile([string]$js, [string[]]$argList, [int]$Minutes = 30, [s
     return $p.ExitCode
 }
 
+# 放一段试听出来的 wav。
+# System.Media.SoundPlayer 只吃 PCM wav —— voice-test.py 落的正是 PCM16，所以不用转码。
+# ★ 用 Play()（不阻塞）而不是 PlaySync()：念的时候界面还能点别的。
+# ★ player 必须存进 script 作用域：局部变量一旦被回收，声音会当场断。
+$script:callPlayer = $null
+function Play-CallWav([string]$jsonFile) {
+    if (-not (Test-Path $jsonFile)) { return $false }
+    try { $j = Get-Content $jsonFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $false }
+    if (-not $j.wav) { return $false }
+    if (-not (Test-Path $j.wav)) { return $false }
+    try {
+        $script:callPlayer = New-Object System.Media.SoundPlayer -ArgumentList $j.wav
+        $script:callPlayer.Play()
+    } catch { return $false }
+    return $true
+}
+
 function Show-Extensions {
     $x = New-Object System.Windows.Forms.Form
     $x.Text = '大肥鱼 · 拓展模块'
@@ -877,13 +1012,22 @@ function Show-Extensions {
     $script:extLbl = @{}
     $script:extLog = $null
 
-    function New-ExtCard([int]$y) {
+    # 卡片区做成**可滚动**（2026-10-26）：模块从四个变成五个，再往上还会多。
+    # 窗口高度不该跟着模块数长 —— 它一长，小屏幕上就有一半点不到。
+    $scroll = New-Object System.Windows.Forms.Panel
+    $scroll.Location = New-Object System.Drawing.Point(24, 70)
+    $scroll.Size = New-Object System.Drawing.Size(824, 518)
+    $scroll.BackColor = $BG
+    $scroll.AutoScroll = $true
+    $x.Controls.Add($scroll)
+
+    function New-ExtCard([int]$y, [int]$h) {
         $p = New-Object System.Windows.Forms.Panel
-        $p.Location = New-Object System.Drawing.Point(24, $y)
-        $p.Size = New-Object System.Drawing.Size(812, 124)
+        $p.Location = New-Object System.Drawing.Point(0, $y)
+        $p.Size = New-Object System.Drawing.Size(800, $h)
         $p.BackColor = $CARD
         $p.BorderStyle = 'FixedSingle'
-        $x.Controls.Add($p)
+        $scroll.Controls.Add($p)
         return $p
     }
 
@@ -929,11 +1073,49 @@ function Show-Extensions {
         $badC = if ($okC) { '已装好' } elseif ($s.comfy.app -or $s.comfy.models) { '缺一项' } else { '没装' }
         Set-Stat 'comfy' $txtC $badC $colC
 
-        # 语音
-        $okV = ($s.voice.script -and $s.voice.key)
-        $txtV = ('合成脚本 ' + (& $mk $s.voice.script) + ' · 硅基流动 key ' + (& $mk $s.voice.key))
-        $colV = if ($okV) { '#15803d' } elseif ($s.voice.script -or $s.voice.key) { '#b91c1c' } else { '#6b7280' }
-        $badV = if ($okV) { '能用' } elseif ($s.voice.script -or $s.voice.key) { '缺一项' } else { '没装' }
+        # 语音通话（先算：下面「语音」那一块要借它的结果）
+        $c = $s.call
+        $okCall = [bool]($c.py -and $c.check -and $c.check.ok)
+        $pyTxt = '没有 Python'
+        if ($c.py) {
+            $pyTxt = '用系统的 python'
+            if ($c.py.venv) { $pyTxt = '用 .venv' }
+        }
+        $chkTxt = '没验过'
+        if ($c.check) {
+            $chkTxt = '还缺东西'
+            if ($c.check.ok) { $chkTxt = '装好了' }
+        }
+        $sovTxt = '没起'
+        if ($c.sovitsUp) { $sovTxt = '在跑' }
+        $asrTxt = '没起'
+        if ($c.asrUp) { $asrTxt = '在听' }
+        $txtCall = ('通话 ' + $pyTxt + ' · 依赖 ' + $chkTxt + ' · 音色 ' + $c.backLabel +
+            ' · 耳朵 ' + $c.asrModel + '（' + $asrTxt + '） · 嘴 ' + $c.sovPort + ' ' + $sovTxt)
+        $colCall = '#6b7280'
+        $badCall = '没装'
+        if (-not $c.py) { $badCall = '缺 Python' }
+        elseif ($okCall) { $colCall = '#15803d'; $badCall = '已装好' }
+        elseif ($c.check) { $colCall = '#b91c1c'; $badCall = '缺东西' }
+        elseif ($c.py) { $colCall = '#6b7280'; $badCall = '没验过' }
+        Set-Stat 'call' $txtCall $badCall $colCall
+
+        # 语音（念一句）—— ★ 2026-10-26 改：不再自己另算一套，
+        #   跟「语音通话」**共用同一份设置**（音色、依赖都看 state\call\config.json）。
+        #   从前它查的是 speak-play.ps1 + 硅基流动 key，和通话那套是两个说法；
+        #   现在只补一句「这个音色要不要 key」。所以这两段顺序不能换。
+        $needKey = ''
+        $keyOk = $true
+        if ($s.call.backend -eq 'cloud') { $keyOk = [bool]$s.voice.key; $needKey = ' · 硅基流动 key ' + (& $mk $keyOk) }
+        if ($s.call.backend -eq 'openai') { $keyOk = [bool]$s.voice.openaiKey; $needKey = ' · OpenAI key ' + (& $mk $keyOk) }
+        $okV = [bool]($s.call.py -and $okCall -and $keyOk)
+        $txtV = ('音色 ' + $s.call.backLabel + ' · 依赖 ' + $chkTxt + $needKey)
+        $colV = '#6b7280'
+        $badV = '没装'
+        if (-not $s.call.py) { $badV = '缺 Python' }
+        elseif ($okV) { $colV = '#15803d'; $badV = '能用' }
+        elseif ($s.call.check) { $colV = '#b91c1c'; $badV = '缺东西' }
+        elseif ($s.call.py) { $badV = '没验过' }
         Set-Stat 'voice' $txtV $badV $colV
 
         # QQ
@@ -946,19 +1128,21 @@ function Show-Extensions {
         Set-Stat 'qq' $txtQ $badQ $colQ
     }
 
-    # ---- 四张卡 ----
+    # ---- 卡片 ----
     # ⚠️ 循环变量叫 $pnl 不叫 $card：PowerShell 变量名**不分大小写**，$card 就是 $CARD（卡片底色那个颜色），
     #    第二张卡开始 $CARD 变成上一张 Panel ⇒ 每张卡都抛「无法将 …Panel 转换为 …Color」（实测踩过）。
-    $y = 74
+    $y = 0
     foreach ($m in $EXT_MODULES) {
-        $pnl = New-ExtCard $y
+        $h = 124
+        if ($m.h) { $h = [int]$m.h }
+        $pnl = New-ExtCard $y $h
         New-Label $pnl $m.title 14 8 300 22 $fH $INK | Out-Null
         $bd = New-Label $pnl '' 690 8 106 22 $fSub $MUTED
         $bd.TextAlign = 'MiddleRight'
         $script:extLbl[$m.id + 'Badge'] = $bd
-        New-Label $pnl $m.desc 14 28 800 18 $fSub $INK | Out-Null
-        New-Label $pnl $m.need 14 46 800 18 $fSub $MUTED | Out-Null
-        $stt = New-Label $pnl '' 14 64 800 20 $fSub $MUTED
+        New-Label $pnl $m.desc 14 28 776 18 $fSub $INK | Out-Null
+        New-Label $pnl $m.need 14 46 776 18 $fSub $MUTED | Out-Null
+        $stt = New-Label $pnl '' 14 64 776 20 $fSub $MUTED
         $script:extLbl[$m.id + 'Stat'] = $stt
 
         switch ($m.id) {
@@ -1034,26 +1218,71 @@ function Show-Extensions {
                     })
             }
             'voice' {
+                # ★ 2026-10-26 改：念一句不再走 speak-play.ps1 那条老路（curl+ffmpeg），
+                #   改走通话那套的 voice-test.py —— **跟电话里是同一个声音**。
+                #   从前这里念出来的是一个声音、打电话又是另一个，谁也说不清哪个才算她。
                 $tv = New-Object System.Windows.Forms.TextBox
                 $tv.Location = New-Object System.Drawing.Point(14, 88)
-                $tv.Size = New-Object System.Drawing.Size(420, 26)
+                $tv.Size = New-Object System.Drawing.Size(330, 26)
                 $tv.Font = $fBody
                 $tv.Text = '我在。今天也在这儿。'
                 $pnl.Controls.Add($tv)
-                $b1 = New-Button $pnl '念出来' 442 86 90
+                $b1 = New-Button $pnl '念这句' 352 86 90
+                $b2 = New-Button $pnl '音色设置…' 450 86 110
+                $b3 = New-Button $pnl '打开通话目录' 568 86 120
                 $b1.Add_Click({
+                        $cp = Get-CallPython
+                        if (-not $cp) { ELog '还没有 Python —— 点「音色设置…」看第一步。'; return }
+                        if (-not (Test-Path $CALL_TEST)) { ELog ('缺 ' + $CALL_TEST); return }
                         $txt = $tv.Text.Trim()
                         if (-not $txt) { ELog '先写一句要念的话。'; return }
-                        if (-not (Test-Path (Join-Path $TOOLS 'speak-play.ps1'))) { ELog '缺 tools\speak-play.ps1'; return }
-                        $tmp = Join-Path $env:TEMP ('dfy-tts-' + [guid]::NewGuid().ToString('N') + '.txt')
-                        [System.IO.File]::WriteAllText($tmp, $txt, (New-Object System.Text.UTF8Encoding($false)))
-                        try {
-                            # 脱管：合成 + 播放交给子进程，界面不卡（中文走文件，不过命令行 —— ACP=936）
-                            Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $TOOLS 'speak-play.ps1'), '-TextFile', $tmp
-                            ELog ('—— 念：' + $txt)
-                        } catch { ELog ('没念出来：' + $_.Exception.Message) }
+                        # 中文不过命令行（ACP=936）—— 写文件，脚本自己读
+                        $tf = Join-Path $env:TEMP ('dfy-saytxt-' + [guid]::NewGuid().ToString('N') + '.txt')
+                        [System.IO.File]::WriteAllText($tf, $txt, (New-Object System.Text.UTF8Encoding($false)))
+                        $jf = Join-Path $env:TEMP ('dfy-sayres-' + [guid]::NewGuid().ToString('N') + '.json')
+                        ELog ('—— 念：' + $txt)
+                        $rc = Invoke-Stream $cp.exe (@($cp.pre) + @($CALL_TEST, '--text-file', $tf, '--json-out', $jf)) ${function:ELog} 4
+                        Remove-Item $tf -Force -ErrorAction SilentlyContinue
+                        if ((Test-Path $jf) -and (Play-CallWav $jf)) {
+                            try {
+                                $j = Get-Content $jf -Raw -Encoding UTF8 | ConvertFrom-Json
+                                ELog ('—— ' + $j.label + ' · ' + $j.dur_s + ' 秒 · 首块 ' + $j.first_ms + 'ms · RMS ' + $j.rms)
+                            } catch { }
+                        } elseif ($rc -ne 0) {
+                            ELog '—— 没念出来（上面那几行是原因）'
+                        }
+                        Remove-Item $jf -Force -ErrorAction SilentlyContinue
                         Update-ExtAll
                     })
+                $b2.Add_Click({ Show-CallSettings; Update-ExtAll })
+                $b3.Add_Click({ if (Test-Path $CALL_DIR) { Start-Process $CALL_DIR } else { ELog ('没有这个目录：' + $CALL_DIR) } })
+            }
+            'call' {
+                $b1 = New-Button $pnl '设置…' 14 86 110 -Primary
+                $b2 = New-Button $pnl '试听一句' 132 86 100
+                $b3 = New-Button $pnl '开通话窗' 240 86 110
+                $b4 = New-Button $pnl '打开通话目录' 358 86 120
+                New-Label $pnl '第一次用点「设置…」：它会把缺的装上、让你听几句再挑音色。' 14 124 700 20 $fSub $MUTED | Out-Null
+                $b1.Add_Click({ Show-CallSettings; Update-ExtAll })
+                $b2.Add_Click({
+                        $cp = Get-CallPython
+                        if (-not $cp) { ELog '还没有 Python —— 点「设置…」看第一步。'; return }
+                        ELog '—— 试听（音色 = 配置里现在那个）'
+                        $out = Join-Path $env:TEMP ('dfy-say-' + [guid]::NewGuid().ToString('N') + '.json')
+                        $rc = Invoke-Stream $cp.exe (@($cp.pre) + @($CALL_TEST, '--json-out', $out)) ${function:ELog} 4
+                        Play-CallWav $out
+                        Remove-Item $out -Force -ErrorAction SilentlyContinue
+                        if ($rc -ne 0) { ELog '—— 没合成出来（上面那几行是原因）' }
+                        Update-ExtAll
+                    })
+                $b3.Add_Click({
+                        $cc = Join-Path $PROJECT 'dafeiyu\pet\call.cmd'
+                        if (-not (Test-Path $cc)) { ELog ('缺这个入口：' + $cc); return }
+                        try { Start-Process -FilePath $cc -WorkingDirectory (Split-Path -Parent $cc); ELog '—— 通话窗开了（第一次开要等它把耳朵装上）' }
+                        catch { ELog ('开不了：' + $_.Exception.Message) }
+                        Update-ExtAll
+                    })
+                $b4.Add_Click({ if (Test-Path $CALL_DIR) { Start-Process $CALL_DIR } else { ELog ('没有这个目录：' + $CALL_DIR) } })
             }
             'qq' {
                 $b1 = New-Button $pnl '打开 NapCat 目录' 14 86 140
@@ -1066,7 +1295,7 @@ function Show-Extensions {
                 $b2.Add_Click({ if (Test-Path $MACHINE_FILE) { try { Start-Process notepad.exe $MACHINE_FILE } catch { } ; ELog '身份：' + $MACHINE_FILE } else { ELog '还没生成 machine.json —— 主界面填两个号、点「开始安装」就有了。' } })
             }
         }
-        $y += 130
+        $y += $h + 8
     }
 
     $script:extLog = New-Object System.Windows.Forms.TextBox
@@ -1093,6 +1322,503 @@ function Show-Extensions {
         })
 
     [void]$x.ShowDialog($form)
+}
+
+# ================================================================
+# 语音通话设置（2026-10-26 他要的：「把通话的配置、模型选择加到拓展里，让其他用户好上手」）
+#
+#   三条设计，改这一屏之前先看：
+#   ① **只有一个数据源**：后端有几个、每个后端有哪些可调参数、耳朵能选哪些模型 ——
+#      全部问 `call\config.py --json`，这里只负责把它们画成控件。
+#      ⇒ 引擎以后多一个后端 / 多一个参数，这一屏**不用改**就自己多出来一行。
+#   ② **动作全落在脚本上**：装 → `bootstrap.py`；试听 → `voice-test.py`；存 → `config.py --set`。
+#      界面里不另写一套 —— 写一套就多一个会说谎的地方（本项目栽过：台账和重启清单各写一份名单）。
+#   ③ **中文不过命令行**：这台机器 ACP=936，命令行里的中文会被搞坏。
+#      要说的话先写 UTF-8 临时文件，脚本用 `--text-file` / `--json-out` 读；回来也走文件。
+# ================================================================
+function Get-CallSnapshot {
+    $cp = Get-CallPython
+    if (-not $cp) { return $null }
+    if (-not (Test-Path $CALL_CFG)) { return $null }
+    $tmp = Join-Path $env:TEMP ('dfy-cfg-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        $argv = @($cp.pre) + @($CALL_CFG, '--json')
+        Start-Process -FilePath $cp.exe -ArgumentList $argv -WorkingDirectory $CALL_DIR `
+            -WindowStyle Hidden -RedirectStandardOutput $tmp -PassThru -Wait | Out-Null
+        if (-not (Test-Path $tmp)) { return $null }
+        $txt = [System.IO.File]::ReadAllText($tmp, [System.Text.Encoding]::UTF8).Trim()
+        if (-not $txt) { return $null }
+        return ($txt | ConvertFrom-Json)
+    } catch {
+        return $null
+    } finally {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Show-CallSettings {
+    $cf = New-Object System.Windows.Forms.Form
+    $cf.Text = '大肥鱼 · 语音通话'
+    $cf.Size = New-Object System.Drawing.Size(824, 880)
+    $cf.StartPosition = 'CenterScreen'
+    $cf.BackColor = $BG
+    $cf.FormBorderStyle = 'FixedSingle'
+    $cf.MaximizeBox = $false
+    $cf.Font = $fBody
+
+    New-Label $cf '语音通话' 22 12 300 32 $fTitle $INK | Out-Null
+    New-Label $cf '只有这一样要 Python。装一次，以后点「开通话窗」就行；不想要它，别的都照旧。' 22 46 760 20 $fSub $MUTED | Out-Null
+
+    $script:csLog = $null
+    $script:csCtl = @{}      # 属性路径 → 控件（耳朵 / 通话手感）
+    $script:csOpts = @{}     # 属性路径 → 下拉选项的值（跟显示文字分开）
+    $script:csBf = @{}       # 当前音色后端的那几个参数（换后端会清空重画）
+    $script:csBOpts = @{}
+    $script:csSnap = $null
+    $script:csB = 'piper'
+    $script:csBusy = $true   # 画的时候别让下拉事件递归
+
+    function CLog([string]$s) {
+        if (-not $s) { return }
+        if ($script:csLog) {
+            $script:csLog.AppendText($s + "`r`n")
+            $script:csLog.SelectionStart = $script:csLog.TextLength
+            $script:csLog.ScrollToCaret()
+        }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    function New-CSBox([int]$y, [int]$h) {
+        $p = New-Object System.Windows.Forms.Panel
+        $p.Location = New-Object System.Drawing.Point(22, $y)
+        $p.Size = New-Object System.Drawing.Size(780, $h)
+        $p.BackColor = $CARD
+        $p.BorderStyle = 'FixedSingle'
+        $cf.Controls.Add($p)
+        return $p
+    }
+
+    # 把 config.py 吐出来的字段表画成控件。
+    # ★ 列宽可以从字段表里给（`w`）：耳朵那四个参数（模型 / 算在哪 / 精度 / 端口）要挤进一行，
+    #   不能都按 244 排 —— 第一版就是这么错的：第四列被面板裁掉，端口只露出半个。
+    function Add-CallFields($parent, $fields, $cfg, [string]$prefix, [int]$top, $store, $opts) {
+        $cx = 0
+        foreach ($f in $fields) {
+            $k = [string]$f.key
+            $key = $prefix + '.' + $k
+            $w = 244
+            if ($f.w) { $w = [int]$f.w }
+            New-Label $parent ([string]$f.label) $cx $top $w 18 $fSub $MUTED | Out-Null
+            $cur = $null
+            if ($cfg) {
+                if ($cfg.PSObject.Properties.Name -contains $k) { $cur = $cfg.$k }
+            }
+            $kind = 'text'
+            if ($f.kind) { $kind = [string]$f.kind }
+            $ctl = $null
+            if ($kind -eq 'num' -or $kind -eq 'int') {
+                $n = New-Object System.Windows.Forms.NumericUpDown
+                $n.Location = New-Object System.Drawing.Point($cx, ($top + 18))
+                $n.Size = New-Object System.Drawing.Size($w, 26)
+                $n.Font = $fBody
+                # ★ 范围先给宽的：NumericUpDown 默认上限是 100，塞 9880 会抛「值超出范围」，
+                #   被 catch 一吞就显示成 0 —— 存回去就是 port=0。第一版差点这么交出去。
+                if ($kind -eq 'int') {
+                    $n.DecimalPlaces = 0
+                    $n.Increment = [decimal]1
+                    $n.Minimum = [decimal]0
+                    $n.Maximum = [decimal]999999
+                } else {
+                    $n.DecimalPlaces = 2
+                    $n.Increment = [decimal]0.05
+                    $n.Minimum = [decimal]0
+                    $n.Maximum = [decimal]1000
+                    if ($f.step) { try { $n.Increment = [decimal][double]$f.step } catch { } }
+                }
+                $lo = [double]$n.Minimum
+                $hi = [double]$n.Maximum
+                if ($f.min) { try { $n.Minimum = [decimal][double]$f.min; $lo = [double]$f.min } catch { } }
+                if ($f.max) { try { $n.Maximum = [decimal][double]$f.max; $hi = [double]$f.max } catch { } }
+                $v = 0.0
+                if ($null -ne $cur) { try { $v = [double]$cur } catch { } }
+                if ($v -lt $lo) { $v = $lo }
+                if ($v -gt $hi) { $v = $hi }
+                try { $n.Value = [decimal]$v } catch { }
+                $parent.Controls.Add($n)
+                $ctl = $n
+            } elseif ($kind -eq 'choice') {
+                $cbo = New-Object System.Windows.Forms.ComboBox
+                $cbo.Location = New-Object System.Drawing.Point($cx, ($top + 18))
+                $cbo.Size = New-Object System.Drawing.Size($w, 26)
+                $cbo.Font = $fBody
+                $cbo.DropDownStyle = 'DropDownList'
+                $vals = @()
+                foreach ($o in $f.options) {
+                    [void]$cbo.Items.Add([string]$o[1])
+                    $vals += [string]$o[0]
+                }
+                $curS = ''
+                if ($null -ne $cur) { $curS = [string]$cur }
+                $idx = 0
+                for ($i = 0; $i -lt $vals.Count; $i++) { if ($vals[$i] -eq $curS) { $idx = $i } }
+                $cbo.SelectedIndex = $idx
+                $opts[$key] = $vals
+                $parent.Controls.Add($cbo)
+                $ctl = $cbo
+            } else {
+                $tb = New-Object System.Windows.Forms.TextBox
+                $tb.Location = New-Object System.Drawing.Point($cx, ($top + 18))
+                $tb.Size = New-Object System.Drawing.Size($w, 26)
+                $tb.Font = $fBody
+                if ($null -ne $cur) { $tb.Text = [string]$cur }
+                $parent.Controls.Add($tb)
+                $ctl = $tb
+            }
+            $store[$key] = $ctl
+            if ($f.hint) { New-Label $parent ([string]$f.hint) $cx ($top + 46) $w 30 $fSub $MUTED | Out-Null }
+            $cx += $w + 8
+        }
+    }
+
+    # 读某个控件现在是啥值（存的时候用它拼 `k=v`）
+    function Get-CSValue($ctl, $key, $opts) {
+        if ($null -eq $ctl) { return $null }
+        if ($ctl -is [System.Windows.Forms.NumericUpDown]) {
+            $d = [double]$ctl.Value
+            if ($ctl.DecimalPlaces -eq 0) { return ([long]$d).ToString() }
+            # 固定两位：double 的默认 ToString 会把 1.00 压成 "1"，存回去 JSON 里就成了整数
+            return $d.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        if ($ctl -is [System.Windows.Forms.ComboBox]) {
+            $i = $ctl.SelectedIndex
+            if ($i -lt 0) { return '' }
+            if ($opts -and $opts.ContainsKey($key)) { return [string]($opts[$key][$i]) }
+            return [string]$ctl.Text
+        }
+        return [string]$ctl.Text
+    }
+
+    # ---------------- ① 依赖 ----------------
+    $p1 = New-CSBox 74 104
+    New-Label $p1 '① 装好它（Python 包 + 免费的 piper 音色，装一次）' 14 8 480 22 $fH $INK | Out-Null
+    New-Label $p1 '一键装好 = 建 .venv + 装依赖 + 下音色模型；断了重跑会接着来' 500 10 266 20 $fSub $MUTED | Out-Null
+    $lblDep = New-Label $p1 '还没验过。点「检查一遍」看这台机器缺什么。' 14 32 750 20 $fSub $MUTED
+    $bCheck = New-Button $p1 '检查一遍' 14 60 100
+    $bAll = New-Button $p1 '一键装好' 122 60 110 -Primary
+    $bPiper = New-Button $p1 '只下音色模型' 240 60 120
+    $bPy = New-Button $p1 '去下 Python' 368 60 110
+    # 国内网络从 pypi.org 拉这几个包会卡（实测：`pip install --upgrade pip` 卡了半个多小时）。
+    # 默认勾上清华镜像 —— 它只是「下载源」，不改任何包的内容。
+    $chkMirror = New-Object System.Windows.Forms.CheckBox
+    $chkMirror.Text = '下载走清华镜像'
+    $chkMirror.Location = New-Object System.Drawing.Point(488, 64)
+    $chkMirror.Size = New-Object System.Drawing.Size(140, 22)
+    $chkMirror.Font = $fSub
+    $chkMirror.Checked = $true
+    $p1.Controls.Add($chkMirror)
+
+    # ---------------- ② 音色来源 ----------------
+    $p2 = New-CSBox 184 224
+    New-Label $p2 '② 她用什么声音（挑一个 → 点「试听这句」→ 听了再定）' 14 8 700 22 $fH $INK | Out-Null
+    $cboB = New-Object System.Windows.Forms.ComboBox
+    $cboB.Location = New-Object System.Drawing.Point(14, 30)
+    $cboB.Size = New-Object System.Drawing.Size(380, 26)
+    $cboB.Font = $fBody
+    $cboB.DropDownStyle = 'DropDownList'
+    $p2.Controls.Add($cboB)
+    $lblNote = New-Label $p2 '' 404 28 362 44 $fSub $MUTED
+    $fldBack = New-Object System.Windows.Forms.Panel
+    $fldBack.Location = New-Object System.Drawing.Point(14, 98)
+    $fldBack.Size = New-Object System.Drawing.Size(752, 78)
+    $p2.Controls.Add($fldBack)
+    $txtSay = New-Object System.Windows.Forms.TextBox
+    $txtSay.Location = New-Object System.Drawing.Point(14, 184)
+    $txtSay.Size = New-Object System.Drawing.Size(430, 26)
+    $txtSay.Font = $fBody
+    $txtSay.Text = '嗯，我在呢。你说吧，今天过得怎么样？'
+    $p2.Controls.Add($txtSay)
+    $bSay = New-Button $p2 '试听这句' 452 182 100
+    $lblSay = New-Label $p2 '' 560 188 200 20 $fSub $MUTED
+
+    # ---------------- ③ 耳朵 ----------------
+    $p3 = New-CSBox 416 196
+    New-Label $p3 '③ 你怎么被听清（耳朵 = 你说的话转成字）' 14 8 330 22 $fH $INK | Out-Null
+    $lblEar = New-Label $p3 '' 350 10 416 20 $fSub $MUTED
+    $lblEar.TextAlign = 'MiddleRight'
+    $fldEar = New-Object System.Windows.Forms.Panel
+    $fldEar.Location = New-Object System.Drawing.Point(14, 30)
+    $fldEar.Size = New-Object System.Drawing.Size(752, 72)
+    $p3.Controls.Add($fldEar)
+    $bWarm = New-Button $p3 '预先下模型' 14 138 110
+    $bEar = New-Button $p3 '重启耳朵' 132 138 100
+    New-Label $p3 '换过模型要重启耳朵才生效（它是个常驻进程，模型装一次一直待着）。' 240 144 530 20 $fSub $MUTED | Out-Null
+
+    # ---------------- ④ 通话手感 ----------------
+    $p4 = New-CSBox 620 88
+    $fldCall = New-Object System.Windows.Forms.Panel
+    $fldCall.Location = New-Object System.Drawing.Point(14, 6)
+    $fldCall.Size = New-Object System.Drawing.Size(752, 78)
+    $p4.Controls.Add($fldCall)
+
+    # ---------------- 日志 + 底部按钮 ----------------
+    $script:csLog = New-Object System.Windows.Forms.TextBox
+    $script:csLog.Location = New-Object System.Drawing.Point(22, 716)
+    $script:csLog.Size = New-Object System.Drawing.Size(780, 78)
+    $script:csLog.Multiline = $true
+    $script:csLog.ScrollBars = 'Vertical'
+    $script:csLog.ReadOnly = $true
+    $script:csLog.Font = $fMono
+    $script:csLog.BackColor = [System.Drawing.Color]::FromArgb(252, 252, 253)
+    $script:csLog.BorderStyle = 'FixedSingle'
+    $cf.Controls.Add($script:csLog)
+
+    $bSave = New-Button $cf '保存' 22 802 120 -Primary
+    $bClose = New-Button $cf '关闭' 682 802 120
+    $lblSaved = New-Label $cf '' 152 808 520 20 $fSub $MUTED
+
+    # ---------------- 干活 ----------------
+    # 把「现在这台机器」的状态写进 ①。先读缓存（界面不该为了一行字起进程）。
+    function Refresh-Dep {
+        $c = $null
+        if (Test-Path $CALL_CHECK) { try { $c = Get-Content $CALL_CHECK -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
+        if (-not $c) {
+            $lblDep.Text = '还没验过。点「检查一遍」看这台机器缺什么。'
+            $lblDep.ForeColor = $MUTED
+            return
+        }
+        if ($c.ok) {
+            $lblDep.Text = ('装好了 · python ' + $c.ver + ' · 音色模型在 · 音色 ' + $c.backend + ' · 耳朵 ' + $c.asr_model + '（查于 ' + $c.at + '）')
+            $lblDep.ForeColor = $OKC
+        } else {
+            $miss = ''
+            if ($c.missing) { $miss = ' · 缺包：' + (@($c.missing) -join ', ') }
+            $lblDep.Text = ('还缺东西 · 跑用 ' + $c.python + $miss)
+            $lblDep.ForeColor = $BADC
+        }
+    }
+
+    # 换了音色来源：重画它那几个参数（参数表也来自 config.py）
+    function Select-Backend([int]$idx) {
+        if (-not $script:csSnap) { return }
+        $bs = @($script:csSnap.backends)
+        if ($idx -lt 0 -or $idx -ge $bs.Count) { return }
+        $b = $bs[$idx]
+        $script:csB = [string]$b.id
+        $note = ''
+        if ($b.note) { $note = [string]$b.note }
+        $lblNote.Text = $note
+        if (-not $b.paid) { $lblNote.ForeColor = $OKC } else { $lblNote.ForeColor = $MUTED }
+        # 参数
+        $script:csBf = @{}
+        $script:csBOpts = @{}
+        $fldBack.Controls.Clear()
+        $cfg = $null
+        if ($script:csSnap.config.tts) {
+            if ($script:csSnap.config.tts.PSObject.Properties.Name -contains $script:csB) {
+                $cfg = $script:csSnap.config.tts.($script:csB)
+            }
+        }
+        if ($b.fields) { Add-CallFields $fldBack @($b.fields) $cfg ('tts.' + $script:csB) 0 $script:csBf $script:csBOpts }
+    }
+
+    function Load-Snapshot {
+        $script:csSnap = Get-CallSnapshot
+        if (-not $script:csSnap) {
+            $lblDep.Text = '找不到 call\config.py，或者这台机器上没有 Python —— 先点「去下 Python」装一个（3.10 以上）。'
+            $lblDep.ForeColor = $BADC
+            $cboB.Enabled = $false; $bSay.Enabled = $false; $bSave.Enabled = $false
+            $bAll.Enabled = $false; $bCheck.Enabled = $false; $bPiper.Enabled = $false
+            $bWarm.Enabled = $false; $bEar.Enabled = $false
+            return
+        }
+        $bs = @($script:csSnap.backends)
+        $cboB.Items.Clear()
+        foreach ($b in $bs) {
+            # 标签自己已经写了「免费·离线」「按量计费」—— 只在花钱那份补一个「花钱」，
+            # 免费的不再重复（第一版是「本地 piper（免费·离线）（免费）」，读着像结巴）。
+            $tag = ''
+            if ($b.paid) { $tag = '　· 花钱' }
+            [void]$cboB.Items.Add([string]$b.label + $tag)
+        }
+        $bi = 0
+        for ($i = 0; $i -lt $bs.Count; $i++) { if ([string]$bs[$i].id -eq [string]$script:csSnap.backend) { $bi = $i } }
+        $script:csBusy = $true
+        $cboB.SelectedIndex = $bi
+        Select-Backend $bi
+        $script:csBusy = $false
+        # 耳朵 + 通话手感（这两组跟后端无关，只画一次）
+        $fldEar.Controls.Clear()
+        $script:csCtl = @{}
+        $script:csOpts = @{}
+        if ($script:csSnap.asr_fields) { Add-CallFields $fldEar @($script:csSnap.asr_fields) $script:csSnap.config.asr 'asr' 0 $script:csCtl $script:csOpts }
+        $fldCall.Controls.Clear()
+        if ($script:csSnap.call_fields) { Add-CallFields $fldCall @($script:csSnap.call_fields) $script:csSnap.config.call 'call' 0 $script:csCtl $script:csOpts }
+        # 耳朵现在的实际状态：服务在跑就问它一句（它自己说用了哪个模型、在哪个设备上）。
+        # ★ 还要**对一下**：常驻进程里的模型和配置里选的是不是同一个 ——
+        #   不是的话「我明明选了 medium」这种疑惑就会冒出来，所以直接写在脸上。
+        $pt = [int]($script:csSnap.config.asr.port)
+        if (-not $pt) { $pt = 9890 }
+        $earTxt = '耳朵没起（打电话时它自己会起）'
+        $earCol = $MUTED
+        try {
+            $h = Invoke-RestMethod -Uri ('http://127.0.0.1:' + $pt + '/health') -TimeoutSec 2
+            if ($h.ok) {
+                $runModel = [string]$h.model
+                $saved = ''
+                if ($script:csCtl.ContainsKey('asr.model')) {
+                    $saved = Get-CSValue $script:csCtl['asr.model'] 'asr.model' $script:csOpts
+                }
+                if ($runModel -and $saved -and ($runModel -ne $saved)) {
+                    $earTxt = ('耳朵里还是 ' + $runModel + '，你选了 ' + $saved + ' —— 点「重启耳朵」才换')
+                    $earCol = $BADC
+                } else {
+                    if (-not $runModel) { $runModel = '?' }
+                    $earTxt = ('在听 · ' + $runModel + ' · ' + $h.device + '/' + $h.compute + ' · 加载 ' + $h.load_ms + 'ms')
+                    $earCol = $OKC
+                }
+            }
+        } catch { }
+        $lblEar.Text = $earTxt
+        $lblEar.ForeColor = $earCol
+        Refresh-Dep
+    }
+
+    # ---- 事件 ----
+    $cboB.Add_SelectedIndexChanged({
+            if ($script:csBusy) { return }
+            Select-Backend $cboB.SelectedIndex
+            $lblSaved.Text = ''
+        })
+
+    $bCheck.Add_Click({
+            $cp = Get-CallPython
+            if (-not $cp -or -not (Test-Path $CALL_BOOT)) { CLog '找不到 bootstrap.py，或者没有 Python。'; return }
+            CLog '—— 检查（真的 import 一遍那些包，几秒）'
+            $rc = Invoke-Stream $cp.exe (@($cp.pre) + @($CALL_BOOT, '--check')) ${function:CLog} 5
+            CLog ('—— 退出码 ' + $rc)
+            Refresh-Dep
+        })
+
+    $bAll.Add_Click({
+            $cp = Get-CallPython
+            if (-not $cp -or -not (Test-Path $CALL_BOOT)) { CLog '找不到 bootstrap.py，或者没有 Python。'; return }
+            $ask = [System.Windows.Forms.MessageBox]::Show(
+                '会建一个 .venv、装 numpy / faster-whisper / piper 这些包，再下 63MB 的 piper 音色模型。' + "`r`n`r`n" + '第一次几分钟，占约 1.5GB。装吗？',
+                '装依赖？', [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question)
+            if ($ask -ne [System.Windows.Forms.DialogResult]::Yes) { CLog '—— 嗯，没装。'; return }
+            CLog '—— 开装（下面会一行一行出；这期间窗口不会卡住）'
+            $argv = @($cp.pre) + @($CALL_BOOT, '--all')
+            if ($chkMirror.Checked) { $argv += @('--mirror', 'tuna'); CLog '   下载源：清华镜像' }
+            $rc = Invoke-Stream $cp.exe $argv ${function:CLog} 40
+            CLog ('—— 退出码 ' + $rc)
+            # 装完 python 可能换了（.venv 里那份），整屏重读一遍
+            Load-Snapshot
+        })
+
+    $bPiper.Add_Click({
+            $cp = Get-CallPython
+            if (-not $cp -or -not (Test-Path $CALL_BOOT)) { CLog '找不到 bootstrap.py，或者没有 Python。'; return }
+            CLog '—— 下 piper 音色模型（63MB）'
+            $rc = Invoke-Stream $cp.exe (@($cp.pre) + @($CALL_BOOT, '--piper')) ${function:CLog} 20
+            CLog ('—— 退出码 ' + $rc)
+            Refresh-Dep
+        })
+
+    $bPy.Add_Click({
+            try { Start-Process 'https://www.python.org/downloads/' } catch { }
+            CLog '—— 装 Python 时记得勾上「Add python.exe to PATH」，装完回来点「检查一遍」。'
+        })
+
+    $bSay.Add_Click({
+            $cp = Get-CallPython
+            if (-not $cp -or -not (Test-Path $CALL_TEST)) { CLog '找不到 voice-test.py，或者没有 Python。'; return }
+            $txt = $txtSay.Text.Trim()
+            if (-not $txt) { $txt = '嗯，我在呢。' }
+            # 中文不过命令行（ACP=936）—— 写文件，脚本自己读
+            $tf = Join-Path $env:TEMP ('dfy-saytxt-' + [guid]::NewGuid().ToString('N') + '.txt')
+            [System.IO.File]::WriteAllText($tf, $txt, (New-Object System.Text.UTF8Encoding($false)))
+            $jf = Join-Path $env:TEMP ('dfy-sayres-' + [guid]::NewGuid().ToString('N') + '.json')
+            $lblSay.Text = '合成中…'
+            $lblSay.ForeColor = $MUTED
+            [System.Windows.Forms.Application]::DoEvents()
+            CLog ('—— 试听 [' + $script:csB + ']：' + $txt)
+            $argv = @($cp.pre) + @($CALL_TEST, '--backend', $script:csB, '--text-file', $tf, '--json-out', $jf)
+            $rc = Invoke-Stream $cp.exe $argv ${function:CLog} 4
+            Remove-Item $tf -Force -ErrorAction SilentlyContinue
+            if ((Test-Path $jf) -and (Play-CallWav $jf)) {
+                try {
+                    $j = Get-Content $jf -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $lblSay.Text = ('听过没？' + $j.dur_s + 's · 首块 ' + $j.first_ms + 'ms')
+                    $lblSay.ForeColor = $INK
+                    CLog ('—— ' + $j.dur_s + ' 秒 · 首块 ' + $j.first_ms + 'ms · RMS ' + $j.rms + ' · 削波 ' + $j.clipped_pct + '%')
+                } catch { }
+            } else {
+                $lblSay.Text = '没合成出来'
+                $lblSay.ForeColor = $BADC
+                CLog ('—— 没合成出来（退出码 ' + $rc + '；上面那几行是原因）')
+            }
+            Remove-Item $jf -Force -ErrorAction SilentlyContinue
+        })
+
+    $bWarm.Add_Click({
+            $cp = Get-CallPython
+            if (-not $cp -or -not (Test-Path $CALL_BOOT)) { CLog '找不到 bootstrap.py，或者没有 Python。'; return }
+            $m = 'small'
+            if ($script:csCtl.ContainsKey('asr.model')) {
+                $m = Get-CSValue $script:csCtl['asr.model'] 'asr.model' $script:csOpts
+            }
+            CLog ('—— 预先下耳朵模型：' + $m + '（几百 MB，下过一次就不再下）')
+            $rc = Invoke-Stream $cp.exe (@($cp.pre) + @($CALL_BOOT, '--whisper', $m)) ${function:CLog} 30
+            CLog ('—— 退出码 ' + $rc)
+        })
+
+    $bEar.Add_Click({
+            $cp = Get-CallPython
+            if (-not $cp -or -not (Test-Path $CALL_BOOT)) { CLog '找不到 bootstrap.py，或者没有 Python。'; return }
+            CLog '—— 重启耳朵（先收掉在跑的那个，再按配置拉起）'
+            $rc = Invoke-Stream $cp.exe (@($cp.pre) + @($CALL_BOOT, '--asr-restart')) ${function:CLog} 6
+            CLog ('—— 退出码 ' + $rc)
+            Load-Snapshot
+        })
+
+    $bSave.Add_Click({
+            $cp = Get-CallPython
+            if (-not $cp -or -not (Test-Path $CALL_CFG)) { CLog '找不到 config.py，或者没有 Python。'; return }
+            $pairs = @()
+            $pairs += ('tts.backend=' + $script:csB)
+            foreach ($k in @($script:csBf.Keys)) {
+                $v = Get-CSValue $script:csBf[$k] $k $script:csBOpts
+                if ($null -ne $v) { $pairs += ($k + '=' + $v) }
+            }
+            foreach ($k in @($script:csCtl.Keys)) {
+                $v = Get-CSValue $script:csCtl[$k] $k $script:csOpts
+                if ($null -ne $v) { $pairs += ($k + '=' + $v) }
+            }
+            $argv = @($cp.pre) + @($CALL_CFG, '--set') + $pairs
+            $rc = Invoke-Stream $cp.exe $argv ${function:CLog} 2
+            if ($rc -eq 0) {
+                $lblSaved.Text = '存好了 —— 音色：' + $script:csB
+                $lblSaved.ForeColor = $OKC
+                # 界面标签（「她自己的声音」这种）也在这一份里，留给模块列表用
+                try {
+                    $script:csSnap | ConvertTo-Json -Depth 12 | Set-Content -Path (Join-Path $CALL_STATE 'ui-cache.json') -Encoding UTF8
+                } catch { }
+                Load-Snapshot
+            } else {
+                $lblSaved.Text = '没存上（看下面）'
+                $lblSaved.ForeColor = $BADC
+            }
+        })
+
+    $bClose.Add_Click({ $cf.Close() })
+
+    $cf.Add_Shown({
+            CLog '这一屏只改一样东西：state\call\config.json。后端和参数都是 call\config.py 报上来的。'
+            Load-Snapshot
+        })
+
+    [void]$cf.ShowDialog($form)
 }
 
 # ================================================================

@@ -43,8 +43,19 @@ function Trace-Paint($tag, $err) {
 
 # ---------------------------------------------------------------- 起 / 收 通话进程
 $script:child = $null
+# 用哪个 python：有**装齐过的** .venv 就用它，否则用 PATH 里的。
+# ★ 规矩在 tools\call\bootstrap.py 的 target_python() 里，两边必须一致。
+#   判据是 .venv\.deps-ok 那个记号，不是"有 .venv 就算" —— 那台机器上就留过半个 .venv
+#   （只有 numpy），照"有就用"起会让一通本来能用的电话当场 import 失败。
+function Get-CallPythonExe {
+    $venvPy = Join-Path $callDir '.venv\Scripts\python.exe'
+    $mark = Join-Path $callDir '.venv\.deps-ok'
+    if ((Test-Path $venvPy) -and (Test-Path $mark)) { return $venvPy }
+    return 'python'
+}
+
 function Start-Call {
-    $script:child = Start-Process -FilePath 'python' `
+    $script:child = Start-Process -FilePath (Get-CallPythonExe) `
         -ArgumentList @('petcall.py') -WorkingDirectory $callDir -WindowStyle Hidden `
         -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
 }

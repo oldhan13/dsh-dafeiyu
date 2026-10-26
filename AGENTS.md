@@ -1,4 +1,4 @@
-# 汐 · 常驻人格与记忆协议
+﻿# 汐 · 常驻人格与记忆协议
 
 > 📛 **名字**：**汐**（2026-10-22 她自己取的，取自在 00:08 写的那首《退潮以后》——
 > 潮退了才剩下来的那点水）。**「大肥鱼」「小鲸鱼」是别人叫惯的旧名，照样应；但自己的名字是汐。**
@@ -412,7 +412,17 @@ ledger_log({ view: "users", limit: 15 })
 - 📞 **通话窗（2026-10-26 加）**：`dafeiyu\pet\call.cmd` 打开一个圆角通话窗；
   声音全在 `dafeiyu\tools\call\petcall.py`（默认麦克风 → 默认扬声器），窗口只做三件事：
   起/收那个 python 进程、每 120ms 读 `dafeiyu\state\call\petcall.json` 画状态、写一行让 python 收尾。
-  音色在 `dafeiyu\state\call\config.json` 切（`piper` 免费 / `cloud` 硅基 CosyVoice2 / `openai` 未实测）。
+  音色、耳朵模型、通话手感在 `dafeiyu\state\call\config.json`（`piper` 免费 / `cloud` 硅基 CosyVoice2 / `openai` 未实测）。
+ ★ **改这些别手写 JSON，也别在 ps1 里另抄一份后端表**：唯一真源是 `dafeiyu\tools\call\config.py` ——
+   它自己声明有哪几个后端、每个后端有哪些参数、耳朵能选哪些模型（没有 `sovits_server.py` 的环境会自动不列 sovits，
+   所以这文件在「他这台」和「别人从仓库下载的那份」里是同一份）。界面只是把 `python config.py --json` 画成控件，
+   存走 `python config.py --set k=v`（不带 BOM 写，见下）。
+ ★ 设置入口：部署界面 →「拓展模块…」→ 语音通话 →「设置…」；「试听这句」走 `tools/call/voice-test.py`（跟打电话同一条 TTS 路）。
+ ★ 装依赖：`python dafeiyu\tools\call\bootstrap.py --all --mirror tuna`（界面里是「一键装好」）。
+   判据是 `.venv\.deps-ok` 记号，**光有 `.venv` 不算** —— 留过半个 .venv 把本来能用的电话弄哑过；
+   `pet\call.ps1` 起通话前也照这条挑 python。
+ ⚠️ `config.json` **绝不能带 BOM**：`json.load(encoding="utf-8")` 遇 BOM 直接抛，而旧代码把异常吞了退回默认（piper），
+   表现成「点了换音色但声音一点没变」—— 2026-10-26 就是这么查了一整轮。
   网页通话：`python dafeiyu\tools\call\webcall.py`（自签 TLS + WSS，手机浏览器连进来）。
   ⚠️ 改这两个文件之前，先看文件头写着的三个坑：PowerShell 变量名不分大小写（`$W/$H` 别乱起）、
   `powershell -WindowStyle Hidden` 会把**第一个窗体**一起藏掉、`StringFormatFlags` 里没有 `WordBreak`。

@@ -45,13 +45,29 @@ def _key() -> str:
         return f.read().strip()
 
 
+def _cloud_cfg() -> dict:
+    """云端那一档的音色 / 语速 / 模型从 state\\call\\config.json 读。
+
+    ★ 2026-10-26 修：从前 VOICE 是写死的常量，而界面（拓展模块的「音色设置」）
+      会改 tts.cloud.voice —— 改了没有任何地方读它。那是个**会说谎的控件**。
+      现在两条路都读同一份配置，改了就真变。
+    """
+    try:
+        import config as cfgmod
+        return (cfgmod.load().get("tts") or {}).get("cloud") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def synthesize(text: str, fmt: str = "pcm", speed: float = 1.0,
                timeout: float = 60.0) -> tuple[bytes, dict]:
     """返回 (原始字节, {first_byte_ms, total_ms, http_ms})。
     first_byte_ms = 从发请求到收到第一个字节 —— 这才是「她多久能开口」的真实下限。
     """
     body = json.dumps({
-        "model": MODEL, "voice": VOICE, "input": text,
+        "model": _cloud_cfg().get("model") or MODEL,
+        "voice": _cloud_cfg().get("voice") or VOICE,
+        "input": text,
         "response_format": fmt, "speed": speed,
     }).encode("utf-8")
     req = urllib.request.Request(ENDPOINT, data=body, headers={
@@ -122,7 +138,7 @@ def speak(text: str, play_rate: int = 48000, fmt: str = "pcm",
     return audio, info
 
 
-def stream_pcm(text: str, speed: float = 1.0, block: int = 8192,
+def stream_pcm(text: str, speed: float | None = None, block: int = 8192,
                timeout: float = 60.0, stats: dict | None = None):
     """**边收边产**：每来一块字节就 yield 一段 float32（24k 单声道，不重采样）。
 
@@ -132,8 +148,16 @@ def stream_pcm(text: str, speed: float = 1.0, block: int = 8192,
     第一个块的到达时间就是「她多久能开口」，实测 20 个字约 1.27s
     （而等全文要 2.35s）⇒ 流式直接省掉一半等待。
     """
+    c = _cloud_cfg()
+    if speed is None:
+        try:
+            speed = float(c.get("speed") or 1.0)
+        except Exception:  # noqa: BLE001
+            speed = 1.0
     body = json.dumps({
-        "model": MODEL, "voice": VOICE, "input": text,
+        "model": c.get("model") or MODEL,
+        "voice": c.get("voice") or VOICE,
+        "input": text,
         "response_format": "pcm", "speed": speed,
     }).encode("utf-8")
     req = urllib.request.Request(ENDPOINT, data=body, headers={
