@@ -22,6 +22,8 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import wave
 
@@ -37,26 +39,13 @@ KEYFILE = os.path.expanduser(r"~\.dsh\siliconflow-key.txt")
 ENDPOINT = "https://api.siliconflow.cn/v1/audio/speech"
 MODEL = "FunAudioLLM/CosyVoice2-0.5B"
 VOICE = "FunAudioLLM/CosyVoice2-0.5B:anna"
-OUTDIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "state", "call"))
+OUTDIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "state", "call"))
 
 
 def _key() -> str:
     with open(KEYFILE, "r", encoding="utf-8") as f:
         return f.read().strip()
-
-
-def _cloud_cfg() -> dict:
-    """云端那一档的音色 / 语速 / 模型从 state\\call\\config.json 读。
-
-    ★ 2026-10-26 修：从前 VOICE 是写死的常量，而界面（拓展模块的「音色设置」）
-      会改 tts.cloud.voice —— 改了没有任何地方读它。那是个**会说谎的控件**。
-      现在两条路都读同一份配置，改了就真变。
-    """
-    try:
-        import config as cfgmod
-        return (cfgmod.load().get("tts") or {}).get("cloud") or {}
-    except Exception:  # noqa: BLE001
-        return {}
 
 
 def synthesize(text: str, fmt: str = "pcm", speed: float = 1.0,
@@ -136,6 +125,20 @@ def speak(text: str, play_rate: int = 48000, fmt: str = "pcm",
     info["decode_ms"] = round((time.time() - t0) * 1000) - info["total_ms"]
     info["all_ms"] = round((time.time() - t0) * 1000)
     return audio, info
+
+
+def _cloud_cfg() -> dict:
+    """云端那一档的音色 / 语速 / 模型从 state\\call\\config.json 读。
+
+    ★ 2026-10-26 修：从前 `VOICE` 是写死的常量，而界面（拓展模块里的「音色设置」）
+      会改 `tts.cloud.voice` —— 改了却没有任何地方读它。那是个**会说谎的控件**：
+      看着能调，实际不生效。现在两条路都读同一份配置，改了就真变。
+    """
+    try:
+        import config as cfgmod
+        return (cfgmod.load().get("tts") or {}).get("cloud") or {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def stream_pcm(text: str, speed: float | None = None, block: int = 8192,
@@ -284,11 +287,13 @@ class PiperEngine:
 
 
 def make_stream(backend: str, text: str, engine=None, stats: dict | None = None):
-    """统一入口：返回 (采样率, 迭代器)。backend = 'piper' | 'cloud' | 'openai'。"""
+    """统一入口：返回 (采样率, 迭代器)。backend = 'piper' | 'sovits' | 'cloud' | 'openai'。"""
     if backend == "piper":
         if engine is None:
             engine = piper_from_config()
         return engine.rate, engine.stream(text, stats=stats)
+    if backend == "sovits":
+        return sovits_rate(), stream_sovits(text, stats=stats)
     if backend == "openai":
         return OPENAI_RATE, stream_openai(text, stats=stats)
     return 24000, stream_pcm(text, stats=stats)
@@ -360,6 +365,154 @@ def stream_openai(text: str, stats: dict | None = None):
             arr = np.frombuffer(raw[: len(raw) // 2 * 2], dtype="<i2").astype("float32") / 32768.0
             if len(arr):
                 yield arr
+    if stats is not None:
+        stats["first_chunk_ms"] = round(first if first is not None else (time.time() - t0) * 1000)
+        stats["total_ms"] = round((time.time() - t0) * 1000)
+        stats["samples"] = total // 2
+
+
+# ---------------------------------------------------------------- 本地：GPT-SoVITS
+# 零样本克隆：给一段参考音（3~10 秒）+ 它说了什么，就能用那个音色说任何话。
+# 模型住在 sovits_server.py 那个常驻进程里（加载一次二十秒起，不能让每通电话都付一遍），
+# 这里只负责跟它要 PCM。没起服务时会抛 RuntimeError —— 上层按「这个后端用不了」处理。
+SOVITS_DEFAULT_PORT = 9880
+
+
+def _sovits_cfg() -> dict:
+    try:
+        import config as cfgmod
+        return (cfgmod.load().get("tts") or {}).get("sovits") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def sovits_base() -> str:
+    c = _sovits_cfg()
+    host = c.get("host") or "127.0.0.1"
+    port = int(c.get("port") or SOVITS_DEFAULT_PORT)
+    return f"http://{host}:{port}"
+
+
+def sovits_health(timeout: float = 2.0) -> dict | None:
+    """没起服务 → None（不要抛，调用方靠它判断可用性）。"""
+    try:
+        with urllib.request.urlopen(sovits_base() + "/health", timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sovits_rate() -> int:
+    h = sovits_health()
+    if not h or not h.get("ok"):
+        raise RuntimeError(
+            "GPT-SoVITS 服务没起来。先跑：python dafeiyu\\tools\\call\\sovits_server.py")
+    return int(h.get("rate") or 32000)
+
+
+# 常驻服务怎么拉起来：模型住在 D:\Tools\gsv-venv 那个 3.10 环境里（torch cu128 + 一堆音频库），
+# 跟通话进程用的 Python 不是一个，所以这里只存「去起哪个解释器、起哪个脚本」。
+def _find_sovits_python() -> str:
+    """GPT-SoVITS 住在哪个解释器里？
+
+    它要 torch cu12 + 一堆音频库，跟通话进程的 python 通常**不是**同一个，
+    所以这里只负责「去起哪个解释器」，判断顺序：
+        ① 环境变量 GSV_PYTHON（换机器 / 换盘最省事）
+        ② 几个常见的 venv 位置
+        ③ 实在找不到就用本进程的解释器 —— 那多半会失败，但至少报错说得出话
+    """
+    env = os.environ.get("GSV_PYTHON")
+    if env:
+        return env
+    for c in (r"D:\Tools\gsv-venv\Scripts\python.exe",
+              r"C:\Tools\gsv-venv\Scripts\python.exe",
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+                           "gsv-venv", "Scripts", "python.exe")):
+        if os.path.exists(c):
+            return c
+    return sys.executable
+
+
+SOVITS_PY = _find_sovits_python()
+SOVITS_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sovits_server.py")
+SOVITS_LOG = os.environ.get("GSV_LOG") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "state", "call", "sovits-server.log")
+
+
+def ensure_sovits(timeout: float = 120.0, autostart: bool = True) -> bool:
+    """确保常驻的 sovits 服务在跑。返回 True = 可以用。
+
+    ★ 为什么要这个：模型加载 2s + 预热 5s，加在一起七八秒。
+    每通电话都付一遍不划算，所以它常驻；但常驻进程会挂（关机、OOM、手动 kill），
+    这时通话进程自己把它拉起来，比让它退回 piper 好。
+    """
+    h = sovits_health()
+    if h and h.get("ok"):
+        return True
+    if not autostart:
+        return False
+    if not (os.path.exists(SOVITS_PY) and os.path.exists(SOVITS_SCRIPT)):
+        return False
+    import subprocess
+    c = _sovits_cfg()
+    port = str(int(c.get("port") or SOVITS_DEFAULT_PORT))
+    os.makedirs(os.path.dirname(os.path.normpath(SOVITS_LOG)), exist_ok=True)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        with open(SOVITS_LOG, "a", encoding="utf-8") as logf:
+            logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 拉起 sovits =====\n")
+            logf.flush()
+            subprocess.Popen(
+                [SOVITS_PY, SOVITS_SCRIPT, "--port", port],
+                cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                stdout=logf, stderr=subprocess.STDOUT,
+                creationflags=flags,
+            )
+    except Exception:  # noqa: BLE001
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        h = sovits_health(timeout=2.0)
+        if h and h.get("ok"):
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def stream_sovits(text: str, speed: float | None = None, stats: dict | None = None,
+                  block: int = 8192, timeout: float = 120.0):
+    """向本地 sovits_server 要一段话，边收边 yield float32 单声道。
+
+    拿不到服务时抛 RuntimeError —— engine 那边会退回 piper，不至于让通话哑掉。
+    """
+    if speed is None:
+        speed = float(_sovits_cfg().get("speed") or 1.0)
+    # ★ `stream=0`：要服务端**按小句整句合成**，不要在句子内部再切块。
+    #   2026-10-26 20:4x 实测（C:\dsh-temp\chunk-gaps.py）：
+    #     · 不传 stream（服务端默认 = 1，句内切块）：一句中间会出现
+    #       841 / 860 / 594 / 590 / 573ms 的停顿 —— 播放端缓冲一空就是一声卡；
+    #     · stream=0（整句）：句内一条波形下来，没有接缝，只有句与句之间那一个
+    #       120ms 的留白（那是服务端故意留的，像人换气）。
+    #   ⇒ 通话这条路要的是**连续**，不是「早几十毫秒开口」。
+    url = (f"{sovits_base()}/tts?text={urllib.parse.quote(text)}"
+           f"&speed={speed:.2f}&stream=0")
+    t0 = time.time()
+    first = None
+    total = 0
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            while True:
+                raw = r.read(block)
+                if not raw:
+                    break
+                if first is None:
+                    first = (time.time() - t0) * 1000
+                total += len(raw)
+                arr = np.frombuffer(raw[: len(raw) // 2 * 2], dtype="<i2").astype("float32") / 32768.0
+                if len(arr):
+                    yield arr
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"GPT-SoVITS 服务连不上（{sovits_base()}）：{e}") from e
     if stats is not None:
         stats["first_chunk_ms"] = round(first if first is not None else (time.time() - t0) * 1000)
         stats["total_ms"] = round((time.time() - t0) * 1000)

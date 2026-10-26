@@ -102,7 +102,7 @@ def main() -> int:
     ap.add_argument("--sink", default="speaker", choices=["speaker", "cable"])
     ap.add_argument("--device", default=None)
     ap.add_argument("--out-device", default=None)
-    ap.add_argument("--tts", default=None, choices=["piper", "cloud", "openai"],
+    ap.add_argument("--tts", default=None, choices=["piper", "sovits", "cloud", "openai"],
                     help="不填就用 config.json 里选的（界面切的就是它）")
     ap.add_argument("--model", default="small")
     ap.add_argument("--asr-device", default=None)
@@ -118,11 +118,31 @@ def main() -> int:
     hud = Hud()
     hud.start()
 
+    # ★ 通话位：同一时刻只该有一通电话。新的按下去，旧的自己退 —— 由 res.py 仲裁，
+    #   不靠「我记着去关」。被顶掉的那一通会走它自己的礼貌通道（petcall 看 petcall.cmd，
+    #   webcall 走 /quit），不听话才硬结束。
+    taken = None
+    try:
+        import res
+        # ★ 先清「上一通被硬杀」留下的烂摊子（2026-10-26 20:3x）：
+        #   被 -Force 打死的电话走不到 release，于是 session.json 留着死 pid、
+        #   `wallpaper.paused` 留着记号 —— 动态壁纸会一直停着没人还回去。
+        #   reap 只清「记录比现实活得久」的那些，**不杀活着的进程**。
+        try:
+            res.reap(quiet=True)
+        except Exception:  # noqa: BLE001
+            pass
+        taken = res.claim("petcall", "pet")
+        if taken:
+            log(f"[接管] 原来那一通（{taken.get('who')} pid {taken.get('pid')}）已让位")
+    except Exception as e:  # noqa: BLE001
+        log(f"[资源] 通话位没登记上（不影响这一通）：{type(e).__name__}: {e}")
+
     t0 = time.time()
     try:
-        from asr import AsrEngine
-        log(f"[ASR] 加载 {args.model} …")
-        asr = AsrEngine(model=args.model, device=args.asr_device)
+        from asr import make_asr
+        log(f"[ASR] 要耳朵（常驻服务优先）…")
+        asr = make_asr(model=args.model, device=args.asr_device)
         log(f"[ASR] {asr.describe()}")
 
         import config as cfgmod
@@ -134,6 +154,13 @@ def main() -> int:
             tts_engine = ttsmod.piper_from_config()
             log(f"[TTS] piper {tts_engine.load_ms:.0f}ms · 预热 {tts_engine.warmup_ms:.0f}ms")
             log(f"[TTS] 语气 快慢 {tts_engine.syn.length_scale} · 起伏 {tts_engine.syn.noise_w_scale}")
+        elif tts_backend == "sovits":
+            import tts as ttsmod
+            # 她自己的声音住在另一个常驻进程里（模型加载 2s + 预热 5s，不能每通电话都付）。
+            # 那个进程没在跑就现在拉起来，等它 ready；拉不起来就让引擎退回 piper，别让电话哑掉。
+            log("[TTS] 使用 GPT-SoVITS（她自己的音色）…")
+            ok = ttsmod.ensure_sovits()
+            log(f"[TTS] sovits {'就绪' if ok else '起不来，这一通会用 piper 顶上'}")
         else:
             log(f"[TTS] 用 {tts_backend}（{cfgmod.label_of(tts_backend)}）")
 
@@ -164,6 +191,10 @@ def main() -> int:
         log(f"[启动失败] {type(e).__name__}: {e}")
         hud.set(state="failed", heard=f"{type(e).__name__}: {e}")
         hud.stop()
+        try:
+            res.release("petcall")
+        except Exception:  # noqa: BLE001
+            pass
         return 3
 
     deadline = (time.time() + args.seconds) if args.seconds else None
@@ -207,6 +238,11 @@ def main() -> int:
         try:
             os.remove(CMD)
         except OSError:
+            pass
+        # 交还通话位（只交还自己那份，别把别人的位子误删）
+        try:
+            res.release("petcall")
+        except Exception:  # noqa: BLE001
             pass
         log(f"[结束] {turns} 轮")
 

@@ -53,12 +53,27 @@ BARGE_RATIO = 2.0
 
 HISTORY_MAX = 24            # 只带最近若干轮进上下文
 
+# ★ 2026-10-26 20:2x：`{maxchars}` 是从 state/call/config.json 的 `call.max_reply_chars`
+#   填进来的。原来这里写死「不超过 25 个字」，而界面上那个「一句最多几个字」的框
+#   **改了没有任何地方读它** —— 又一个会说谎的控件（跟云端那个写死 voice 是同一类）。
 SYSTEM = (
     "你正在和主人打电话。声音传过去，所以只说口语。\n"
-    "每次回话不超过 25 个字，一到两句，可以带一点语气词。\n"
+    "每次回话不超过 {maxchars} 个字，一到两句，可以带一点语气词。\n"
     "不要列表、不要加粗、不要括号里的旁白、不要念表情符号。\n"
     "听不清就直说听不清，不要瞎猜。"
 )
+
+
+def _call_cfg() -> dict:
+    """通话手感（什么时候算说完 / 一句几个字 / 让不让壁纸退场）从配置读。
+
+    读不到就用文件头上那几个常量 —— 这一条是兜底，不是常态。
+    """
+    try:
+        import config as cfgmod
+        return cfgmod.load().get("call") or {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 KEYFILE = os.path.expanduser(r"~\.dsh\deepseek-key.txt")
 
@@ -93,10 +108,12 @@ def _api_key() -> str:
         return f.read().strip()
 
 
-def brain_say(history: list[dict], system: str = SYSTEM,
+def brain_say(history: list[dict], system: str | None = None,
               model: str = "deepseek-chat", timeout: float = 20.0) -> tuple[str, float]:
     import urllib.request
 
+    if system is None:
+        system = SYSTEM.format(maxchars=25)
     body = json.dumps({
         "model": model,
         "messages": [{"role": "system", "content": system}] + history,
@@ -114,6 +131,120 @@ def brain_say(history: list[dict], system: str = SYSTEM,
     took = (time.time() - t0) * 1000
     text = (j.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
     return text, took
+
+
+# ---------------------------------------------------------------- 出口缓冲
+
+class JitterPlayer:
+    """把「生成」和「播放」拆成两条线，中间垫一小段缓冲。
+
+    ★ 2026-10-26 20:4x 量出来的（他原话：「主要问题是声音卡顿，听感很不好，
+      QQ 单独发的语音就还行」）：
+
+      sovits 的出块是**突发式**的。实测三个句子，一句话中间会出现
+      **841 / 860 / 594 / 590 / 573 ms 的停顿**（`C:\\dsh-temp\\chunk-gaps.py` 量的）。
+      整句算下来的 RTF 只有 0.6 —— **平均够快，节奏是错的**：
+      播放端按 1.0 倍速放，缓冲一空就是一声卡。
+
+      而 QQ 那条路为什么好？因为它是「整段合成完再播」，根本没有中间的空档。
+
+      ⇒ 这里先攒够 `cushion` 秒再开口，之后边放边收。真的追不上就等它，
+        但 cushion 会自己变大（这一句饿过 ⇒ 下一句多垫 0.25s，最多 1.2s），
+        所以「越聊越顺」，不用人去调参数。
+    """
+
+    def __init__(self, sink, rate: int, cushion: float = 0.35,
+                 t0: float | None = None, min_piece: float = 0.08):
+        self.sink = sink
+        self.rate = max(1, int(rate))
+        self.cushion = float(cushion)
+        self.min_piece = float(min_piece)
+        self._buf: list[np.ndarray] = []
+        self._n = 0
+        self._done = False
+        self._abort = False
+        self._cv = threading.Condition()
+        self._thread = None
+        self._t0 = t0 if t0 is not None else time.time()
+        self.starved = False        # 这一句有没有饿过
+        self.played = 0             # 真正交给 sink 的采样数
+        self.first_at = None        # 第一次出声的时刻（相对 t0，秒）
+
+    def start(self) -> "JitterPlayer":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def push(self, arr) -> None:
+        if arr is None or not len(arr):
+            return
+        a = np.asarray(arr, dtype="float32").ravel()
+        with self._cv:
+            if self._abort:
+                return
+            self._buf.append(a)
+            self._n += len(a)
+            self._cv.notify_all()
+
+    def finish(self) -> None:
+        with self._cv:
+            self._done = True
+            self._cv.notify_all()
+
+    def abort(self) -> None:
+        with self._cv:
+            self._abort = True
+            self._buf.clear()
+            self._n = 0
+            self._cv.notify_all()
+
+    def wait(self, timeout: float = 0.05) -> bool:
+        """等它放完。True = 已经结束（正常放完或被掐掉）。"""
+        if self._thread is None:
+            return True
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def _run(self) -> None:
+        need = int(self.cushion * self.rate)
+        min_n = max(1, int(self.min_piece * self.rate))
+        started = False
+        starving = False
+        while True:
+            with self._cv:
+                if not started:
+                    # 先垫够再开口：这一步就是「不卡」的全部秘密
+                    while not self._abort and not self._done and self._n < need:
+                        self._cv.wait(0.05)
+                    started = True
+                while not self._abort and not self._buf and not self._done:
+                    if not starving:
+                        starving = True
+                        self.starved = True
+                    self._cv.wait(0.02)
+                starving = False
+                if self._abort:
+                    return
+                if not self._buf:
+                    return                      # 已经说完且放完了
+                # 攒到至少 min_piece 再送出去：太碎的块反而更容易抖
+                take = []
+                got = 0
+                while self._buf and got < min_n:
+                    a = self._buf.pop(0)
+                    take.append(a)
+                    got += len(a)
+                self._n -= got
+            piece = take[0] if len(take) == 1 else np.concatenate(take)
+            if self.first_at is None:
+                self.first_at = time.time() - self._t0
+            if self.sink is not None:
+                try:
+                    self.sink(piece, self.rate)
+                except Exception as e:  # noqa: BLE001
+                    log(f"[播放] 出错：{type(e).__name__}: {e}")
+                    return
+            self.played += len(piece)
 
 
 # ---------------------------------------------------------------- 引擎
@@ -134,7 +265,7 @@ class CallEngine:
     """
 
     def __init__(self, asr=None, tts_backend: str | None = None, tts_engine=None,
-                 sink=None, on_event=None, system: str = SYSTEM,
+                 sink=None, on_event=None, system: str | None = None,
                  model: str = "deepseek-chat", seed: list[dict] | None = None,
                  verbose: bool = True):
         # 不指定就按 state/call/config.json 里选的（界面切的就是它）
@@ -144,18 +275,35 @@ class CallEngine:
                 tts_backend = cfgmod.backend()
             except Exception:  # noqa: BLE001
                 tts_backend = "piper"
+
+        # ★ 通话手感也从那份配置来（`call.silence_end` / `call.max_reply_chars`）。
+        #   从前这两个框改了不生效 —— 跟云端那个写死 voice 是同一种毛病，一起修掉。
+        ccfg = _call_cfg()
+        try:
+            self.silence_end = float(ccfg.get("silence_end") or SILENCE_END)
+        except (TypeError, ValueError):
+            self.silence_end = SILENCE_END
+        self.silence_end = min(4.0, max(0.25, self.silence_end))
+        try:
+            maxchars = int(ccfg.get("max_reply_chars") or 25)
+        except (TypeError, ValueError):
+            maxchars = 25
+        maxchars = min(120, max(8, maxchars))
+
         self.asr = asr
         self.tts_backend = tts_backend
         self.tts_engine = tts_engine
         self.sink = sink
         self.on_event = on_event
-        self.system = system
+        self.system = system if system else SYSTEM.format(maxchars=maxchars)
         self.model = model
         self.verbose = verbose
 
         self.history: list[dict] = list(seed or [])
         self.state = "idle"
         self.level = 0.0
+        # 播放缓冲的垫子（秒）。JitterPlayer 会按「这一句饿没饿过」自己调它。
+        self._cushion = 0.35
 
         self._q: queue.Queue = queue.Queue(maxsize=64)     # 切好句的音频
         self._stop = threading.Event()
@@ -222,7 +370,7 @@ class CallEngine:
     def _tick(self) -> None:
         """没声音进来时也得能把最后一句切掉 —— 否则「说完就挂断/断线」那一句永远不出来。"""
         with self._lock:
-            if self._speech > 0 and (time.monotonic() - self._last_frame) > (SILENCE_END + 0.25):
+            if self._speech > 0 and (time.monotonic() - self._last_frame) > (self.silence_end + 0.25):
                 self._close()
 
     def _frame(self, sig: np.ndarray) -> None:
@@ -258,7 +406,7 @@ class CallEngine:
         elif self._speech > 0:
             self._buf.append(sig.copy())
             self._silence += dur
-            if self._silence >= SILENCE_END:
+            if self._silence >= self.silence_end:
                 self._close()
         else:
             now = time.monotonic()
@@ -327,10 +475,16 @@ class CallEngine:
             log(f"对方：{heard}   （音频 {dur:.1f}s · ASR {asr_ms:.0f}ms）")
 
         self.history.append({"role": "user", "content": heard})
+        # ★ 从前 history 只增不减（虽然每次只把最后 24 条喂给模型）——
+        #   一通两小时的电话能攒下几百轮，白占着不放。现在攒到两倍就掐掉最前面的。
+        if len(self.history) > HISTORY_MAX * 2:
+            del self.history[:len(self.history) - HISTORY_MAX * 2]
         reply, brain_ms = brain_say(self.history[-HISTORY_MAX:], self.system, self.model)
         turn["brain_ms"] = round(brain_ms)
         turn["reply"] = reply
         self.history.append({"role": "assistant", "content": reply})
+        if len(self.history) > HISTORY_MAX * 2:
+            del self.history[:len(self.history) - HISTORY_MAX * 2]
         if not reply:
             self.turns.append(turn)
             self._set_state("listening")
@@ -345,25 +499,63 @@ class CallEngine:
         self._loud = 0.0
         stats: dict = {}
         t_tts = time.time()
-        tts_rate, it = ttsmod.make_stream(self.tts_backend, reply,
-                                          engine=self.tts_engine, stats=stats)
+        try:
+            tts_rate, it = ttsmod.make_stream(self.tts_backend, reply,
+                                              engine=self.tts_engine, stats=stats)
+        except Exception as e:  # noqa: BLE001
+            # 先自救：sovits 那个常驻进程可能被关掉了（关机 / 手动 kill / OOM）
+            recovered = False
+            if self.tts_backend == "sovits":
+                try:
+                    if ttsmod.ensure_sovits(timeout=45.0):
+                        tts_rate, it = ttsmod.make_stream("sovits", reply, stats=stats)
+                        recovered = True
+                except Exception:  # noqa: BLE001
+                    recovered = False
+            if not recovered:
+                # sovits 起不来 / cloud 没 key —— 别让这一通电话直接哑掉，退回本地 piper
+                if self.verbose:
+                    log(f"[TTS] {self.tts_backend} 不可用（{type(e).__name__}: {e}），退回 piper")
+                self.tts_backend = "piper"
+                if self.tts_engine is None:
+                    self.tts_engine = ttsmod.piper_from_config()
+                tts_rate, it = ttsmod.make_stream("piper", reply,
+                                                  engine=self.tts_engine, stats=stats)
         self._speaking.set()
         self._set_state("speaking")
         self.emit("say_start", rate=tts_rate)
-        first_ms = None
-        played_samples = 0
+        # ★ 播放走抖动缓冲（见 JitterPlayer 上面的注释）：不再「拿到一块就播一块」。
+        player = JitterPlayer(self.sink, tts_rate, cushion=self._cushion, t0=t_tts).start()
         try:
-            for ch in it:
+            try:
+                for ch in it:
+                    if self._abort.is_set() or self._stop.is_set():
+                        break
+                    player.push(ch)
+            except Exception as e:  # noqa: BLE001
+                # 生成到一半断了（sovits 掉线 / 网络抖）——**别把她说到一半的话掐掉**，
+                # 把已经攒下的放完，再记一笔。
+                log(f"[TTS] 生成中断（{type(e).__name__}: {e}），已收到的照常说完")
+            player.finish()
+            while not player.wait(0.05):
                 if self._abort.is_set() or self._stop.is_set():
+                    player.abort()
                     break
-                if self.sink is not None:
-                    self.sink(ch, tts_rate)
-                if first_ms is None:
-                    first_ms = (time.time() - t_tts) * 1000
-                played_samples += len(ch)
         finally:
+            if not player.wait(0.05):
+                player.abort()
             self._speaking.clear()
             self.emit("say_end", interrupted=self._abort.is_set())
+
+        # 自调垫子：这一句饿过 ⇒ 下一句多垫 0.25s；一路顺 ⇒ 慢慢收回去
+        if player.starved:
+            self._cushion = min(1.20, self._cushion + 0.25)
+            if self.verbose:
+                log(f"[缓冲] 这一句饿过，下一句垫到 {self._cushion:.2f}s")
+        else:
+            self._cushion = max(0.35, self._cushion - 0.05)
+        first_ms = (player.first_at * 1000) if player.first_at is not None else None
+        played_samples = player.played
 
         tts_ms = (time.time() - t_tts) * 1000
         turn.update({
@@ -373,6 +565,9 @@ class CallEngine:
             "played_s": round(played_samples / max(1, tts_rate), 2),
             "interrupted": self._abort.is_set(),
             "first_sound_ms": round(asr_ms + brain_ms + (first_ms or 0)),
+            # 听感的两条现场证据：这一句播放有没有饿过、当时的垫子多厚
+            "starved": bool(player.starved),
+            "cushion_s": round(self._cushion, 2),
         })
         self.turns.append(turn)
         if self.verbose:

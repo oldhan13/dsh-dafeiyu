@@ -221,7 +221,7 @@ class Session:
 
 # ---------------------------------------------------------------- 服务器
 
-def make_process_request(page: bytes):
+def make_process_request(page: bytes, stop=None):
     def process_request(connection, request):
         path = (request.path or "/").split("?")[0]
         if path.startswith("/ws"):
@@ -240,6 +240,16 @@ def make_process_request(page: bytes):
                 "Content-Length": str(len(body)),
                 "Connection": "close",
             }), body)
+        if path == "/quit":
+            # 让位通道：res.py 要顶掉这一通时走这里（礼貌优先，硬杀是兜底）
+            if stop is not None:
+                stop.set()
+            body = b'{"ok":true,"bye":true}'
+            return Response(200, "OK", Headers({
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+                "Connection": "close",
+            }), body)
         body = b"not found"
         return Response(404, "Not Found", Headers({
             "Content-Type": "text/plain; charset=utf-8",
@@ -250,14 +260,37 @@ def make_process_request(page: bytes):
 
 
 class WebCall:
-    def __init__(self, asr, piper, tts_backend: str):
+    def __init__(self, asr, piper, tts_backend: str, idle_exit: float = 600.0):
         self.asr = asr
         self.piper = piper
         self.tts_backend = tts_backend
         self.sessions = 0
+        self.idle_exit = idle_exit
+        self.last_active = time.time()
 
     async def handler(self, ws) -> None:
-        await Session(ws, self.asr, self.piper, self).run()
+        self.sessions += 1
+        self.last_active = time.time()
+        try:
+            await Session(ws, self.asr, self.piper, self).run()
+        finally:
+            self.sessions -= 1
+            self.last_active = time.time()
+
+    async def idle_keeper(self, stop) -> None:
+        """★ 没人打就自己退 —— 它不该是一个需要人记得去关的东西。
+
+        注意：判据是「**没有会话**且**一段时间没人连**」，不是「没有请求」——
+        页面开着但没拨号也算空闲，那正是该收摊的时候。
+        """
+        if not self.idle_exit:
+            return
+        while True:
+            await asyncio.sleep(20)
+            if self.sessions <= 0 and (time.time() - self.last_active) > self.idle_exit:
+                log(f"[空闲] {self.idle_exit:.0f} 秒没人打，自己退（端口和显存让出来）")
+                stop.set()
+                return
 
 
 async def amain(args) -> int:
@@ -265,11 +298,26 @@ async def amain(args) -> int:
     with open(PAGE, "rb") as f:
         page = f.read()
 
-    # ---- 预热：ASR 与 piper 都只加载一次，所有会话共用
+    stop = asyncio.Event()
+
+    # ★ 通话位：同一时刻只该有一通电话。网页这边拨进来，桌宠那边那一通让位。
+    try:
+        import res
+        # ★ 登记**完整地址**：这里是 https（自签证书），让位通道要按这个协议去打，
+        #   不然 res 那边拼 http 会握手失败，最后变成硬杀。
+        _scheme = "http" if args.no_tls else "https"
+        taken = res.claim("webcall", "web", port=args.port,
+                          url=f"{_scheme}://127.0.0.1:{args.port}/quit")
+        if taken:
+            log(f"[接管] 原来那一通（{taken.get('who')} pid {taken.get('pid')}）已让位")
+    except Exception as e:  # noqa: BLE001
+        log(f"[资源] 通话位没登记上（不影响这一通）：{type(e).__name__}: {e}")
+
+    # ---- 预热：耳朵与 piper 都只加载一次，所有会话共用
     t0 = time.time()
-    from asr import AsrEngine
-    log(f"[ASR] 加载 {args.model} …")
-    asr = AsrEngine(model=args.model, device=args.asr_device)
+    from asr import make_asr
+    log("[ASR] 要耳朵（常驻服务优先）…")
+    asr = make_asr(model=args.model, device=args.asr_device)
     log(f"[ASR] {asr.describe()}")
 
     piper = None
@@ -284,25 +332,39 @@ async def amain(args) -> int:
         log(f"[TTS] 用 {backend}（{cfgmod.label_of(backend)}）")
     log(f"[就绪] 预热合计 {(time.time()-t0)*1000:.0f}ms")
 
-    web = WebCall(asr, piper, backend)
+    web = WebCall(asr, piper, backend, idle_exit=args.idle_exit)
     ctx = None
     if not args.no_tls:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(CERT, KEY)
 
-    async with serve(web.handler, args.host, args.port, ssl=ctx, max_size=None,
-                     process_request=make_process_request(page)) as server:
-        scheme = "http" if args.no_tls else "https"
-        log("=" * 62)
-        log(f"  网页通话已开：{scheme}://127.0.0.1:{args.port}/")
-        if not args.no_tls:
-            for ip in lan_ips():
-                log(f"                 {scheme}://{ip}:{args.port}/   ← 手机用这个")
-            log("  ★ 自签证书：手机上会弹「不受信任」，点 高级 → 继续前往")
-        else:
-            log("  ★ 没有 TLS：只有本机 localhost 能拿到麦克风，手机不行")
-        log("=" * 62)
-        await asyncio.Future()
+    try:
+        async with serve(web.handler, args.host, args.port, ssl=ctx, max_size=None,
+                         process_request=make_process_request(page, stop)) as server:
+            scheme = "http" if args.no_tls else "https"
+            log("=" * 62)
+            log(f"  网页通话已开：{scheme}://127.0.0.1:{args.port}/")
+            if not args.no_tls:
+                for ip in lan_ips():
+                    log(f"                 {scheme}://{ip}:{args.port}/   ← 手机用这个")
+                log("  ★ 自签证书：手机上会弹「不受信任」，点 高级 → 继续前往")
+            else:
+                log("  ★ 没有 TLS：只有本机 localhost 能拿到麦克风，手机不行")
+            if args.idle_exit:
+                log(f"  ★ 空闲 {args.idle_exit:.0f} 秒没人打会自动退出（不用人记得关）")
+            log("=" * 62)
+            keeper = asyncio.create_task(web.idle_keeper(stop))
+            try:
+                await stop.wait()
+            finally:
+                keeper.cancel()
+    finally:
+        try:
+            import res
+            res.release("webcall")
+        except Exception:  # noqa: BLE001
+            pass
+    return 0
 
 
 def main() -> int:
@@ -311,10 +373,14 @@ def main() -> int:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8443)
     ap.add_argument("--no-tls", action="store_true", help="只有本机可用（手机拿不到麦克风）")
-    ap.add_argument("--tts", default=None, choices=["piper", "cloud", "openai"],
+    ap.add_argument("--tts", default=None, choices=["piper", "sovits", "cloud", "openai"],
                     help="不填就用 config.json 里选的")
     ap.add_argument("--model", default="small")
     ap.add_argument("--asr-device", default=None)
+    ap.add_argument("--idle-exit", type=float, default=0.0,
+                    help="多少秒没人打就自己退出（0 = 一直开着，默认）。"
+                         "★ 它现在几乎不占东西：耳朵在常驻服务里、嘴在 sovits 里，"
+                         "本进程只管转发 —— 所以不该按「省资源」的逻辑催它退")
     args = ap.parse_args()
     try:
         asyncio.run(amain(args))

@@ -43,10 +43,11 @@ function Trace-Paint($tag, $err) {
 
 # ---------------------------------------------------------------- 起 / 收 通话进程
 $script:child = $null
+
 # 用哪个 python：有**装齐过的** .venv 就用它，否则用 PATH 里的。
 # ★ 规矩在 tools\call\bootstrap.py 的 target_python() 里，两边必须一致。
-#   判据是 .venv\.deps-ok 那个记号，不是"有 .venv 就算" —— 那台机器上就留过半个 .venv
-#   （只有 numpy），照"有就用"起会让一通本来能用的电话当场 import 失败。
+#   判据是 `.venv\.deps-ok` 那个记号，不是"有 .venv 就算" —— 这台机器上就留过半个 .venv
+#   （只有 numpy），照那条起会让一通本来能用的电话当场 import 失败。
 function Get-CallPythonExe {
     $venvPy = Join-Path $callDir '.venv\Scripts\python.exe'
     $mark = Join-Path $callDir '.venv\.deps-ok'
@@ -72,7 +73,33 @@ function Stop-Call {
     if ($script:child -and -not $script:child.HasExited) {
         try { $script:child.Kill() } catch { }
     }
+    $script:child = $null
+    # ★ 兜底（2026-10-26 19:0x 他报「点 × 之后电话没挂断」）：
+    #   `$script:child` 只在**这一份**脚本起的进程上有值 —— 窗口被重复打开过、或者上一次
+    #   Restart-Call 里 Start-Process 抛过错，就会留下**没人管**的 petcall.py：
+    #   窗口关了，它还在占着麦克风照常听。所以这里按命令行特征扫一遍，全部收掉（排除自己）。
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like '*petcall.py*' -and $_.ProcessId -ne $PID } |
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
+    } catch { }
     Remove-Item $cmd -ErrorAction SilentlyContinue
+    # ★ 收尾兜底（2026-10-26 20:3x 抓到的）：`res.release` 住在 petcall 的 finally 里，
+    #   **被 -Force 打死的那一通永远不会走到那儿** —— 于是
+    #     ① `state\call\session.json` 留着一个死 pid；
+    #     ② `state\call\wallpaper.paused` 留着记号，**动态壁纸就一直停在那儿不放了**
+    #        （实测现场：记号还在，wallpaper64 的 videodecode 却是 95%，两边说的是反的）。
+    #   `res.py reap` 就是专门清这两样、并且在「没人在通话」时把壁纸还回去的。
+    #   有超时：它只是收尾，绝不能因为它把挂断卡住。
+    try {
+        $r = Start-Process -FilePath (Get-CallPythonExe) -ArgumentList @('res.py', 'reap') `
+            -WorkingDirectory $callDir -WindowStyle Hidden -PassThru
+        for ($j = 0; $j -lt 25; $j++) {
+            if ($r.HasExited) { break }
+            Start-Sleep -Milliseconds 120
+        }
+        if (-not $r.HasExited) { try { $r.Kill() } catch { } }
+    } catch { }
 }
 
 # ---------------------------------------------------------------- 音色来源（选项）
@@ -81,9 +108,15 @@ function Stop-Call {
 $CFG = Join-Path $stateDir 'config.json'
 $script:VOICES = @(
     @{ id = 'piper';  short = '本地 piper' },
-    @{ id = 'cloud';  short = '云端 CosyVoice' },
-    @{ id = 'openai'; short = 'OpenAI TTS' }
+    @{ id = 'sovits'; short = '她自己的声音' },
+    @{ id = 'cloud';  short = '云端 CosyVoice' }
 )
+# ★ 2026-10-26 19:0x 他报「切换音色有 bug，桌宠的声音没变化」，两个原因：
+#   ① 这张表**漏了 sovits**（那时刚接上）⇒ 从 sovits 点一下会跳到表头 piper，从 piper 点只能在
+#      piper→cloud→openai 之间绕，**永远回不到 sovits**；
+#   ② 表里那个 **openai 没有 key**，切过去 engine 会静默退回 piper ⇒ 连着点几下听到的全是同一个声音，
+#      看起来像「切换没生效」。
+#   ⇒ 表里只留**真的能出声**的三个；openai 需要 key，等配了 key 再手动 base64 加回来。
 
 function Read-Voice {
     try {
@@ -210,13 +243,136 @@ $posX = [int][math]::Max($wa.Left + 8, [math]::Min($posX, $wa.Right - $WINW - 8)
 $posY = [int][math]::Max($wa.Top + 8, [math]::Min($posY, $wa.Bottom - $WINH - 8))
 $f.Location = New-Object System.Drawing.Point($posX, $posY)
 
+# ================================================================ 画图缓存
+# ★ 2026-10-26 20:2x —— 「一通话就卡」里**真正属于我们、也真正改得动**的那一份，就在这儿。
+#   原来的画法是**每 120ms 把整套 GDI+ 对象重造一遍**：14 个光环椭圆各配一个
+#   GraphicsPath + 一个 SolidBrush，再加 6 个 Font、3 个 StringFormat、4 个 Pen、
+#   2 个 LinearGradientBrush —— 一帧四十来个对象，一秒八帧。
+#   用 `C:\dsh-temp\paint-soak.ps1` 把这三段 Paint 抄出来空跑 35 秒，量到：
+#       **9.4% 单核不停手 · 每帧 10~12ms · 偶发 20~50ms 的顿**
+#   而 35 秒里 ws 一直是 113MB —— **它不泄漏，它只是一直在烧**。
+#   ⇒ 规矩改成：**只造一次的，造一次**；光环不再造 Path（FillEllipse 本来就不需要 Path），
+#     alpha 量化后连刷子也一起缓存。
+#   ⚠ 以后再往下面三个 Paint 里加东西，先问一句：**这个能缓存吗**。
+$STAGE_W = $WINW; $STAGE_H = 258
+$TRANS_W = $WINW; $TRANS_H = 156
+$CX = $STAGE_W / 2; $CY = 104; $BASE_R = 56
+
+$script:oFont = @{}       # 字体
+$script:oBrush = @{}       # 刷子
+$script:oPen = @{}       # 笔
+$script:oFmt = @{}      # StringFormat
+$script:oGlow = @{}    # 光环刷子（按 alpha 量化缓存；换状态时清空）
+$script:oAvatar = @{}  # 头像渐变刷（按状态缓存）
+$script:oMz = @{}      # MeasureString 结果（按文本缓存）
+$script:gfxAccent = $null
+$script:jsonMt = $null
+$script:sigT = ''
+$script:sigS = ''
+$script:accentNow = $PAL['starting'].c
+
+function Get-AvatarBrush([string]$st) {
+    if ($script:oAvatar.ContainsKey($st)) { return $script:oAvatar[$st] }
+    if ($st -eq 'speaking') {
+        $top = [System.Drawing.Color]::FromArgb(255, 214, 160); $bot = [System.Drawing.Color]::FromArgb(226, 128, 40)
+    } elseif ($st -eq 'thinking') {
+        $top = [System.Drawing.Color]::FromArgb(255, 224, 180); $bot = [System.Drawing.Color]::FromArgb(212, 148, 52)
+    } else {
+        $top = [System.Drawing.Color]::FromArgb(150, 210, 255); $bot = [System.Drawing.Color]::FromArgb(52, 122, 208)
+    }
+    $br = New-Object System.Drawing.Drawing2D.PathGradientBrush($script:oAvatarPath)
+    $br.CenterPoint = New-Object System.Drawing.PointF([single]$CX, [single]($CY - $BASE_R * 0.35))
+    $br.CenterColor = $top
+    $br.SurroundColors = @($bot)
+    $script:oAvatar[$st] = $br
+    return $br
+}
+
+function Get-GlowBrush([int]$a) {
+    if ($a -lt 2) { $a = 2 }
+    $k = [int]([math]::Floor($a / 4.0)) * 4      # 量化：alpha 最大也就 26，桶数少得很
+    if ($k -lt 2) { $k = 2 }
+    if ($script:oGlow.ContainsKey($k)) { return $script:oGlow[$k] }
+    $acc = $script:accentNow
+    $b = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($k, $acc.R, $acc.G, $acc.B))
+    $script:oGlow[$k] = $b
+    return $b
+}
+
+function Get-LevelPen([string]$st) {
+    $k = "pen_$st"
+    if ($script:oPen.ContainsKey($k)) { return $script:oPen[$k] }
+    $pen = New-Object System.Drawing.Pen($script:accentNow, [single]3.0)
+    $pen.StartCap = 'Round'
+    $pen.EndCap = 'Round'
+    $script:oPen[$k] = $pen
+    return $pen
+}
+
+function Measure-Cached($g, [string]$k, [string]$text) {
+    $key = "$k|$text"
+    if ($script:oMz.ContainsKey($key)) { return $script:oMz[$key] }
+    if ($script:oMz.Count -gt 48) { $script:oMz.Clear() }
+    $sz = $g.MeasureString($text, $script:oFont.bubble, [int]($TRANS_W - 96.0), $script:oFmt.bubble)
+    $script:oMz[$key] = $sz
+    return $sz
+}
+
+function Build-Gfx {
+    # ---- 字体
+    $script:oFont.title  = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $script:oFont.close  = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+    $script:oFont.voice  = New-Object System.Drawing.Font('Microsoft YaHei UI', 8.5)
+    $script:oFont.glyph  = New-Object System.Drawing.Font('Microsoft YaHei UI', 27, [System.Drawing.FontStyle]::Bold)
+    $script:oFont.status = New-Object System.Drawing.Font('Microsoft YaHei UI', 11.5)
+    $script:oFont.timer  = New-Object System.Drawing.Font('Consolas', 9)
+    $script:oFont.bubble = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
+    $script:oFont.hint   = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $script:oFont.btn    = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5, [System.Drawing.FontStyle]::Bold)
+
+    # ---- 背景渐变（尺寸是死的，造一次用到底）
+    $script:oBrush.formBg  = Get-BgBrush $WINW $WINH
+    $script:oBrush.stageBg = Get-BgBrush $STAGE_W $STAGE_H
+    $script:oBrush.transBg = Get-BgBrush $TRANS_W $TRANS_H
+
+    # ---- 文字刷子
+    $script:oBrush.glyph   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(246, 251, 255))
+    $script:oBrush.status  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(216, 228, 242))
+    $script:oBrush.timer   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(96, 110, 130))
+    $script:oBrush.heardTxt = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(148, 162, 182))
+    $script:oBrush.heardBg  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, 42, 58))
+    $script:oBrush.replyTxt = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(226, 238, 250))
+    $script:oBrush.replyBg  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(26, 52, 82))
+    $script:oBrush.hint     = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(74, 86, 104))
+    $script:oBrush.btnTxt   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 244, 244))
+    $script:oBrush.btnDead  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, 42, 56))
+    $script:oBrush.hl       = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(58, 255, 255, 255))
+
+    # ---- 笔
+    $script:oPen.lvlDim = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(48, 96, 140), [single]3.0)
+    $script:oPen.lvlDim.StartCap = 'Round'
+    $script:oPen.lvlDim.EndCap = 'Round'
+    $script:oPen.replyEdge = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(120, 95, 182, 255), [single]1.2)
+
+    # ---- 对齐
+    $script:oFmt.center = New-Object System.Drawing.StringFormat
+    $script:oFmt.center.Alignment = 'Center'
+    $script:oFmt.center.LineAlignment = 'Center'
+    $script:oFmt.bubble = New-Object System.Drawing.StringFormat
+    # ⚠ 别设 FormatFlags = WordBreak —— StringFormatFlags 里没有这个成员，设了整块画不出来
+    $script:oFmt.bubble.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
+
+    # ---- 头像那块：几何是死的，刷子按状态缓存（Path 得活到最后，刷子引用它）
+    $script:oAvatarPath = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $script:oAvatarPath.AddEllipse(($CX - $BASE_R), ($CY - $BASE_R), ($BASE_R * 2), ($BASE_R * 2))
+}
+Build-Gfx
+
 $f.Region = New-Object System.Drawing.Region (New-RoundPath 0 0 $WINW $WINH 22)
 $f.Add_Paint({
     param($s, $e)
     try {
-        $b = Get-BgBrush $f.Width $f.Height
-        $e.Graphics.FillRectangle($b, 0, 0, $f.Width, $f.Height)
-        $b.Dispose()
+        $e.Graphics.FillRectangle($script:oBrush.formBg, 0, 0, $f.Width, $f.Height)
     } catch { Trace-Paint 'form' $_.Exception }
 })
 
@@ -281,109 +437,76 @@ $stage.Add_Paint({
         $g = $e.Graphics
         $g.SmoothingMode = 'AntiAlias'
         $g.TextRenderingHint = 'ClearTypeGridFit'
-        $CW = $stage.Width
-        $CH = $stage.Height
 
-        $bg = Get-BgBrush $CW $CH
-        $g.FillRectangle($bg, 0, 0, $CW, $CH)
-        $bg.Dispose()
+        $g.FillRectangle($script:oBrush.stageBg, 0, 0, $STAGE_W, $STAGE_H)
 
         $st = "$($script:vis.state)"
         $pal = $PAL[$st]
         if (-not $pal) { $pal = $PAL['starting'] }
-        $accent = $pal.c
-
-        $cx = $CW / 2
-        $cy = 104
-        $baseR = 56
+        $script:accentNow = $pal.c
+        # 光环刷子是按 accent 缓存出来的 —— 换了状态就得换一批颜色
+        if ($script:gfxAccent -ne $st) {
+            $script:gfxAccent = $st
+            $script:oGlow.Clear()
+        }
 
         $beat = [math]::Sin($script:tick * 0.16) * 0.5 + 0.5
         $amp = if ($st -eq 'speaking') { 9.0 } elseif ($st -eq 'thinking') { 5.0 } else { 4.0 }
         $pulse = [single](($script:vis.level) * 0.6 + $beat * 0.4)
 
-        # 外发光：一圈圈往下淡
+        # 外发光：一圈圈往下淡。
+        # ★ 原来每圈造一个 GraphicsPath + 一个 SolidBrush；FillEllipse 根本不需要 Path，
+        #   刷子按 alpha 量化缓存 ⇒ 一帧 0 个新对象（原来 28 个）。
         for ($i = 14; $i -ge 1; $i--) {
-            $rr = $baseR + $i * 3.2 + $pulse * $amp
+            $rr = $BASE_R + $i * 3.2 + $pulse * $amp
             $a = [int](26 * (1 - $i / 15.0) * (0.45 + $pulse * 0.85))
             if ($a -lt 2) { continue }
-            $col = [System.Drawing.Color]::FromArgb($a, $accent.R, $accent.G, $accent.B)
-            $pp = New-Object System.Drawing.Drawing2D.GraphicsPath
-            $pp.AddEllipse(($cx - $rr), ($cy - $rr), ($rr * 2), ($rr * 2))
-            $br = New-Object System.Drawing.SolidBrush($col)
-            $g.FillPath($br, $pp)
-            $br.Dispose(); $pp.Dispose()
+            $gb = Get-GlowBrush $a
+            $g.FillEllipse($gb,
+                [single]($CX - $rr), [single]($CY - $rr), [single]($rr * 2), [single]($rr * 2))
         }
 
-        # 头像本体：径向渐变
-        $fp = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $fp.AddEllipse(($cx - $baseR), ($cy - $baseR), ($baseR * 2), ($baseR * 2))
-        $pgb = New-Object System.Drawing.Drawing2D.PathGradientBrush($fp)
-        $pgb.CenterPoint = New-Object System.Drawing.PointF([single]$cx, [single]($cy - $baseR * 0.35))
-        $top = if ($st -eq 'speaking') { [System.Drawing.Color]::FromArgb(255, 214, 160) }
-               elseif ($st -eq 'thinking') { [System.Drawing.Color]::FromArgb(255, 224, 180) }
-               else { [System.Drawing.Color]::FromArgb(150, 210, 255) }
-        $bot = if ($st -eq 'speaking') { [System.Drawing.Color]::FromArgb(226, 128, 40) }
-               elseif ($st -eq 'thinking') { [System.Drawing.Color]::FromArgb(212, 148, 52) }
-               else { [System.Drawing.Color]::FromArgb(52, 122, 208) }
-        $pgb.CenterColor = $top
-        $pgb.SurroundColors = @($bot)
-        $g.FillPath($pgb, $fp)
-        $pgb.Dispose()
+        # 头像本体：径向渐变（刷子按状态缓存）
+        $ab = Get-AvatarBrush $st
+        $g.FillPath($ab, $script:oAvatarPath)
 
         # 高光
-        $hl = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(58, 255, 255, 255))
-        $g.FillEllipse($hl, [single]($cx - $baseR * 0.55), [single]($cy - $baseR * 0.78),
-            [single]($baseR * 1.1), [single]($baseR * 0.62))
-        $hl.Dispose()
-        $fp.Dispose()
-
-        $sf = New-Object System.Drawing.StringFormat
-        $sf.Alignment = 'Center'
-        $sf.LineAlignment = 'Center'
+        $g.FillEllipse($script:oBrush.hl,
+            [single]($CX - $BASE_R * 0.55), [single]($CY - $BASE_R * 0.78),
+            [single]($BASE_R * 1.1), [single]($BASE_R * 0.62))
 
         # 「汐」
-        $gf = New-Object System.Drawing.Font('Microsoft YaHei UI', 27, [System.Drawing.FontStyle]::Bold)
-        $wb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(246, 251, 255))
-        $g.DrawString('汐', $gf, $wb, (New-Object System.Drawing.RectangleF(0, [single]($cy - 28), [single]$CW, 56)), $sf)
-        $wb.Dispose(); $gf.Dispose()
+        $g.DrawString('汐', $script:oFont.glyph, $script:oBrush.glyph,
+            (New-Object System.Drawing.RectangleF(0, [single]($CY - 28), [single]$STAGE_W, 56)),
+            $script:oFmt.center)
 
         # 状态文字
-        $sfont = New-Object System.Drawing.Font('Microsoft YaHei UI', 11.5)
-        $sbrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(216, 228, 242))
-        $g.DrawString($pal.text, $sfont, $sbrush,
-            (New-Object System.Drawing.RectangleF(0, [single]($cy + $baseR + 20), [single]$CW, 26)), $sf)
-        $sbrush.Dispose(); $sfont.Dispose()
+        $g.DrawString($pal.text, $script:oFont.status, $script:oBrush.status,
+            (New-Object System.Drawing.RectangleF(0, [single]($CY + $BASE_R + 20), [single]$STAGE_W, 26)),
+            $script:oFmt.center)
 
         # 计时
         $sec = [int]$script:vis.seconds
         $ts = ('{0:00}:{1:00}' -f [int]($sec / 60), ($sec % 60))
-        $tf = New-Object System.Drawing.Font('Consolas', 9)
-        $tb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(96, 110, 130))
-        $g.DrawString($ts, $tf, $tb,
-            (New-Object System.Drawing.RectangleF(0, [single]($cy + $baseR + 46), [single]$CW, 20)), $sf)
-        $tb.Dispose(); $tf.Dispose(); $sf.Dispose()
+        $g.DrawString($ts, $script:oFont.timer, $script:oBrush.timer,
+            (New-Object System.Drawing.RectangleF(0, [single]($CY + $BASE_R + 46), [single]$STAGE_W, 20)),
+            $script:oFmt.center)
 
         # 电平条（圆头）
         $n = 13; $barW = 3.0; $gap = 6.0
         $tot = $n * $barW + ($n - 1) * $gap
-        $x0 = ($CW - $tot) / 2
-        $by = $cy + $baseR + 80
+        $x0 = ($STAGE_W - $tot) / 2
+        $by = $CY + $BASE_R + 80
         $lvl = [double]$script:vis.level
         if ($st -eq 'speaking') { $lvl = 0.34 + 0.42 * $beat }
-        $pen = New-Object System.Drawing.Pen($accent, [single]$barW)
-        $pen.StartCap = 'Round'
-        $pen.EndCap = 'Round'
-        $dim = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(48, 96, 140), [single]$barW)
-        $dim.StartCap = 'Round'
-        $dim.EndCap = 'Round'
+        $pen = Get-LevelPen $st
         for ($i = 0; $i -lt $n; $i++) {
             $dd = [math]::Abs($i - ($n - 1) / 2) / (($n - 1) / 2)
             $hh = [math]::Max(2.0, [math]::Min(18.0, $lvl * 46 * (1 - $dd * 0.62)))
             $xx = [single]($x0 + $i * ($barW + $gap) + $barW / 2)
-            $use = if ($hh -gt 7) { $pen } else { $dim }
+            $use = if ($hh -gt 7) { $pen } else { $script:oPen.lvlDim }
             $g.DrawLine($use, $xx, [single]($by - $hh / 2), $xx, [single]($by + $hh / 2))
         }
-        $pen.Dispose(); $dim.Dispose()
     } catch { Trace-Paint 'stage' $_.Exception }
 })
 
@@ -401,19 +524,12 @@ $trans.Add_Paint({
         $g = $e.Graphics
         $g.SmoothingMode = 'AntiAlias'
         $g.TextRenderingHint = 'ClearTypeGridFit'
-        $TW = $trans.Width
-        $TH = $trans.Height
-        $bg = Get-BgBrush $TW $TH
-        $g.FillRectangle($bg, 0, 0, $TW, $TH)
-        $bg.Dispose()
+        $g.FillRectangle($script:oBrush.transBg, 0, 0, $TRANS_W, $TRANS_H)
 
-        $bfont = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
-        $fmt = New-Object System.Drawing.StringFormat
         # ⚠ 别设 FormatFlags = WordBreak —— StringFormatFlags 里**没有**这个成员，
         #   设了会抛「枚举值无效」，整块画不出来，变成白底红叉。给矩形宽度它自己会折行。
-        $fmt.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
         $padX = 11.0; $padY = 7.0
-        $maxW = $TW - 96.0
+        $maxW = $TRANS_W - 96.0
         $yy = 8.0
 
         $heard = "$($script:vis.heard)"
@@ -421,51 +537,37 @@ $trans.Add_Paint({
 
         # 你（靠右、暗一点）
         if ($heard) {
-            $sz = $g.MeasureString($heard, $bfont, ([int]$maxW), $fmt)
+            $sz = Measure-Cached $g 'h' $heard
             $boxW = [single][math]::Min($maxW, $sz.Width + $padX * 2)
             $boxH = [single][math]::Min(46.0, $sz.Height + $padY * 2)
-            $boxX = [single]($TW - 22 - $boxW)
+            $boxX = [single]($TRANS_W - 22 - $boxW)
             $p1 = New-RoundPath $boxX $yy $boxW $boxH 10
-            $br1 = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, 42, 58))
-            $g.FillPath($br1, $p1); $br1.Dispose()
-            $tb1 = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(148, 162, 182))
-            $g.DrawString($heard, $bfont, $tb1,
+            $g.FillPath($script:oBrush.heardBg, $p1)
+            $g.DrawString($heard, $script:oFont.bubble, $script:oBrush.heardTxt,
                 (New-Object System.Drawing.RectangleF([single]($boxX + $padX), [single]($yy + $padY),
-                    [single]($boxW - $padX * 2), [single]($boxH - $padY * 2))), $fmt)
-            $tb1.Dispose(); $p1.Dispose()
+                    [single]($boxW - $padX * 2), [single]($boxH - $padY * 2))), $script:oFmt.bubble)
+            $p1.Dispose()
             $yy += $boxH + 8
         }
 
         # 汐（靠左、蓝一点；正在说的时候描个边）
         if ($reply) {
-            $sz2 = $g.MeasureString($reply, $bfont, ([int]$maxW), $fmt)
+            $sz2 = Measure-Cached $g 'r' $reply
             $boxW2 = [single][math]::Min($maxW, $sz2.Width + $padX * 2)
             $boxH2 = [single][math]::Min(58.0, $sz2.Height + $padY * 2)
             $p2 = New-RoundPath 22 $yy $boxW2 $boxH2 10
-            $br2 = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(26, 52, 82))
-            $g.FillPath($br2, $p2); $br2.Dispose()
-            if ($script:vis.state -eq 'speaking') {
-                $pen2 = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(120, 95, 182, 255), [single]1.2)
-                $g.DrawPath($pen2, $p2); $pen2.Dispose()
-            }
-            $tb2 = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(226, 238, 250))
-            $g.DrawString($reply, $bfont, $tb2,
+            $g.FillPath($script:oBrush.replyBg, $p2)
+            if ($script:vis.state -eq 'speaking') { $g.DrawPath($script:oPen.replyEdge, $p2) }
+            $g.DrawString($reply, $script:oFont.bubble, $script:oBrush.replyTxt,
                 (New-Object System.Drawing.RectangleF([single]($padX + 22), [single]($yy + $padY),
-                    [single]($boxW2 - $padX * 2), [single]($boxH2 - $padY * 2))), $fmt)
-            $tb2.Dispose(); $p2.Dispose()
+                    [single]($boxW2 - $padX * 2), [single]($boxH2 - $padY * 2))), $script:oFmt.bubble)
+            $p2.Dispose()
         }
 
         if (-not $heard -and -not $reply) {
-            $hintF = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
-            $hintB = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(74, 86, 104))
-            $sf2 = New-Object System.Drawing.StringFormat
-            $sf2.Alignment = 'Center'
-            $g.DrawString('说话就行，她能听见', $hintF, $hintB,
-                (New-Object System.Drawing.RectangleF(0, 54, [single]$TW, 24)), $sf2)
-            $hintB.Dispose(); $hintF.Dispose(); $sf2.Dispose()
+            $g.DrawString('说话就行，她能听见', $script:oFont.hint, $script:oBrush.hint,
+                (New-Object System.Drawing.RectangleF(0, 54, [single]$TRANS_W, 24)), $script:oFmt.center)
         }
-
-        $bfont.Dispose(); $fmt.Dispose()
     } catch { Trace-Paint 'trans' $_.Exception }
 })
 
@@ -487,30 +589,24 @@ $btn.Add_Paint({
         $g = $e.Graphics
         $g.SmoothingMode = 'AntiAlias'
         $g.TextRenderingHint = 'ClearTypeGridFit'
-        $BW = $btn.Width
-        $BH = $btn.Height
         $dead = ("$($script:vis.state)" -eq 'idle') -or (-not $script:vis.alive)
         if ($dead) {
-            $db = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, 42, 56))
-            $g.FillRectangle($db, 0, 0, $BW, $BH)
-            $db.Dispose()
+            $g.FillRectangle($script:oBrush.btnDead, 0, 0, $BTW, $BTH)
         } else {
-            $rr = New-Object System.Drawing.Rectangle 0, 0, $BW, $BH
-            $topC = if ($script:hover) { [System.Drawing.Color]::FromArgb(232, 104, 104) } else { [System.Drawing.Color]::FromArgb(212, 84, 84) }
-            $botC = if ($script:hover) { [System.Drawing.Color]::FromArgb(190, 62, 62) } else { [System.Drawing.Color]::FromArgb(164, 52, 52) }
-            $br = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-                $rr, $topC, $botC, [System.Drawing.Drawing2D.LinearGradientMode]::Vertical)
-            $g.FillRectangle($br, 0, 0, $BW, $BH)
-            $br.Dispose()
+            # 渐变刷子按「悬停 / 不悬停」各造一次，挂进 $script:oBrush 里（这个键只在这儿用）
+            $k = if ($script:hover) { 'btnHover' } else { 'btnNormal' }
+            if (-not $script:oBrush.ContainsKey($k)) {
+                $rr = New-Object System.Drawing.Rectangle 0, 0, $BTW, $BTH
+                $topC = if ($script:hover) { [System.Drawing.Color]::FromArgb(232, 104, 104) } else { [System.Drawing.Color]::FromArgb(212, 84, 84) }
+                $botC = if ($script:hover) { [System.Drawing.Color]::FromArgb(190, 62, 62) } else { [System.Drawing.Color]::FromArgb(164, 52, 52) }
+                $script:oBrush[$k] = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+                    $rr, $topC, $botC, [System.Drawing.Drawing2D.LinearGradientMode]::Vertical)
+            }
+            $g.FillRectangle($script:oBrush[$k], 0, 0, $BTW, $BTH)
         }
         $txt = if ($dead) { '关闭' } else { '挂 断' }
-        $fnt = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5, [System.Drawing.FontStyle]::Bold)
-        $wb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 244, 244))
-        $sf = New-Object System.Drawing.StringFormat
-        $sf.Alignment = 'Center'
-        $sf.LineAlignment = 'Center'
-        $g.DrawString($txt, $fnt, $wb, (New-Object System.Drawing.RectangleF(0, 0, [single]$BW, [single]$BH)), $sf)
-        $wb.Dispose(); $fnt.Dispose(); $sf.Dispose()
+        $g.DrawString($txt, $script:oFont.btn, $script:oBrush.btnTxt,
+            (New-Object System.Drawing.RectangleF(0, 0, [single]$BTW, [single]$BTH)), $script:oFmt.center)
     } catch { Trace-Paint 'btn' $_.Exception }
 })
 $btn.Add_MouseEnter({ $script:hover = $true; $btn.Invalidate() })
@@ -537,6 +633,16 @@ foreach ($c in @($f, $title, $stage, $trans)) {
 }
 
 # ---------------------------------------------------------------- 时钟
+# ★ 2026-10-26 20:2x 这条也跟着改了。原来每次 Tick 都做两件白烧的事：
+#   ① `Get-Content` + `ConvertFrom-Json` **每 120ms 解析一遍**（文件其实 100ms 才写一次，
+#      而且大部分时候内容片段根本没变）⇒ 改成**看 mtime，变了才读**；
+#   ② 三个控件**每 120ms 全部 Invalidate**，哪怕状态一个字都没变
+#      ⇒ 改成：文字变了才重画气泡和按钮；动画（听/想/说）才重画舞台；
+#      已挂断 / 没接通的时候一帧都不画（那时候窗口本来就快关了）。
+$script:jsonMt = $null
+$script:sigT = ''
+$script:sigS = ''
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 120
 $timer.add_Tick({
@@ -544,8 +650,12 @@ $timer.add_Tick({
     $st = $null
     try {
         if (Test-Path $json) {
-            $raw = Get-Content -Path $json -Raw -Encoding UTF8 -ErrorAction Stop
-            if ($raw.Trim()) { $st = $raw | ConvertFrom-Json }
+            $mt = [System.IO.File]::GetLastWriteTimeUtc($json)
+            if ($mt -ne $script:jsonMt) {
+                $script:jsonMt = $mt
+                $raw = [System.IO.File]::ReadAllText($json, [System.Text.Encoding]::UTF8)
+                if ($raw.Trim()) { $st = $raw | ConvertFrom-Json }
+            }
         }
     } catch { }
 
@@ -566,9 +676,25 @@ $timer.add_Tick({
         $script:vis.state = 'idle'
     }
 
-    $stage.Invalidate()
-    $trans.Invalidate()
-    $btn.Invalidate()
+    # ---- 按需重画
+    $v = $script:vis
+    $stx = "$($v.state)"
+
+    $sigT = "$stx|$($v.heard)|$($v.reply)"
+    if ($sigT -ne $script:sigT) {
+        $script:sigT = $sigT
+        $trans.Invalidate()
+        $btn.Invalidate()
+    }
+
+    $sigS = "$stx|$([int]$v.seconds)"
+    if ($sigS -ne $script:sigS) {
+        $script:sigS = $sigS
+        $stage.Invalidate()
+    }
+
+    # 光环 / 电平要动的时候才每帧重画；挂着不动的时候不烧那一份
+    if ($stx -ne 'idle' -and $stx -ne 'failed') { $stage.Invalidate() }
 })
 
 # ---------------------------------------------------------------- 事件

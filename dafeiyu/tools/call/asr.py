@@ -204,8 +204,136 @@ class AsrEngine:
         return self._explain
 
 
+# ---------------------------------------------------------------- 常驻服务（她的耳朵）
+#
+# ★ 2026-10-26 19:3x 他说的：「没有办法让这些资源在5080上运行吗，它完全是空闲的啊」。
+#   量出来：5080 只用了 2597 / 16303 MiB —— 卡是空的。所以不该省显存，
+#   该省的是 **「每通电话重新往卡上装一次模型」**：ASR 加载+warmup 实测 2.62s，
+#   装上去以后本该一直待着。于是耳朵也做成常驻进程（asr_server.py），
+#   通话进程只跟 127.0.0.1:9890 要文字；服务不在就自己拉起来；拉不起来就在本进程加载（老行为）。
+ASR_DEFAULT_PORT = 9890
+ASR_PY = os.environ.get("ASR_PYTHON") or sys.executable
+ASR_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asr_server.py")
+ASR_LOG = os.environ.get("ASR_LOG") or os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "state", "call", "asr-server.log"))
+
+
+def _asr_cfg() -> dict:
+    try:
+        import config as cfgmod
+        return cfgmod.load().get("asr") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def asr_base() -> str:
+    c = _asr_cfg()
+    host = c.get("host") or "127.0.0.1"
+    port = int(c.get("port") or ASR_DEFAULT_PORT)
+    return f"http://{host}:{port}"
+
+
+def asr_health(timeout: float = 1.5) -> dict | None:
+    """没起服务 → None（不抛，调用方靠它判断可用性）。"""
+    import json as _json
+    import urllib.request as _uq
+    try:
+        with _uq.urlopen(asr_base() + "/health", timeout=timeout) as r:
+            return _json.loads(r.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def ensure_asr(timeout: float = 90.0, autostart: bool = True) -> bool:
+    """确保常驻耳朵在跑。返回 True = 可以走远程。"""
+    h = asr_health()
+    if h and h.get("ok"):
+        return True
+    if not autostart or not os.path.exists(ASR_SCRIPT):
+        return False
+    import subprocess
+    c = _asr_cfg()
+    os.makedirs(os.path.dirname(os.path.normpath(ASR_LOG)), exist_ok=True)
+    cmd = [ASR_PY, ASR_SCRIPT, "--port", str(int(c.get("port") or ASR_DEFAULT_PORT)),
+           "--model", str(c.get("model") or "small")]
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        with open(ASR_LOG, "a", encoding="utf-8") as logf:
+            logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} 拉起 asr =====\n")
+            logf.flush()
+            subprocess.Popen(cmd, cwd=os.path.dirname(os.path.abspath(__file__)),
+                             stdout=logf, stderr=subprocess.STDOUT, creationflags=flags)
+    except Exception:  # noqa: BLE001
+        return False
+    end = time.time() + timeout
+    while time.time() < end:
+        h = asr_health(timeout=2.0)
+        if h and h.get("ok"):
+            return True
+        if h and h.get("err"):
+            return False
+        time.sleep(0.5)
+    return False
+
+
+class AsrRemote:
+    """跟本进程里的 AsrEngine 同一个形状（transcribe / last_ms / describe）。"""
+
+    def __init__(self):
+        self.last_ms = 0.0
+        self._explain = "远程（常驻耳朵）"
+        h = asr_health() or {}
+        dev = h.get("device") or "?"
+        cmp_ = h.get("compute") or "?"
+        self._explain = (f"常驻服务 {asr_base()} · {dev}/{cmp_} · "
+                         f"加载一次后一直待着（{h.get('load_ms')}ms）")
+
+    def warmup(self):
+        pass
+
+    def transcribe(self, audio, vad: bool = False, beam_size: int = 1) -> str:
+        import json as _json
+        import urllib.error as _ue
+        import urllib.request as _uq
+        import numpy as _np
+        a = _np.asarray(audio, dtype="float32").ravel()
+        pcm = (_np.clip(a, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+        req = _uq.Request(asr_base() + "/asr", data=pcm, method="POST",
+                          headers={"Content-Type": "application/octet-stream"})
+        t0 = time.time()
+        try:
+            with _uq.urlopen(req, timeout=120) as r:
+                j = _json.loads(r.read().decode("utf-8"))
+        except _ue.URLError as e:
+            raise RuntimeError(f"常驻耳朵连不上（{asr_base()}）：{e}") from e
+        if not j.get("ok"):
+            raise RuntimeError(f"常驻耳朵出错：{j.get('err')}")
+        self.last_ms = float(j.get("ms") or (time.time() - t0) * 1000.0)
+        return j.get("text") or ""
+
+    def describe(self) -> str:
+        return self._explain
+
+
+def make_asr(model: str = "small", device: str | None = None,
+             compute: str | None = None, prefer_remote: bool = True):
+    """通话进程该调这个：先问常驻耳朵，不行就在本进程里加载。
+
+    两条路返回的对象形状一样，engine.py / loop.py 不用改。
+    """
+    if prefer_remote:
+        h = asr_health()
+        if not (h and h.get("ok")):
+            ensure_asr(autostart=True, timeout=90.0)
+            h = asr_health()
+        if h and h.get("ok"):
+            return AsrRemote()
+        print("[ASR] 常驻耳朵起不来，改在本进程加载（老行为）", flush=True)
+    return AsrEngine(model=model, device=device, compute=compute)
+
+
 if __name__ == "__main__":
     print("nvidia dll dirs:", _CUDA_DIRS or "(没有)")
     print("zhconv:", "有" if _zh_convert else "没有（用内置兜底表）")
-    eng = AsrEngine()
+    eng = make_asr()
     print(eng.describe())
