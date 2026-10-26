@@ -205,3 +205,23 @@ $s.Save()
 
 **做法**：`plan --out <workDir>/shotlist.json`（文件路径，或干脆不给 `--out`，它默认写到 timeline 旁边）；
 报告再 `report timeline.json shotlist.json --out report.md`。
+
+## 15. 通话「卡顿」：先分清是合成慢、还是播放断（2026-10-26）
+
+现象：打电话时她的声音一顿一顿（偶尔还带一声「啪」），可 QQ 单发的语音却没事。
+
+分三层量，别猜：
+1. **合成出来的波形有没有洞** —— 直接拉 `/tts` 的裸 PCM，扫内部静音段（10ms 窗口、RMS<0.01）。
+   实测模型自己在标点处会停 **0.35~0.88 秒**，那是最像「卡」的东西。
+   `engine.squeeze_silence()` 只在静音段上压短（80ms，句号 160ms），有声的样点一个都不碰。
+2. **播放端会不会断** —— 拿一段已经拿到手的音频跑真 `SpeakerSink`，另一个线程每 2ms 读一次
+   `IAudioClient::GetCurrentPadding`；归零就是声卡没东西可放。32k / 44.1k / 48k × 47ms / 120ms 缓冲
+   实测**中途 0 次**归零 ⇒ 播放这一侧是干净的。
+3. **音频是不是「还在路上」** —— 合成一秒的话要 0.65~1.2 秒，**边合成边播必然在那儿断**
+   （`petcall.jsonl` 里的 `starved` 就是这一下）。所以现在是**整段收齐再播**，跟 QQ 发语音同一个形状；
+   代价是开口晚 1~2 秒。
+
+**做法**：`tts.stream_sovits` 发 `stream=0&batch=1`（服务端整段一次 `run`：cut2 + batch_size 4 +
+parallel_infer + fragment_interval 0.07），engine 收齐 → `squeeze_silence` → 一次性 push 给 sink。
+⚠️ **别改回「拿到一块就 sink 一块」** —— 那不是优化，那正是卡顿本身。
+⚠️ 用 loopback 录音去数「咔哒」会骗人：录音自己在静音之后会插一个假尖峰，每次都出现在同一处。
