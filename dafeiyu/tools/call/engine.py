@@ -270,6 +270,43 @@ class JitterPlayer:
             self.played += len(piece)
 
 
+def squeeze_silence(x: np.ndarray, rate: int, floor: float = 0.012,
+                    min_ms: int = 180) -> np.ndarray:
+    """把句子中间那些「白」压短。
+
+    ★ 2026-10-26 21:4x：整段交给模型之后（并行、快），它自己会在标点处停
+      350~880ms —— 那正是他说的「卡」。这截白在音频里是**静音**，所以处理起来
+      最安全：只在静音段上动刀，不动任何有声的样点（不会引入咔哒）。
+      ≥400ms 的留 160ms（像句号），其余留 80ms（像换气）。
+    """
+    w = max(1, int(0.01 * rate))
+    n = len(x) // w
+    if n < 5:
+        return x
+    env = np.sqrt(np.mean(x[:n * w].reshape(n, w) ** 2, axis=1))
+    peak = float(np.max(env)) or 1.0
+    quiet = env < max(floor, peak * 0.02)
+    out: list[np.ndarray] = []
+    last = 0
+    i = 0
+    while i < n:
+        if not quiet[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and quiet[j]:
+            j += 1
+        dur_ms = (j - i) * 10
+        if dur_ms >= min_ms:
+            keep = 160 if dur_ms >= 400 else 80
+            out.append(x[last:i * w])
+            out.append(np.zeros(max(1, int(keep / 1000.0 * rate)), dtype="float32"))
+            last = j * w
+        i = j
+    out.append(x[last:])
+    return np.concatenate(out)
+
+
 # ---------------------------------------------------------------- 引擎
 
 class CallEngine:
@@ -583,11 +620,14 @@ class CallEngine:
             pass
         collect_ms = (time.time() - t_collect) * 1000
         # 整句已在手 ⇒ 垫子只要一小截（留 120ms 给线程调度，不再是「等音频」）
+        audio = (np.concatenate(chunks) if chunks else np.zeros(0, dtype="float32"))
+        before_s = len(audio) / max(1, tts_rate)
+        audio = squeeze_silence(audio, tts_rate)
+        squeezed_ms = (before_s - len(audio) / max(1, tts_rate)) * 1000
         self.emit("say_start", rate=tts_rate)
         player = JitterPlayer(self.sink, tts_rate, cushion=0.12, t0=t_tts).start()
         try:
-            for a in chunks:
-                player.push(a)
+            player.push(audio)
             player.finish()
             while not player.wait(0.05):
                 if self._abort.is_set() or self._stop.is_set():

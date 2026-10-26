@@ -495,7 +495,7 @@ def stream_sovits(text: str, speed: float | None = None, stats: dict | None = No
     #       120ms 的留白（那是服务端故意留的，像人换气）。
     #   ⇒ 通话这条路要的是**连续**，不是「早几十毫秒开口」。
     url = (f"{sovits_base()}/tts?text={urllib.parse.quote(text)}"
-           f"&speed={speed:.2f}&stream=0")
+           f"&speed={speed:.2f}&stream=0&batch=1")
     t0 = time.time()
     first = None
     total = 0

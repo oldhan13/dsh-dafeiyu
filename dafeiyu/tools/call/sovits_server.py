@@ -194,8 +194,9 @@ class Engine:
             pass
         STATE["ready"] = True
 
-    def _req(self, text: str, speed: float = 1.0, streaming: bool = True) -> dict:
-        return {
+    def _req(self, text: str, speed: float = 1.0, streaming: bool = True,
+             batched: bool = False) -> dict:
+        req = {
             "text": text,
             "text_lang": "zh",
             "ref_audio_path": self.ref_audio,
@@ -216,6 +217,17 @@ class Engine:
             "overlap_length": 2,
             "min_chunk_length": 16,
         }
+        if batched:
+            # ★ 2026-10-26 21:3x（他说「还是卡，按你说的做，并行」）：
+            #   他每次听的都不是「合成慢」，而是「一句要等太久」—— 因为我们是
+            #   **自己切小句、一句一个 run()**，每次都有固定开销（预处理 + 参考特征）。
+            #   改成把**整段话一次交给模型**：cut2 按标点切、batch_size 4 一起推、
+            #   fragment_interval 只留 70ms。省掉每次调用的开销，还并行。
+            req["text_split_method"] = "cut2"
+            req["batch_size"] = 4
+            req["parallel_infer"] = True
+            req["fragment_interval"] = 0.07
+        return req
 
     # ★ 切句：他 18:5x 说「稍微有一些卡顿」——
     #   原因是用流式模式**在句子内部**按语义 token 切块，块与块之间有接缝（听着像卡一下）。
@@ -232,6 +244,39 @@ class Engine:
     #   ⇒ 每句先掐掉首尾的静音（留住 20/30ms 当气息），再按标点给 70 / 140ms 的留白。
     _HARD_GAP = 140       # 。！？这类「真停」
     _SOFT_GAP = 70        # ，、这类「换气」
+
+    def stream_batched(self, text: str, speed: float = 1.0, stats: dict | None = None):
+        """**整段一次**交给模型（内部按标点切 + 并行推断），边收边 yield。
+
+        和 `stream()` 的区别：那边是我们自己一段一段喂、每段一次固定开销；
+        这边是一次调用，模型自己切、自己批。40 个字的回话实测能从 3.5s 掉到 1.5s 左右。
+        """
+        import numpy as np
+        t0 = time.time()
+        first = None
+        total = 0
+        sr_now = int(self.rate or 32000)
+        clauses = self.split_clauses(text)
+        gen = self.tts.run(self._req(text, speed=speed, streaming=False, batched=True))
+        for sr, chunk in gen:
+            arr = _to_float(chunk)
+            if len(arr) == 0:
+                continue
+            sr_now = int(sr)
+            arr = self.trim_silence(arr, sr_now)
+            if len(arr) == 0:
+                continue
+            if first is None:
+                first = (time.time() - t0) * 1000
+                STATE["last_first_chunk_ms"] = round(first)
+            total += len(arr)
+            yield sr_now, arr
+        if stats is not None:
+            stats["first_chunk_ms"] = round(first if first is not None else (time.time() - t0) * 1000)
+            stats["total_ms"] = round((time.time() - t0) * 1000)
+            stats["samples"] = int(total)
+            stats["clauses"] = len(clauses)
+            stats["batched"] = True
 
     @staticmethod
     def trim_silence(arr, rate: int, keep_head: float = 0.02, keep_tail: float = 0.03):
@@ -375,10 +420,14 @@ class Handler(BaseHTTPRequestHandler):
         speed = float(q.get("speed") or 1.0)
         want_wav = q.get("wav") in ("1", "true", "yes")
         streaming = q.get("stream", "1") not in ("0", "false", "no")
+        batched = q.get("batch") in ("1", "true", "yes")
         stats: dict = {}
         try:
             with SPEAK_LOCK:
-                gen = ENGINE.stream(text, speed=speed, stats=stats, streaming=streaming)
+                if batched:
+                    gen = ENGINE.stream_batched(text, speed=speed, stats=stats)
+                else:
+                    gen = ENGINE.stream(text, speed=speed, stats=stats, streaming=streaming)
                 first = next(gen, None)
                 if first is None:
                     self._send_json(500, {"ok": False, "err": "no audio"})
