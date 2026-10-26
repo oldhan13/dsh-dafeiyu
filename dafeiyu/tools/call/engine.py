@@ -154,11 +154,13 @@ class JitterPlayer:
     """
 
     def __init__(self, sink, rate: int, cushion: float = 0.35,
-                 t0: float | None = None, min_piece: float = 0.08):
+                 t0: float | None = None, min_piece: float = 0.08,
+                 fade: float = 0.005):
         self.sink = sink
         self.rate = max(1, int(rate))
         self.cushion = float(cushion)
         self.min_piece = float(min_piece)
+        self.fade = float(fade)          # 接缝淡入淡出的长度（秒）
         self._buf: list[np.ndarray] = []
         self._n = 0
         self._done = False
@@ -167,6 +169,7 @@ class JitterPlayer:
         self._thread = None
         self._t0 = t0 if t0 is not None else time.time()
         self.starved = False        # 这一句有没有饿过
+        self.fades = 0              # 做了几次淡入淡出（听感排查用）
         self.played = 0             # 真正交给 sink 的采样数
         self.first_at = None        # 第一次出声的时刻（相对 t0，秒）
 
@@ -208,8 +211,10 @@ class JitterPlayer:
     def _run(self) -> None:
         need = int(self.cushion * self.rate)
         min_n = max(1, int(self.min_piece * self.rate))
+        fade_n = max(1, int(self.fade * self.rate))
         started = False
         starving = False
+        resume = True                       # 第一块也淡入：从静音里开口不该是一步跳上去
         while True:
             with self._cv:
                 if not started:
@@ -222,6 +227,13 @@ class JitterPlayer:
                         starving = True
                         self.starved = True
                     self._cv.wait(0.02)
+                if starving:
+                    # 缓冲饿空过 ⇒ 声音是从静音里突然接上的。
+                    # ★ 2026-10-26 20:5x 他报「播放时有爆破声/电流声」，量的就是这个：
+                    #   模拟合成端停顿 0.7s，用真扬声器录回来，接缝处有一步 **0.32** 的跳变
+                    #   （纯音自己每步只有 0.01）—— 一步跳变就是一声「啪」。
+                    #   所以断过之后的第一块淡入，说完的最后一块淡出，把台阶换成斜坡。
+                    resume = True
                 starving = False
                 if self._abort:
                     return
@@ -235,7 +247,18 @@ class JitterPlayer:
                     take.append(a)
                     got += len(a)
                 self._n -= got
+                last = self._done and not self._buf
             piece = take[0] if len(take) == 1 else np.concatenate(take)
+            if len(piece) > fade_n * 2:
+                if resume:
+                    piece = piece.copy()
+                    piece[:fade_n] *= np.linspace(0.0, 1.0, fade_n, dtype="float32")
+                    resume = False
+                    self.fades += 1
+                if last:
+                    piece = piece.copy()
+                    piece[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype="float32")
+                    self.fades += 1
             if self.first_at is None:
                 self.first_at = time.time() - self._t0
             if self.sink is not None:
@@ -536,6 +559,14 @@ class CallEngine:
                 # 生成到一半断了（sovits 掉线 / 网络抖）——**别把她说到一半的话掐掉**，
                 # 把已经攒下的放完，再记一笔。
                 log(f"[TTS] 生成中断（{type(e).__name__}: {e}），已收到的照常说完")
+            # ★ 2026-10-26 20:5x：打断时只是 break 出循环，生成器要等这一轮结束才被
+            #   回收 —— 那段时间服务端还在为一个没人听的请求合成，而它的 SPEAK_LOCK
+            #   是全局的，下一句得排队（实测多等 456ms，通话里就是「该说话了还没声」）。
+            #   显式关掉连接，服务端立刻收手。
+            try:
+                it.close()
+            except Exception:  # noqa: BLE001
+                pass
             player.finish()
             while not player.wait(0.05):
                 if self._abort.is_set() or self._stop.is_set():
@@ -568,6 +599,7 @@ class CallEngine:
             # 听感的两条现场证据：这一句播放有没有饿过、当时的垫子多厚
             "starved": bool(player.starved),
             "cushion_s": round(self._cushion, 2),
+            "fades": int(player.fades),
         })
         self.turns.append(turn)
         if self.verbose:
@@ -643,7 +675,8 @@ class SpeakerSink:
       （打断靠的就是这一点）。
     """
 
-    def __init__(self, device_hint: str | None = None, replace_rate: int | None = None):
+    def __init__(self, device_hint: str | None = None, replace_rate: int | None = None,
+                 buffer_s: float = 0.12):
         import soundcard as sc
         if device_hint:
             hint = device_hint.lower()
@@ -653,6 +686,12 @@ class SpeakerSink:
         else:
             self.spk = sc.default_speaker()
         self.replace_rate = replace_rate
+        # ★ 2026-10-26 20:5x：soundcard 默认的 blocksize 是「一个设备周期」
+        #   （这台机器上 ≈10ms）。10ms 的声卡缓冲意味着**只要 Python 这一侧被
+        #   卡住 10ms 以上，声卡那头就空了** —— 而通话时同进程里还有 whisper、
+        #   还有 GDI+ 的重画、还有 GIL 抢。空一下再续上，接缝就是一声「啪」。
+        #   缓存给到 120ms 是纯保险：正常时它只是躺着，出问题时顶住。
+        self.buffer_s = float(buffer_s or 0.0)
         self._rate = None
         self._player = None
         self.first_audio_ms = None
@@ -666,7 +705,15 @@ class SpeakerSink:
                     self._player.__exit__(None, None, None)
                 except Exception:  # noqa: BLE001
                     pass
-            self._player = self.spk.player(samplerate=use, channels=1)
+            self._player = None
+            block = int(self.buffer_s * use) if self.buffer_s > 0 else None
+            try:
+                self._player = (self.spk.player(samplerate=use, channels=1, blocksize=block)
+                                if block else self.spk.player(samplerate=use, channels=1))
+            except Exception as e:  # noqa: BLE001
+                # 有的驱动不接受自定义缓冲长度 —— 退回默认，别让一声都出不来
+                log(f"[嘴] 缓冲 {self.buffer_s:.2f}s 没被接受（{type(e).__name__}），用默认")
+                self._player = self.spk.player(samplerate=use, channels=1)
             self._rate = use
             self._player.__enter__()
         a = np.asarray(chunk, dtype="float32")
