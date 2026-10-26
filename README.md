@@ -339,6 +339,36 @@ python -m pip install -U yt-dlp
 `--asr` 第一次跑会下 faster-whisper 的 `small` 模型（约 460MB，走 `HF_ENDPOINT` 镜像）；
 之后是纯本地推理。机器的 pip 默认源若是卡住的，加 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
 
+## 打个电话（可选：要装 Python 依赖）
+
+桌宠和网页都能跟她通话：**你说话它听、它回话，中间能打断它**。
+
+| 入口 | 怎么开 | 声音怎么走 |
+|---|---|---|
+| 桌宠通话窗 | `dafeiyu\pet\call.cmd` | 本机麦克风 → 本机扬声器 |
+| 网页通话 | `python dafeiyu\tools\call\webcall.py`，手机/电脑浏览器打开它打印的地址 | 浏览器麦克风 ⇄ WebSocket ⇄ 本机 |
+
+两条入口共用同一层引擎（`dafeiyu/tools/call/engine.py`），链路是一条：
+
+```
+麦克风 ──► VAD 切句 ──► 语音转写 ──► 模型 ──► 流式 TTS ──► 播放
+                          ▲                      │
+                          └──── 打断（barge-in）◄─┘
+```
+
+- **依赖**：`pip install -r dafeiyu\tools\call\requirements.txt`（Python 3.10+）。
+  转写用 faster-whisper，有 CUDA 就自动用 GPU；模型第一次用时自己下，落在 `dafeiyu\state\` 下面。
+- **音色三选一**（写 `dafeiyu\state\call\config.json`，或 `python dafeiyu\tools\call\config.py cloud`，
+  通话窗顶栏点一下也能切）：
+  · `piper` —— 本地 ONNX，**免费、离线、0 显存**，音色偏播报腔（默认）
+  · `cloud` —— 硅基流动 CosyVoice2，**明显更自然**，按量计费，开口多约 1 秒
+  · `openai` —— `gpt-4o-mini-tts`，最自然、还能给语气指令；**未实测（本机没有 key）**，要 key + 代理
+- **key 放哪**：`~\.dsh\siliconflow-key.txt` / `~\.dsh\deepseek-key.txt` / `~\.dsh\openai-key.txt`，
+  也可以用同名环境变量。**别把 key 写进仓库**。
+- **实测**（这台机器，CUDA + whisper small + piper）：你停下说话到听见第一声 **≈2.3 秒**
+  （VAD 0.9s + 转写 + 想 + TTS 首块）；一次通话的预热 ≈6 秒（ASR 与 piper 各一次，只付一回）。
+- 想让第一声更快：换更小的 whisper 模型、或把 TTS 留在本地（云端首字节多约 1.3 秒）。
+
 ## 可选：拓展模块
 
 上面那些是本体。另外四样要么吃显存、要么要账号、要么要额外的额度 —— 所以不进主流程，单独一页：

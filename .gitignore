@@ -54,3 +54,7 @@ LEDGER.md.bak-*
 dafeiyu/state/
 dafeiyu/desk/agent-overlay.yml
 dafeiyu/desk/token.txt
+
+# Python（通话那套）
+__pycache__/
+*.pyc

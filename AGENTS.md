@@ -409,6 +409,13 @@ ledger_log({ view: "users", limit: 15 })
      结果它跟 `$script:act`（状态字符串）**是同一个变量**，`Test-Path $ACT` 变成 `Test-Path 'idle'`，
      于是活动状态永远读不到、鱼一直当自己在待机。改成 `$ACTFILE` 才对。
      **PowerShell 变量名不分大小写，起名时先想想有没有同名近亲。**
+- 📞 **通话窗（2026-10-26 加）**：`dafeiyu\pet\call.cmd` 打开一个圆角通话窗；
+  声音全在 `dafeiyu\tools\call\petcall.py`（默认麦克风 → 默认扬声器），窗口只做三件事：
+  起/收那个 python 进程、每 120ms 读 `dafeiyu\state\call\petcall.json` 画状态、写一行让 python 收尾。
+  音色在 `dafeiyu\state\call\config.json` 切（`piper` 免费 / `cloud` 硅基 CosyVoice2 / `openai` 未实测）。
+  网页通话：`python dafeiyu\tools\call\webcall.py`（自签 TLS + WSS，手机浏览器连进来）。
+  ⚠️ 改这两个文件之前，先看文件头写着的三个坑：PowerShell 变量名不分大小写（`$W/$H` 别乱起）、
+  `powershell -WindowStyle Hidden` 会把**第一个窗体**一起藏掉、`StringFormatFlags` 里没有 `WordBreak`。
 - 双击你打开的是**你的会话**（网页 3080 那套），不是另一个机器人：那儿说的话和 QQ 上是同一个你。
 
 ## 十四、你能动这台电脑（2026-10-20 凌晨 · 新增按名字点）

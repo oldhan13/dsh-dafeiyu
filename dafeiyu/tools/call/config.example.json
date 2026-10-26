@@ -1,0 +1,29 @@
+{
+  "tts": {
+    "backend": "piper",
+    "piper": {
+      "length_scale": 1.1,
+      "noise_scale": 0.72,
+      "noise_w_scale": 0.9
+    },
+    "cloud": {
+      "voice": "FunAudioLLM/CosyVoice2-0.5B:anna",
+      "speed": 1.0
+    },
+    "openai": {
+      "model": "gpt-4o-mini-tts",
+      "voice": "nova",
+      "base_url": "https://api.openai.com/v1",
+      "instructions": ""
+    }
+  },
+  "asr": {
+    "model": "small",
+    "device": null,
+    "compute": null
+  },
+  "call": {
+    "silence_end": 0.9,
+    "max_reply_chars": 25
+  }
+}
