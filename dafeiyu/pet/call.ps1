@@ -309,6 +309,40 @@ function Get-LevelPen([string]$st) {
     return $pen
 }
 
+# ★ 2026-10-26 21:4x（他说「语音时的动画太卡」）：
+#   光环原来是**每帧** 14 次 FillEllipse + 14 次函数调用 + 一堆 [single] 转换 ——
+#   PowerShell 的解释开销比画图本身贵得多，40ms 一帧根本喂不满。
+#   现在按「状态 × 脉冲档位（16 档）」**预渲染成小位图**，每帧只剩一次 DrawImage。
+$script:oGlowImg = @{}
+$script:glowLevels = 16
+
+function Get-GlowImage([string]$st, [single]$pulse) {
+    $lv = [int][math]::Round($pulse * ($script:glowLevels - 1))
+    if ($lv -lt 0) { $lv = 0 }
+    if ($lv -gt ($script:glowLevels - 1)) { $lv = $script:glowLevels - 1 }
+    $key = "$st|$lv"
+    $hit = $script:oGlowImg[$key]
+    if ($hit) { return $hit }
+    if ($script:oGlowImg.Count -gt 64) { $script:oGlowImg.Clear() }
+    $p = [single]($lv / [single]($script:glowLevels - 1))
+    $amp = if ($st -eq 'speaking') { 9.0 } elseif ($st -eq 'thinking') { 5.0 } else { 4.0 }
+    $maxR = $BASE_R + 14 * 3.2 + $p * $amp + 6
+    $side = [int][math]::Ceiling($maxR * 2)
+    $bmp = New-Object System.Drawing.Bitmap($side, $side, [System.Drawing.Imaging.PixelFormat]::Format32bppPArgb)
+    $gg = [System.Drawing.Graphics]::FromImage($bmp)
+    $gg.SmoothingMode = 'AntiAlias'
+    $c = [single]($side / 2.0)
+    for ($i = 14; $i -ge 1; $i--) {
+        $rr = [single]($BASE_R + $i * 3.2 + $p * $amp)
+        $a = [int](26 * (1 - $i / 15.0) * (0.45 + $p * 0.85))
+        if ($a -lt 2) { continue }
+        $gg.FillEllipse((Get-GlowBrush $a), [single]($c - $rr), [single]($c - $rr), [single]($rr * 2), [single]($rr * 2))
+    }
+    $gg.Dispose()
+    $script:oGlowImg[$key] = $bmp
+    return $bmp
+}
+
 function Measure-Cached($g, [string]$k, [string]$text) {
     $key = "$k|$text"
     if ($script:oMz.ContainsKey($key)) { return $script:oMz[$key] }
@@ -329,6 +363,11 @@ function Build-Gfx {
     $script:oFont.bubble = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
     $script:oFont.hint   = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
     $script:oFont.btn    = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5, [System.Drawing.FontStyle]::Bold)
+
+    # ---- 三块固定矩形（每帧不再 New-Object）
+    $script:rfGlyph  = New-Object System.Drawing.RectangleF(0, [single]($CY - 28), [single]$STAGE_W, 56)
+    $script:rfStatus = New-Object System.Drawing.RectangleF(0, [single]($CY + $BASE_R + 20), [single]$STAGE_W, 26)
+    $script:rfTimer  = New-Object System.Drawing.RectangleF(0, [single]($CY + $BASE_R + 46), [single]$STAGE_W, 20)
 
     # ---- 背景渐变（尺寸是死的，造一次用到底）
     $script:oBrush.formBg  = Get-BgBrush $WINW $WINH
@@ -458,17 +497,10 @@ $stage.Add_Paint({
         $script:lvlS = $script:lvlS + ([double]$script:vis.level - $script:lvlS) * 0.35
         $pulse = [single]($script:lvlS * 0.6 + $beat * 0.4)
 
-        # 外发光：一圈圈往下淡。
-        # ★ 原来每圈造一个 GraphicsPath + 一个 SolidBrush；FillEllipse 根本不需要 Path，
-        #   刷子按 alpha 量化缓存 ⇒ 一帧 0 个新对象（原来 28 个）。
-        for ($i = 14; $i -ge 1; $i--) {
-            $rr = $BASE_R + $i * 3.2 + $pulse * $amp
-            $a = [int](26 * (1 - $i / 15.0) * (0.45 + $pulse * 0.85))
-            if ($a -lt 2) { continue }
-            $gb = Get-GlowBrush $a
-            $g.FillEllipse($gb,
-                [single]($CX - $rr), [single]($CY - $rr), [single]($rr * 2), [single]($rr * 2))
-        }
+        # 外发光：一整张预渲染的小位图，一次 DrawImage（原来 14 次 FillEllipse）
+        $img = Get-GlowImage $st $pulse
+        $half = [single]($img.Width / 2.0)
+        $g.DrawImage($img, [single]($CX - $half), [single]($CY - $half), [single]$img.Width, [single]$img.Height)
 
         # 头像本体：径向渐变（刷子按状态缓存）
         $ab = Get-AvatarBrush $st
@@ -479,22 +511,16 @@ $stage.Add_Paint({
             [single]($CX - $BASE_R * 0.55), [single]($CY - $BASE_R * 0.78),
             [single]($BASE_R * 1.1), [single]($BASE_R * 0.62))
 
-        # 「汐」
-        $g.DrawString('汐', $script:oFont.glyph, $script:oBrush.glyph,
-            (New-Object System.Drawing.RectangleF(0, [single]($CY - 28), [single]$STAGE_W, 56)),
-            $script:oFmt.center)
+        # 「汐」（矩形早就造好，不再每帧 New-Object）
+        $g.DrawString('汐', $script:oFont.glyph, $script:oBrush.glyph, $script:rfGlyph, $script:oFmt.center)
 
         # 状态文字
-        $g.DrawString($pal.text, $script:oFont.status, $script:oBrush.status,
-            (New-Object System.Drawing.RectangleF(0, [single]($CY + $BASE_R + 20), [single]$STAGE_W, 26)),
-            $script:oFmt.center)
+        $g.DrawString($pal.text, $script:oFont.status, $script:oBrush.status, $script:rfStatus, $script:oFmt.center)
 
         # 计时
         $sec = [int]$script:vis.seconds
         $ts = ('{0:00}:{1:00}' -f [int]($sec / 60), ($sec % 60))
-        $g.DrawString($ts, $script:oFont.timer, $script:oBrush.timer,
-            (New-Object System.Drawing.RectangleF(0, [single]($CY + $BASE_R + 46), [single]$STAGE_W, 20)),
-            $script:oFmt.center)
+        $g.DrawString($ts, $script:oFont.timer, $script:oBrush.timer, $script:rfTimer, $script:oFmt.center)
 
         # 电平条（圆头）
         $n = 13; $barW = 3.0; $gap = 6.0

@@ -25,6 +25,7 @@ import json
 import os
 import queue
 import sys
+import re
 import threading
 import time
 import warnings
@@ -57,11 +58,111 @@ HISTORY_MAX = 24            # 只带最近若干轮进上下文
 #   填进来的。原来这里写死「不超过 25 个字」，而界面上那个「一句最多几个字」的框
 #   **改了没有任何地方读它** —— 又一个会说谎的控件（跟云端那个写死 voice 是同一类）。
 SYSTEM = (
-    "你正在和主人打电话。声音传过去，所以只说口语。\n"
-    "每次回话不超过 {maxchars} 个字，一到两句，可以带一点语气词。\n"
-    "不要列表、不要加粗、不要括号里的旁白、不要念表情符号。\n"
-    "听不清就直说听不清，不要瞎猜。"
+    "你在跟主人打电话，声音是直接送到他耳朵里的。\n"
+    "**说人话，别说稿子**：一次一到两句，总共不超过 {maxchars} 个字。\n"
+    "句子长短错开 —— 有时两个字（「嗯」「是吗」），有时一整句。\n"
+    "可以带语气词（嗯、啊、呗、欸、哈哈），可以有停顿（用逗号表示），"
+    "可以有情绪（他累你就软一点，他逗你就接住）。\n"
+    "不要列表、不要加粗、不要括号里的旁白、不要念表情符号、不要客套话。\n"
+    "听不清就直说听不清，不要瞎猜。\n"
+    "★ 如果他让你**动这台电脑**（打开程序、关掉什么、截图、查内存/磁盘/文件、写或改一个文件、"
+    "搜东西、发消息……），你不要自己编结果 —— 整个回复只写一个记号：[[电脑]]\n"
+    "  那一句会被转给能真正操作电脑的那条路，她的回答再由你的声音念出来。"
 )
+
+_MARK = "[[电脑]]"
+
+
+def _call_context() -> str:
+    """给通话那一路一点**真上下文**：现在几点、他是谁、最近几天发生了什么。
+
+    ★ 2026-10-26 21:4x（他说「语音的内容接入上下文和 agent」）：从前这段 SYSTEM
+      是**空的** —— 打电话的她只知道「在打电话」，不知道主人今天在折腾什么，
+      所以会说出「我这儿看不到你电脑的情况呀」这种话。现在把开场简报（`memory/brief.md`，
+      每 30 分钟自己重写一份）和当前时间带上。
+    """
+    parts = []
+    try:
+        parts.append("现在是 " + time.strftime("%Y-%m-%d %H:%M") + "。")
+    except Exception:  # noqa: BLE001
+        pass
+    p = os.path.join(HERE, "..", "..", "memory", "brief.md")
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:
+            t = f.read().strip()
+        if t:
+            parts.append("（下面是你的开场简报，用作背景，不要照着念）\n" + t[:1800])
+    except OSError:
+        pass
+    return "\n\n".join(parts)
+
+
+def desk_ask(text: str, wait: float = 45.0) -> str:
+    """把这句话交给桌面那条 agent（有记忆、有工具），等它的回答。
+
+    ★ 只走已经存在的 `/say`：那条路上的工具、人格、上下文都是现成的，
+      不新开接口，也不在两处各维护一份。返回空串 = 没等到（对方没起 / 跑太久）。
+    """
+    import urllib.request
+
+    hist = os.path.join(HERE, "..", "..", "desk", "history.jsonl")
+    pos = -1
+    try:
+        with open(hist, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+    except OSError:
+        pos = -1
+    body = json.dumps({"text": text, "quiet": True}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    try:
+        with open(os.path.join(HERE, "..", "..", "desk", "token.txt"), "r", encoding="utf-8") as f:
+            headers["x-dfy-token"] = f.read().strip()
+    except OSError:
+        pass
+    req = urllib.request.Request("http://127.0.0.1:3079/say", data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read()
+    except Exception as e:  # noqa: BLE001
+        log(f"[电脑] 交给桌面那条路失败：{type(e).__name__}: {e}")
+        return ""
+    if pos < 0:
+        return ""
+    end = time.time() + wait
+    while time.time() < end:
+        time.sleep(0.4)
+        try:
+            with open(hist, "rb") as f:
+                f.seek(pos)
+                chunk = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if o.get("role") == "assistant":
+                t = str(o.get("text") or "").strip()
+                if t:
+                    return t
+    return ""
+
+
+def speech_clip(text: str, limit: int = 80) -> str:
+    """念出来的话别太长：按句子截到 limit 个字符左右。"""
+    t = " ".join(str(text or "").split())
+    if len(t) <= limit:
+        return t
+    cut = 0
+    for i, ch in enumerate(t[:limit]):
+        if ch in "。！？!?，,；;":
+            cut = i + 1
+    return (t[:cut] if cut else t[:limit]).rstrip()
 
 
 def _call_cfg() -> dict:
@@ -298,7 +399,7 @@ def squeeze_silence(x: np.ndarray, rate: int, floor: float = 0.012,
             j += 1
         dur_ms = (j - i) * 10
         if dur_ms >= min_ms:
-            keep = 160 if dur_ms >= 400 else 80
+            keep = 210 if dur_ms >= 400 else 115
             out.append(x[last:i * w])
             out.append(np.zeros(max(1, int(keep / 1000.0 * rate)), dtype="float32"))
             last = j * w
@@ -356,6 +457,10 @@ class CallEngine:
         self.sink = sink
         self.on_event = on_event
         self.system = system if system else SYSTEM.format(maxchars=maxchars)
+        if not system:
+            ctx = _call_context()
+            if ctx:
+                self.system = self.system + "\n\n" + ctx
         self.model = model
         self.verbose = verbose
 
@@ -541,10 +646,25 @@ class CallEngine:
             del self.history[:len(self.history) - HISTORY_MAX * 2]
         reply, brain_ms = brain_say(self.history[-HISTORY_MAX:], self.system, self.model)
         turn["brain_ms"] = round(brain_ms)
+        # ★ 2026-10-26 21:5x：要真动电脑的那一句，转给桌面那条 agent（有工具、有记忆），
+        #   她的回答再拿回来念。判据是模型自己给的记号，不用正则去猜「这算不算命令」。
+        if _MARK in reply:
+            said = reply.replace(_MARK, "").strip()
+            if self.verbose:
+                log("[电脑] 这句要真动手 —— 交给桌面那条 agent")
+            self._set_state("thinking")
+            t_desk = time.time()
+            got = desk_ask(heard)
+            turn["desk_ms"] = round((time.time() - t_desk) * 1000)
+            reply = speech_clip(got) if got else (said or "我还在弄，等一会儿再跟你说")
+            if self.verbose:
+                log(f"[电脑] 回来 {len(got)} 字（{turn['desk_ms']}ms）")
         turn["reply"] = reply
         self.history.append({"role": "assistant", "content": reply})
         if len(self.history) > HISTORY_MAX * 2:
             del self.history[:len(self.history) - HISTORY_MAX * 2]
+        # 记号类的残留一律不许念出来（不然她会把「[[电脑]]」当字读给你听）
+        reply = re.sub(r"\[\[.*?\]\]", "", reply).strip()
         if not reply:
             self.turns.append(turn)
             self._set_state("listening")
