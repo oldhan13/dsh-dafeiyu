@@ -450,9 +450,13 @@ $stage.Add_Paint({
             $script:oGlow.Clear()
         }
 
-        $beat = [math]::Sin($script:tick * 0.16) * 0.5 + 0.5
+        # ★ 2026-10-26 21:1x：帧率从 8.3fps 提到 25fps（间隔 120ms → 40ms），
+        #   所以相位要按「每 3 帧 = 原来 1 帧」折算，否则那口气会快三倍。
+        $beat = [math]::Sin(($script:tick / 3.0) * 0.16) * 0.5 + 0.5
         $amp = if ($st -eq 'speaking') { 9.0 } elseif ($st -eq 'thinking') { 5.0 } else { 4.0 }
-        $pulse = [single](($script:vis.level) * 0.6 + $beat * 0.4)
+        # 电平是 12Hz 送进来的，直接画会一跳一跳；这里让它每帧朝目标滑 35%
+        $script:lvlS = $script:lvlS + ([double]$script:vis.level - $script:lvlS) * 0.35
+        $pulse = [single]($script:lvlS * 0.6 + $beat * 0.4)
 
         # 外发光：一圈圈往下淡。
         # ★ 原来每圈造一个 GraphicsPath + 一个 SolidBrush；FillEllipse 根本不需要 Path，
@@ -497,7 +501,7 @@ $stage.Add_Paint({
         $tot = $n * $barW + ($n - 1) * $gap
         $x0 = ($STAGE_W - $tot) / 2
         $by = $CY + $BASE_R + 80
-        $lvl = [double]$script:vis.level
+        $lvl = [double]$script:lvlS
         if ($st -eq 'speaking') { $lvl = 0.34 + 0.42 * $beat }
         $pen = Get-LevelPen $st
         for ($i = 0; $i -lt $n; $i++) {
@@ -642,14 +646,18 @@ foreach ($c in @($f, $title, $stage, $trans)) {
 $script:jsonMt = $null
 $script:sigT = ''
 $script:sigS = ''
+$script:lvlS = 0.0
 
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 120
+# ★ 2026-10-26 21:1x（他说「把动画变流畅一点」）：120ms = 8.3fps，眼睛看得出来在跳。
+#   画图对象现在全是缓存的（一帧 0 个新对象），所以提到 40ms = 25fps 是付得起的；
+#   读 JSON 仍然每 3 帧一次（≈120ms）—— 文件写的就是这个节奏，读快了没意义。
+$timer.Interval = 40
 $timer.add_Tick({
     $script:tick++
     $st = $null
     try {
-        if (Test-Path $json) {
+        if (($script:tick % 3) -eq 0) {
             $mt = [System.IO.File]::GetLastWriteTimeUtc($json)
             if ($mt -ne $script:jsonMt) {
                 $script:jsonMt = $mt

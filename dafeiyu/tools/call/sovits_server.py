@@ -224,14 +224,44 @@ class Engine:
     _HARD = "。！？；…\n"
     _SOFT = "，,、"
     _MAXLEN = 14          # 一句别超过 14 字，保证单句推理够快（首块 = 第一句的时间）
-    _GAP_MS = 120         # 句间静音
+    _GAP_MS = 120         # 句间静音（老前提留，实际按标点分两档，见下）
+    # ★ 2026-10-26 21:0x（他说「稍微好一点，但还是有卡顿」）：
+    #   量下去才发现**卡的不是断流，是白**：模型每句自己带一截句首/句尾静音，
+    #   我们又把整句首尾直接接起来，于是一个逗号处会静 **360 / 410 / 570 / 600 / 730ms**。
+    #   听感上那就是「她说一半停住了，再接着往下说」—— 他说的卡顿大半是它。
+    #   ⇒ 每句先掐掉首尾的静音（留住 20/30ms 当气息），再按标点给 70 / 140ms 的留白。
+    _HARD_GAP = 140       # 。！？这类「真停」
+    _SOFT_GAP = 70        # ，、这类「换气」
+
+    @staticmethod
+    def trim_silence(arr, rate: int, keep_head: float = 0.02, keep_tail: float = 0.03):
+        import numpy as np
+        if len(arr) == 0:
+            return arr
+        peak = float(np.max(np.abs(arr)))
+        if peak <= 0.0:
+            return arr
+        thr = max(0.006, peak * 0.02)
+        loud = np.where(np.abs(arr) > thr)[0]
+        if not len(loud):
+            return arr[:0]
+        a = max(0, int(loud[0]) - int(keep_head * rate))
+        b = min(len(arr), int(loud[-1]) + 1 + int(keep_tail * rate))
+        return arr[a:b]
 
     @classmethod
     def split_clauses(cls, text: str) -> list[str]:
+        """★ 2026-10-26 21:1x：**逗号也切**。
+
+        他说「稍微好一点，但还是有卡顿」。量下去：模型自己在逗号处会停
+        **360~730ms**（`trim_silence` 掐不掉 —— 那截白在句子中间，不在首尾）。
+        ⇒ 那就别把逗号交给她：在逗号处切开、每段整句合成，段间由我们给 **70ms**。
+          拍子就归我们管了，听感上是换气，不是断流。
+        """
         segs, cur = [], ""
         for ch in text:
             cur += ch
-            if ch in cls._HARD:
+            if ch in cls._HARD or ch in cls._SOFT:
                 segs.append(cur)
                 cur = ""
         if cur:
@@ -272,14 +302,18 @@ class Engine:
                 if len(arr) == 0:
                     continue
                 sr_now = int(sr)
+                arr = self.trim_silence(arr, sr_now)
+                if len(arr) == 0:
+                    continue
                 if first is None:
                     first = (time.time() - t0) * 1000
                     STATE["last_first_chunk_ms"] = round(first)
                 total += len(arr)
                 yield sr_now, arr
-            # 句间留一点静音（最后一句不留）
+            # 句间留一点静音（最后一句不留）；按标点决定长短
             if idx != len(clauses) - 1:
-                n_gap = max(1, int(sr_now * 0.001 * self._GAP_MS))
+                gap_ms = self._HARD_GAP if clause[-1:] in self._HARD else self._SOFT_GAP
+                n_gap = max(1, int(sr_now * 0.001 * gap_ms))
                 if gap is None or len(gap) != n_gap:
                     gap = np.zeros(n_gap, dtype="float32")
                 total += len(gap)
