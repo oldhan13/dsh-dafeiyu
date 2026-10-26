@@ -1,9 +1,18 @@
-numpy>=1.26
-scipy>=1.11
-soundfile>=0.12
-SoundCard>=0.4.3
-faster-whisper>=1.0
-ctranslate2>=4.0
-piper-tts>=1.2
-websockets>=12.0
-cryptography>=42.0
+# 通话那套的依赖。★ 用 == 钉死，不要改回 >=
+#
+# 为什么钉死（2026-10-26 实测）：写成 `numpy>=1.26` 这种，pip 会为了「挑最新」去回溯求解，
+# 在 Python 3.12 上直接卡住 —— 十分钟 640 秒 CPU、一个包都没开始下、也没有子进程。
+# 界面上看起来就是「点了一键装好，什么都没发生」。钉死就不回溯了。
+#
+# 下面这一组是 2026-10-26 在「Python 3.12 + Windows 11 + RTX 5080」上**实测跑通**的那一版
+# （就是他这台机器上通话一直在用的那套）。换 Python 大版本时如果哪个包装不上，
+# 就单独把那个包换到有轮子的最近版本，别整组一起动。
+numpy==2.5.3
+scipy==1.18.1
+soundfile==0.14.0
+SoundCard==0.4.6
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+piper-tts==1.8.0
+websockets==17.3
+cryptography==50.0.2
