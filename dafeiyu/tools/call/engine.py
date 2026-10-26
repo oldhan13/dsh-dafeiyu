@@ -546,15 +546,27 @@ class CallEngine:
                                                   engine=self.tts_engine, stats=stats)
         self._speaking.set()
         self._set_state("speaking")
-        self.emit("say_start", rate=tts_rate)
-        # ★ 播放走抖动缓冲（见 JitterPlayer 上面的注释）：不再「拿到一块就播一块」。
-        player = JitterPlayer(self.sink, tts_rate, cushion=self._cushion, t0=t_tts).start()
+        # ⚠️ `say_start` 是「声音开始出来」的信号（界面靠它切状态），必须放在**攒齐之后**发，
+        #    不然窗口会显示「她在说」而其实还在合成 —— 那就是个会说谎的指示器。
+        # ★★ 2026-10-26 21:1x（他第三次说：「不是音频合成的问题，是播放的问题，播放的时候卡了」）
+        #
+        #   量到最后一步才看清：**播放这一侧是干净的**。`underrun-probe.py` 一边放
+        #   一段已经拿在手里的纯音、一边每 2ms 问一次声卡 `GetCurrentPadding` ——
+        #   32k / 44.1k / 48k、缓冲 47ms 和 120ms 都一样：**中途一次都没空**（只在开头那一下）。
+        #   所以「卡」不是缓冲空，是**音频还没到手就开播**：她一边说、服务端一边合成，
+        #   拍子天然比播放慢，声卡那点缓冲垫不住 → 听起来就是播放卡住。
+        #
+        #   而 QQ 单发语音为什么好听？因为它是**整段合成完再播**，中间根本没有「还没到」。
+        #   ⇒ 那就照它来：**先把这一整句拿到手，再开播**（他说过卡顿比多等一会儿难受得多）。
+        #     代价是开口晚 ~1s（首块 0.9~1.4s + 剩下的合成），换播放一个洞都没有。
+        chunks: list[np.ndarray] = []
+        t_collect = time.time()
         try:
             try:
                 for ch in it:
                     if self._abort.is_set() or self._stop.is_set():
                         break
-                    player.push(ch)
+                    chunks.append(np.asarray(ch, dtype="float32").ravel())
             except Exception as e:  # noqa: BLE001
                 # 生成到一半断了（sovits 掉线 / 网络抖）——**别把她说到一半的话掐掉**，
                 # 把已经攒下的放完，再记一笔。
@@ -567,6 +579,15 @@ class CallEngine:
                 it.close()
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            pass
+        collect_ms = (time.time() - t_collect) * 1000
+        # 整句已在手 ⇒ 垫子只要一小截（留 120ms 给线程调度，不再是「等音频」）
+        self.emit("say_start", rate=tts_rate)
+        player = JitterPlayer(self.sink, tts_rate, cushion=0.12, t0=t_tts).start()
+        try:
+            for a in chunks:
+                player.push(a)
             player.finish()
             while not player.wait(0.05):
                 if self._abort.is_set() or self._stop.is_set():
@@ -578,13 +599,8 @@ class CallEngine:
             self._speaking.clear()
             self.emit("say_end", interrupted=self._abort.is_set())
 
-        # 自调垫子：这一句饿过 ⇒ 下一句多垫 0.25s；一路顺 ⇒ 慢慢收回去
-        if player.starved:
-            self._cushion = min(1.20, self._cushion + 0.25)
-            if self.verbose:
-                log(f"[缓冲] 这一句饿过，下一句垫到 {self._cushion:.2f}s")
-        else:
-            self._cushion = max(0.35, self._cushion - 0.05)
+        # ★ 整句先到手再播 ⇒ 「饿」这件事在结构上不会发生了；`starved` 只当作断言留着，
+        #   它要是又变 true，说明真出问题了（不是正常的尾部判断）。
         first_ms = (player.first_at * 1000) if player.first_at is not None else None
         played_samples = player.played
 
@@ -595,10 +611,11 @@ class CallEngine:
             "tts_first_audio_ms": round(first_ms or 0),
             "played_s": round(played_samples / max(1, tts_rate), 2),
             "interrupted": self._abort.is_set(),
-            "first_sound_ms": round(asr_ms + brain_ms + (first_ms or 0)),
-            # 听感的两条现场证据：这一句播放有没有饿过、当时的垫子多厚
+            "first_sound_ms": round(asr_ms + brain_ms + (collect_ms + (first_ms or 0))),
+            # 听感的现场证据：整句攒齐花了多久、播的时候有没有饿过
+            "collect_ms": round(collect_ms),
+            "cushion_s": 0.12,
             "starved": bool(player.starved),
-            "cushion_s": round(self._cushion, 2),
             "fades": int(player.fades),
         })
         self.turns.append(turn)
