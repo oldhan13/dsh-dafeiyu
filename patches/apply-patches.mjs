@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /**
- * dsh-dafeiyu 本地补丁 —— 把大肥鱼要的两处改动打到 `dsh-onebot-qq` 里。
+ * dsh-dafeiyu 本地补丁 —— 把大肥鱼要的四处改动打到 `dsh-onebot-qq` 里。
  *
- *   1. poke-inbound   戳一戳（notice/notify/poke）翻成一条 "[戳一戳]" 消息，走正常入站管线
- *   2. split-private  私聊里一段多行回复，按行拆成几条发（一句一个气泡）
+ *   1. poke-inbound        戳一戳（notice/notify/poke）翻成一条 "[戳一戳]" 消息，走正常入站管线
+ *   2. split-private       私聊里一段多行回复，按行拆成几条发（一句一个气泡）
+ *   3. mirror-group-send   插件发进群的话也补记一行到 group/raw.jsonl，watch 才看得见
+ *   4. emoji-reaction      白名单放行 set_msg_emoji_like（贴在消息底下的表情回应）
  *
- * 为什么要打补丁：这两件事插件本身不做，而 npm 包一升级就会被覆盖，
+ * 为什么要打补丁：这几件事插件本身不做，而 npm 包一升级就会被覆盖，
  * 所以放在这里，装的时候自动重打。补丁是**整段锚点替换**，不是 diff，
  * 认不出锚点就报错退出（不硬改），宁可不打也不要改坏。
  *
@@ -207,6 +209,28 @@ const MIRROR_SEND_BLOCK = [
     '        return messageId;',
 ].join('\n');
 
+// ── 补丁 4：表情回应进白名单（2026-10-26）────────────────────────────
+// 为什么：`qq_napcat_api` 只放行 NAPCAT_API_WHITELIST 里的 action，而「贴在消息底下的小 emoji」
+// （set_msg_emoji_like）不在里面 —— 想贴只能绕开插件直连 NapCat 的 HTTP，等于把端口和 token
+// 搬到别处写死。放进白名单，走已有的 qq_napcat_api，参数 {message_id, emoji_id, set}。
+// 锚点选白名单**末尾三项 + 收尾的 ]**：比只锚一行稳，上游要加新 action 多半加在这一行前后。
+const EMOJI_MARKER = 'set_msg_emoji_like';
+const EMOJI_ANCHOR = [
+    "    'ocr_image',",
+    "    'get_ai_characters',",
+    "    'send_group_ai_record',",
+    '];',
+].join('\n');
+const EMOJI_BLOCK = [
+    "    'ocr_image',",
+    "    'get_ai_characters',",
+    "    'send_group_ai_record',",
+    '    // Local patch (dafeiyu 2026-10-26): 消息表情回应 —— 贴在消息底部的小 emoji，不额外发一条。',
+    '    // 走 qq_napcat_api：{ message_id, emoji_id: "128077", set: true }。',
+    "    'set_msg_emoji_like',",
+    '];',
+].join('\n');
+
 /** @type {{id:string, file:string, marker:string, ops:{find:string, replace:string}[]}[]} */
 const PATCHES = [
     {
@@ -233,6 +257,12 @@ const PATCHES = [
             { find: MIRROR_CARD_ANCHOR, replace: MIRROR_CARD_BLOCK },
             { find: MIRROR_SEND_ANCHOR, replace: MIRROR_SEND_BLOCK },
         ],
+    },
+    {
+        id: 'emoji-reaction',
+        file: 'tools.js',
+        marker: EMOJI_MARKER,
+        ops: [{ find: EMOJI_ANCHOR, replace: EMOJI_BLOCK }],
     },
 ];
 

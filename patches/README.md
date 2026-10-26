@@ -1,6 +1,6 @@
-# patches —— 打在 `dsh-onebot-qq` 上的三处本地改动
+# patches —— 打在 `dsh-onebot-qq` 上的四处本地改动
 
-大肥鱼有三件事，上游插件不做，所以这里放三个补丁，**装的时候自动打上**（`install.ps1` 会调 `apply-patches.mjs`）。
+大肥鱼有四件事，上游插件不做，所以这里放四个补丁，**装的时候自动打上**（`install.ps1` 会调 `apply-patches.mjs`）。
 它们是**整段锚点替换**，不是 diff：找不到锚点就报错退出，宁可不打，也不硬改。
 
 | 补丁 | 改哪个文件 | 做了什么 |
@@ -8,6 +8,19 @@
 | `poke-inbound` | `connection.js` | 戳一戳（`notice/notify/poke`）翻成一条 `[戳一戳]` 消息，走正常入站管线。只认「目标是本账号」的，群里别人互戳、自己戳自己直接丢 |
 | `split-private-replies` | `outbound.js` | 私聊里一段多行回复，按行拆成 2–8 条发（间隔 320ms）。每行超过 160 字、或超过 8 行，就整段发，不刷屏 |
 | `mirror-group-send` | `outbound.js` | 插件发出去的**群消息也补记一行**到 `dafeiyu/group/raw.jsonl`（字段与 `group/watch.mjs` 的 `sendGroup()` 完全对齐）。没有它，群里两条嘴互相看不见：watch 只知道**自己**发的，主会话经插件发进群的话它不知道，于是可能把同一件事再答一遍 |
+| `emoji-reaction` | `tools.js` | 把 `set_msg_emoji_like`（**贴在消息底部的小 emoji**，不额外发一条）加进 `NAPCAT_API_WHITELIST`。不加只能绕开插件直连 NapCat 的 HTTP，端口和 token 就得签到别处去 |
+
+## `emoji-reaction` 怎么用
+
+打完补丁、**重启 `dsh web`** 之后：
+
+```
+qq_napcat_api(action: "set_msg_emoji_like", params: { message_id: "<消息 id>", emoji_id: "128077", set: true })
+```
+
+- `emoji_id` 是 QQ 的表情 id（数字字符串），`128077` 是 👍；`set: false` 取消。
+- `message_id` 得是真的 —— 自己发的消息，`qq_send_*` 的返回值里就带着它；
+  **别人发来的消息，消息边界里目前不带 id**（上游插件没传），要贴他的消息得先改入站那一侧。
 
 ## 为什么放在这里
 
