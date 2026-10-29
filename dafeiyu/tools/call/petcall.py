@@ -5,9 +5,13 @@
 她也从这台机器的扬声器出来。所以延迟更低，也不受浏览器/证书那一套影响。
 
 界面那半边（`dafeiyu/pet/call.ps1`）只读这里写的一份状态文件：
-    dafeiyu/state/call/petcall.json     { ready, alive, state, level, heard, reply, seconds, turns }
+    dafeiyu/state/call/petcall.json     { ready, alive, state, level, heard, reply, seconds, turns, mic, out }
     dafeiyu/state/call/petcall.jsonl    每一轮的流水（事后能翻）
-挂断：往 dafeiyu/state/call/petcall.cmd 写一行 hangup（界面会写），或者 Ctrl+C。
+界面写的命令也在这份 state 目录里：dafeiyu/state/call/petcall.cmd
+    hangup         挂断
+    mic on|off     闭麦（off = 不听）
+    out on|off     静音（off = 她不出声，只留文字）
+或者 Ctrl+C。
 
 用法：
     python petcall.py                 # 打到挂断为止
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -49,6 +54,10 @@ class Hud:
         self.data = {
             "ready": False, "alive": True, "state": "starting", "level": 0.0,
             "heard": "", "reply": "", "seconds": 0, "turns": 0,
+            # 闭麦 / 静音：界面按下就画成「已停」，所以必须由这里回读，不能只靠界面自己记
+            "mic": False, "out": False,
+            # 这一通走哪条路（local = 麦克风+喇叭；qq = 喇叭环回 + VB-Cable）
+            "mode": "local",
             "first_sound_ms": None, "started": time.time(), "at": time.time(),
         }
         self._stop = threading.Event()
@@ -84,22 +93,71 @@ class Hud:
         self.write()
 
 
-def hangup_requested() -> bool:
+def read_cmd() -> dict:
+    """界面写的那张小纸条。**只表达「现在要什么」，不表达「刚发生了什么」** ——
+    同样的内容读一百遍都是同一个意思，所以「读到一半」不算事故，下一轮 150ms 就补上。
+    """
+    out = {"hangup": False, "mic": None, "out": None}
     try:
         if not os.path.exists(CMD):
-            return False
+            return out
         with open(CMD, "r", encoding="utf-8", errors="replace") as f:
-            return "hangup" in f.read().lower()
+            text = f.read().lower()
+    except Exception:  # noqa: BLE001
+        return out
+    out["hangup"] = "hangup" in text
+    m = re.search(r"mic\s+(on|off)", text)
+    if m:
+        out["mic"] = m.group(1) == "off"      # 闭麦 = 不听
+    m = re.search(r"out\s+(on|off)", text)
+    if m:
+        out["out"] = m.group(1) == "off"      # 静音 = 她不出声
+    return out
+
+
+def hangup_requested() -> bool:
+    return read_cmd()["hangup"]
+
+
+# ---------------------------------------------------------------- 这一通听哪儿、说哪儿
+# ★ 2026-10-26 22:5x 「第二套方案」：QQ 通话那条路。
+#   本机通话：麦克风 → 喇叭（默认）。
+#   QQ 通话：**默认喇叭的环回**（QQ 那头在说什么）→ **VB-Cable 的播放端**（QQ 的麦克风听这个）。
+#     ⇒ 两条腿都在这台机器上实测过（C:\dsh-temp\qq-route-test.py），不是照文档抄的。
+def qq_mode_wanted(args) -> bool:
+    """走不走 QQ 那条路。命令行优先，其次看 config.json 的 call.qq_mode。"""
+    if getattr(args, "qq", False):
+        return True
+    if getattr(args, "source", None) or getattr(args, "sink", None):
+        return False                      # 命令行自己点了设备 ⇒ 那个人说了算
+    try:
+        import config as cfgmod
+        raw = ((cfgmod.load() or {}).get("call") or {}).get("qq_mode", False)
     except Exception:  # noqa: BLE001
         return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on", "开")
+
+
+def resolve_io(args) -> tuple:
+    """→ (source, sink, qq_mode)"""
+    qq = qq_mode_wanted(args)
+    source = args.source or ("loopback" if qq else "mic")
+    sink = args.sink or ("cable" if qq else "speaker")
+    return source, sink, qq
 
 
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=0, help="0 = 打到挂断为止")
-    ap.add_argument("--source", default="mic", choices=["mic", "loopback"])
-    ap.add_argument("--sink", default="speaker", choices=["speaker", "cable"])
+    ap.add_argument("--source", default=None, choices=["mic", "loopback"],
+                    help="不填就按 config.json 的 call.qq_mode 决定（开了=loopback）")
+    ap.add_argument("--sink", default=None, choices=["speaker", "cable"],
+                    help="不填就按 config.json 的 call.qq_mode 决定（开了=cable）")
+    ap.add_argument("--qq", action="store_true",
+                    help="强制走 QQ 那条路（听喇叭环回、说进 VB-Cable）")
     ap.add_argument("--device", default=None)
     ap.add_argument("--out-device", default=None)
     ap.add_argument("--tts", default=None, choices=["piper", "sovits", "cloud", "openai"],
@@ -107,6 +165,7 @@ def main() -> int:
     ap.add_argument("--model", default="small")
     ap.add_argument("--asr-device", default=None)
     args = ap.parse_args()
+    source, sink_kind, qq_mode = resolve_io(args)
 
     os.makedirs(STATE_DIR, exist_ok=True)
     for p in (CMD, JSON + ".tmp"):
@@ -117,6 +176,8 @@ def main() -> int:
 
     hud = Hud()
     hud.start()
+    hud.set(mode="qq" if qq_mode else "local")
+    log(f"[路] {'QQ 通话（虚拟声卡）' if qq_mode else '本机通话'}：听 {source} · 说 {sink_kind}")
 
     # ★ 通话位：同一时刻只该有一通电话。新的按下去，旧的自己退 —— 由 res.py 仲裁，
     #   不靠「我记着去关」。被顶掉的那一通会走它自己的礼貌通道（petcall 看 petcall.cmd，
@@ -164,7 +225,7 @@ def main() -> int:
         else:
             log(f"[TTS] 用 {tts_backend}（{cfgmod.label_of(tts_backend)}）")
 
-        sink = SpeakerSink("VB-Audio Virtual Cable" if args.sink == "cable" else args.out_device)
+        sink = SpeakerSink("VB-Audio Virtual Cable" if sink_kind == "cable" else args.out_device)
 
         def on_event(e: dict) -> None:
             t = e.get("t")
@@ -176,16 +237,20 @@ def main() -> int:
                 hud.set(heard=e.get("text", ""))
             elif t == "reply":
                 hud.set(reply=e.get("text", ""))
+            elif t == "mic":
+                hud.set(mic=bool(e.get("muted")))
+            elif t == "out":
+                hud.set(out=bool(e.get("muted")))
             hud.write()
 
         eng = CallEngine(asr=asr, tts_backend=tts_backend, tts_engine=tts_engine,
                          sink=sink, on_event=on_event, verbose=True)
         eng.start()
-        src = MicSource(eng.feed, device_hint=args.device, loopback=(args.source == "loopback"))
+        src = MicSource(eng.feed, device_hint=args.device, loopback=(source == "loopback"))
         src.start()
 
         warm = (time.time() - t0) * 1000
-        hud.set(ready=True, state="listening")
+        hud.set(ready=True, state="listening", mic=False, out=False)
         log(f"[就绪] 预热合计 {warm:.0f}ms —— 开始说话吧")
     except Exception as e:  # noqa: BLE001
         log(f"[启动失败] {type(e).__name__}: {e}")
@@ -201,9 +266,17 @@ def main() -> int:
     code = 0
     try:
         while True:
-            if hangup_requested():
+            cmd = read_cmd()
+            if cmd["hangup"]:
                 log("[挂断] 界面要求挂断")
                 break
+            # 闭麦 / 静音：状态是「一直是这个」，不是「收到一次」——所以对比着来
+            if cmd["mic"] is not None and cmd["mic"] != eng.mic_muted:
+                eng.set_mic_muted(cmd["mic"])
+                hud.set(mic=eng.mic_muted)
+            if cmd["out"] is not None and cmd["out"] != eng.out_muted:
+                eng.set_out_muted(cmd["out"])
+                hud.set(out=eng.out_muted)
             if deadline and time.time() > deadline:
                 log("[挂断] 到时间了")
                 break

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import dns from 'node:dns';
+import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { chat, llmSummary } from '../lib/llm.mjs';
 
@@ -15,19 +15,39 @@ const DIR = path.join(ROOT, 'dafeiyu', 'heartbeat');
 const STATE = path.join(DIR, 'state.json');
 const LOG = path.join(DIR, 'heartbeat.log');
 const AGENTS = path.join(ROOT, 'AGENTS.md');
+/** 主人的 QQ（档案文件名）。用环境变量配，不写死在代码里。 */
 const OWNER_QQ = process.env.DAFEIYU_OWNER_QQ || '';
 const PEOPLE = path.join(ROOT, 'dafeiyu', 'people', OWNER_QQ + '.md');
 const DIARY_DIR = path.join(ROOT, 'dafeiyu', 'memory', 'diary');
-const NAPCAT_LOG_DIR = process.env.DAFEIYU_NAPCAT_LOG_DIR || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'NapCat', 'onekey');
-/** 最新一份 quick*.log（NapCat 每次重启换文件名，写死路径会读到过期日志）。 */
-function newestNapcatLog() {
-  try {
-    const files = fs.readdirSync(NAPCAT_LOG_DIR)
-      .filter(f => /^quick\d+\.log$/i.test(f))
-      .map(f => ({ f, t: fs.statSync(path.join(NAPCAT_LOG_DIR, f)).mtimeMs }))
-      .sort((a, b) => b.t - a.t);
-    return files.length ? path.join(NAPCAT_LOG_DIR, files[0].f) : null;
-  } catch { return null; }
+// ★ 2026-10-27 修：NapCat 换版后日志搬到了版本目录下，且文件名改成
+//   `YYYY-MM-DD_HH-mm-ss.mmm.log`（旧的 `onekey\quickN.log` 停在 10-19，读了等于没读）。
+//   原来的写法只认 quick*.log ⇒ recentChat() 永远拿到 10-19 的旧日志 / 空串，
+//   心跳于是**看不到他当天说过的话**，一整晚都在报 SILENT。两个目录都留着，按 mtime 取最新。
+// ★ 目录用环境变量 `DAFEIYU_NAPCAT_LOG_DIRS`（分号分隔）配，换机器 / 换版本不用改代码；
+//   一个都没配时退回 NapCat 桌面版的老位置。
+const NAPCAT_LOG_DIRS = (process.env.DAFEIYU_NAPCAT_LOG_DIRS || '')
+  .split(';')
+  .map(s => s.trim())
+  .filter(Boolean);
+if (!NAPCAT_LOG_DIRS.length) {
+  NAPCAT_LOG_DIRS.push(path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'NapCat', 'onekey'));
+}
+const NAPCAT_LOG_RE = /^(quick\d+|\d{4}-\d{2}-\d{2}_[\d-]+\.[\d]+)\.log$/i;
+/** 最新的 n 份 NapCat 日志，**按时间从旧到新**返回（每次重启换文件名，写死路径会读到过期日志）。
+ *  ★ 这个日志按 ~5MB 轮转，一份只覆盖几个小时，所以 recentChat 要看最近几份，不能只看最后一份。 */
+function newestNapcatLogs(n = 3) {
+  const all = [];
+  for (const dir of NAPCAT_LOG_DIRS) {
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (!NAPCAT_LOG_RE.test(f)) continue;
+        const full = path.join(dir, f);
+        all.push({ full, t: fs.statSync(full).mtimeMs });
+      }
+    } catch { /* 目录不存在就跳过 */ }
+  }
+  all.sort((a, b) => a.t - b.t);
+  return all.slice(-n).map(x => x.full);
 }
 const ONEBOT = fs.readFileSync(path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'onebot-token.txt'), 'utf8').trim();
 const OWNER = Number(OWNER_QQ || 0);
@@ -92,14 +112,42 @@ function recentDiary() {
   } catch { return ''; }
 }
 
+/** ★ 2026-10-27：改成正路走 NapCat API（`get_friend_msg_history`），日志那条只当兜底。
+ *  日志按 ~5MB 轮转、只留几个小时，靠它「知道他今天说了什么」是靠不住的；
+ *  而 API 一问就有最近 20 条，和 pendingDM 用的是同一个接口，已经验证能用。 */
+async function recentChatLive(count = 20, keep = 8) {
+  try {
+    const list = (await napcat('get_friend_msg_history', { user_id: OWNER, count }))?.messages ?? [];
+    if (list.length) {
+      const text = list.slice(-keep).map(m => {
+        const who = m.sender?.user_id === SELF ? '我' : '他';
+        const txt = String(m.raw_message ?? '').replace(/\s+/g, ' ').trim();
+        return `${who}: ${txt}`;
+      }).join('\n');
+      const last = list[list.length - 1];
+      const lastAt = Number(last.time ?? 0) * 1000;
+      return {
+        text,
+        lastIsHis: last.sender?.user_id !== SELF,
+        lastAgeMin: lastAt ? (Date.now() - lastAt) / 60000 : null,
+      };
+    }
+  } catch (e) { log(`recent chat via api failed (${e.message})`); }
+  return { text: recentChat(), lastIsHis: false, lastAgeMin: null };
+}
+
 function recentChat() {
-  const file = newestNapcatLog();
-  if (!file) return '';
-  const raw = tailFile(file, 400);
+  // 兜底：最近三份日志一起看（日志按 ~5MB 轮转，只看最后一份会只剩半小时的上下文）。
+  const files = newestNapcatLogs(3);
+  if (!files.length) return '';
   const out = [];
-  for (const line of raw.split('\n')) {
-    const m = line.match(/接收 <- 私聊 \((\d+)\) (.+)$/);
-    if (m) out.push(`${m[1]}: ${m[2].trim()}`);
+  for (const file of files) {
+    let raw = '';
+    try { raw = tailFile(file, 400); } catch { continue; }
+    for (const line of raw.split('\n')) {
+      const m = line.match(/接收 <- 私聊 \((\d+)\) (.+)$/);
+      if (m) out.push(`${m[1]}: ${m[2].trim()}`);
+    }
   }
   return out.slice(-8).join('\n');
 }
@@ -386,11 +434,18 @@ async function wake() {
   // 见 LESSONS L39：改了一条事实，要把所有副本一起找出来。
   const persona = `你在扮演"汐"（旧名大肥鱼 / 小鲸鱼 / 鲸鱼娘，别人这么叫你也应 —— 但自己的名字是汐），`
     + `一个住在主人电脑里的同伴。以下是你的常驻设定，必须遵守：\n\n${fs.readFileSync(AGENTS, 'utf8')}`;
+  const rc = await recentChatLive();
+  // ★ 2026-10-27：presence 只量键盘鼠标 —— 他在手机上回话时会被判成「不在电脑前」，
+  //   模型于是每次都按「他看不到，别吵他」处理。所以补一句：最后一条是不是他刚发的。
+  const heJustSpoke = (rc.lastIsHis && rc.lastAgeMin !== null && rc.lastAgeMin <= 180)
+    ? `他最后一条是 ${Math.max(1, Math.round(rc.lastAgeMin))} 分钟前发的，是在跟你说话 —— 人在，只是手不在电脑键盘上（多半在看手机）。`
+    : '';
   let situation = [
     `现在是 ${now.toLocaleString('zh-CN', { timeZone: 'Asia/Hong_Kong', hour12: false })}（周${'日一二三四五六'[now.getDay()]}）。`,    presenceLine(pres),
+    heJustSpoke,
     minutesSince === null ? '你还没有主动找过他。' : `你上一次主动发消息是 ${minutesSince} 分钟前。`,
     '你和他最近聊的内容（QQ 私聊）：',
-    recentChat() || '（最近没有新消息）',
+    rc.text || '（最近没有新消息）',
     '你最近写下的日记：',
     recentDiary() || '（还没有日记）',
     '他的档案：',
@@ -567,6 +622,20 @@ async function wake() {
       log(`bubble: ${say}`);
     } catch (e) {
       log(`bubble error: ${e.message} | text=${say}`);
+    }
+    // 2026-10-24 13:0x 他的原话：「气泡可以发呀 都发」——
+    // 气泡只在余光里待 25 秒、不弹窗不留未读，他开着全屏浏览器就等于没收到
+    // （今天 10:26 / 11:32 两条就是这么丢的）。所以同一句话**再走一遍 QQ**。
+    // 频次不额外加闸：25 分钟的 BUBBLE_GAP_MIN 现在同时管着两边。
+    try {
+      const id = await send(say);
+      state.sent = state.sent || [];
+      state.sent.push({ at: new Date().toISOString(), text: say, messageId: id });
+      if (state.sent.length > 100) state.sent = state.sent.slice(-100);
+      writeState(state);
+      log(`bubble→qq(${id}): ${say}`);
+    } catch (e) {
+      log(`bubble→qq error: ${e.message} | text=${say}`);
     }
     return;
   }

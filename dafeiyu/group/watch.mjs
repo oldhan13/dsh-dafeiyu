@@ -41,6 +41,15 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 const GROUP_DIR = path.join(ROOT, 'dafeiyu', 'group');
 const STATE_FILE = path.join(GROUP_DIR, 'state.json');
 const RAW_FILE = path.join(GROUP_DIR, 'raw.jsonl');
+// ★ 2026-10-27 23:4x 主人：「解禁在淆晨群里的权限，开放强相关回复和艾特回复」。
+//   每个群可以单独放开两档：
+//     strong —— 不必等点名，只要这几句**强相关**（在说我／问我／在聊我在的那件事）就能接；
+//     at     —— 真 @ 也不再一律交给主会话，本机也能回（回之前先看主会话有没有已经回过）。
+//   没写进这个文件的群 = 老规矩（@ 交主会话，其余按原来的松口径判断）。
+const PERMS_FILE = path.join(GROUP_DIR, 'permissions.json');
+function loadPerms() {
+  try { return JSON.parse(fs.readFileSync(PERMS_FILE, 'utf8')); } catch { return {}; }
+}
 const AGENTS = path.join(ROOT, 'AGENTS.md');
 
 const PORT = 3078;
@@ -68,6 +77,12 @@ const SAID_MS = 90 * 60 * 1000;
 // 2026-10-21 夜 23:2x：REPLY_GAP_MS / REPLY_PER_HOUR **撤了** —— 他说「一小时四条的限制也撤了吧，
 // 我希望你能自己判断要不要说话」。别再拿数字替她做判断；要收回来应该去改提示词，不是加闸。
 const THREAD_MS = 15 * 60 * 1000;       // 被 @ 之后，这场对话再算「在跟她说话」15 分钟
+// 2026-10-26 10:30 主人：「收到一条系统判为『提到名字或其他代称』的消息时，先读那条消息的上下文，
+//   再二次判断要不要回」。
+//   ⇒ 名字命中只当**线索**，不当命令。二次判断要看的上下文 = 触发那条前面 CTX_BEFORE 条、
+//     后面 CTX_AFTER 条（后面同样重要：话题可能已经被别人岔开了）。
+const CTX_BEFORE = 8;
+const CTX_AFTER = 6;
 
 // ---------------------------------------------------------------- 状态
 function loadState() {
@@ -235,6 +250,18 @@ function recent(gid) {
 }
 
 /**
+ * 取「触发那条」前后的一小段上下文（二次判断专用）。
+ * 为什么不是直接给整个窗口：25 分钟里可能有七八个不相干的话题，整段丢过去模型会抓错重点；
+ * 前后各截几条，既能看见「这句话在说什么」，也能看见「后面别人有没有把话岔开」。
+ * 触发那条找不到（窗口已滑走）时退回窗口最后 14 条 —— 宁可上下文短一点，也别不给。
+ */
+function contextAround(items, trigger) {
+  const i = items.findIndex(x => x.ts === trigger.ts && x.qq === trigger.qq);
+  if (i < 0) return items.slice(-14);
+  return items.slice(Math.max(0, i - CTX_BEFORE), Math.min(items.length, i + 1 + CTX_AFTER));
+}
+
+/**
  * 群里判断用的「人格节选」。
  * 以前是把整份 AGENTS.md（约 13 KB）当 system 喂进去 —— 换 DeepSeek-V3 之后每 5 分钟一次、每群一次，
  * 那份钱的账不该这么花。这里只取两节：§五「表达方式」和 §五·三「群里的她」。
@@ -253,7 +280,7 @@ function groupPersona() {
 }
 
 // ---------------------------------------------------------------- 模型
-async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
+async function decide(gid, items, { inThread = false, withWhom = [], perms = {}, atDirect = false } = {}) {
   const persona = groupPersona();
   const notes = (() => {
     try { return fs.readFileSync(path.join(GROUP_DIR, `${gid}.md`), 'utf8').slice(-1500); } catch { return '（还没有记过）'; }
@@ -268,10 +295,22 @@ async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
     x.replyUnknown ? '[引用了一条认不出的消息]' : ''
   ].join('');
   const chat = items.map(x => `${x.nick}(${x.qq})${tags(x)}: ${x.text}`).join('\n');
-  const mode = inThread
+  const mode = atDirect
+    ? [
+        '这一轮有人**直接 @ 了你**，而主会话还没回 —— 这一条就是给你的，答它。',
+        '只答被问到的那件事，别顺带点评别人；答不上来（问的是你不了解的东西）就 SILENT。'
+      ].join('\n')
+    : inThread
     ? [
         `刚刚有人点过你的名（${withWhom.join('、') || '群里的人'}），那场话还没散。`,
         '接着那场话说；话题已经换掉就 SILENT。'
+      ].join('\n')
+    : perms.strong
+    ? [
+        '这一轮没有人点你的名 —— 但**这个群已经开放「强相关回复」，不必等点名**。',
+        '判据只有一条：**这几句跟你强相关吗** —— 在说你（含「那只鱼」这类代称）、在问你、',
+        '在聊你正在做的那件事、在说你懂的东西。强相关就**接一句**。',
+        '别人在聊他们自己的事（游戏、作业、吃什么），你只是想凑个热闹 —— SILENT。'
       ].join('\n')
     : [
         '这一轮没有人点你的名 —— 但**不必等点名**。',
@@ -306,7 +345,9 @@ async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
     '   要提就说「图我这边看不到，说说里面是啥」，或者干脆不说。',
     '4. 标签的意思：[@你]=直接叫你；[回你的话]=引用回复你；[点你名]=正文提到你的名字；',
     '   [@全体]=广播，不是在叫你；[回X的话]=这句是回应 X 的 —— 除非话题跟你在的这件是一回事，否则别接。',
-    '5. 有人 [@你] 的那条由主会话回，别抢；你能接的是它之后紧接着的那几句。',
+    perms.at
+      ? '5. 本群已经放开 [@你] —— 那条由你来答（主会话没回的情况下），只答那件事，别顺势展开一长段。'
+      : '5. 有人 [@你] 的那条由主会话回，别抢；你能接的是它之后紧接着的那几句。',
     '6. **一句话想多长就多长** —— 长的短的交错才像人。',
     '6▸ **你换行 = 分条发**（2026-10-22 主人定的）：「在群里的消息，我建议你每条单独发，如果真的很多的话就可以一起」。',
     '   ⇒ 你写一行、我就分一条消息发出去（中间隔不到一秒，像人在打字）；写满 5 行或总共超过一百五十字，',
@@ -357,8 +398,85 @@ async function decide(gid, items, { inThread = false, withWhom = [] } = {}) {
   return (j.choices?.[0]?.message?.content ?? '').trim();
 }
 
+/**
+ * 二次判断（2026-10-26 10:30 主人要的）：「系统判为提到名字 / 代称 ⇒ 要回」这件事，
+ * 只当**线索**。真正决定之前，先把**触发那条的上下文**读一遍，再问一次「这条到底要不要我回」。
+ *
+ * 为什么需要它（都是真实踩过的）：
+ *   · 群里还有另一个也叫「大肥鱼」的 bot —— 名字命中 ≠ 在叫我；
+ *   · 「川宝你不是大肥鱼，你是我的女」—— 名字出现了，但那句是 @ 别人的；
+ *   · 「大肥鱼这称呼比任何@都好使」—— 名字出现了，但那是在**议论**这个名字，不是找我说话。
+ * 这三条按旧逻辑都满足「提到名字」；旧逻辑里它只是"赶紧看一眼"的触发器，模型仍可能接一句多余的。
+ * 现在多一道**只看上下文**的判断，且明确要求它回答「这个名字指的是谁」。
+ *
+ * 输出（沿用同一套指令格式，好让下游的 parseDirective / replyGate / 去重闸都照旧生效）：
+ *   SKIP: <一句话为什么不用回>     ← 不回
+ *   REPLY: ...                    ← 回，文字照常走全部闸
+ */
+async function reviewNamed(gid, items, trigger) {
+  const ctx = contextAround(items, trigger);
+  const tagOf = (x) => [
+    x.self ? '[你自己]' : '',
+    x.addressed ? '[@你]' : '',
+    x.atAll ? '[@全体]' : '',
+    x.named ? '[点你名]' : '',
+    x.replyToMe ? '[回你的话]' : '',
+    x.replyToOther ? '[回' + (x.replyToNick || '别人') + '的话]' : '',
+    x.replyUnknown ? '[引用了一条认不出的消息]' : '',
+    x.ts === trigger.ts && x.qq === trigger.qq ? '[系统判为提到你的名字/代称]' : ''
+  ].join('');
+  const chat = ctx.map(x => `${x.nick}(${x.qq})${tagOf(x)}: ${x.text}`).join('\n');
+  const prompt = [
+    `你在群里（群号 ${gid}），你叫汐 —— 旧名/代称是「大肥鱼」「小鲸鱼」「鲸鱼娘」「肥鱼」，别人这么叫你也应。`,
+    '',
+    '系统刚才报了一条：**下面这段里有你的名字或代称**。但那只是字面命中 —— 名字出现不等于在跟你说话，',
+    '群里还有别人（甚至别的 bot）用了同类的名字。下面是那条**前面几句、那条本身、后面几句**：',
+    '',
+    chat,
+    '',
+    '现在只做一件事：**二次判断 —— 这条要不要我回？** 按顺序想，别跳步：',
+    '1. 这个名字指的是**我**吗？（有别的 bot / 别人的昵称也是鱼 → 可能不是叫我）',
+    '2. 这句是**对谁说的**？@ 了别人、在回答别人、在议论别人 → 不是在跟我说话；',
+    '3. 提名字的**方式**是哪一种：在叫我（问我在不在 / 问我事 / 说我在做的事）／拿我打趣或当例子／',
+    '   在议论「大肥鱼」这个名字本身？后两种多数不用我开口；',
+    '4. 话题**过去**了吗？后面几句已经把话岔开、别人已经答完了 → 不用回。',
+    '5. 如果我上一次已经答过这件事（上面带 [你自己] 的就是我说过的），**别再答一遍**。',
+    '',
+    '输出只能是下面两种之一：',
+    '  SKIP: <一句话说明为什么不用回>',
+    '  REPLY: <第一句>',
+    '         <第二句，换行另起，可省略>',
+    '铁律不变：没有具体东西要说就 SKIP；不猜图里的内容（图到你这里只是 `[图片]`）；不提主人的私事。'
+  ].join('\n');
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), DECIDE_TIMEOUT_MS);
+  let r;
+  try {
+    r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${KEY}` },
+      body: JSON.stringify({
+        model: MODEL,
+        temperature: 0.4,   // 这一步是判断，不是写话 —— 比 decide() 那步稳一点
+        max_tokens: MAX_OUT_TOKENS,
+        messages: [
+          { role: 'system', content: groupPersona() },
+          { role: 'user', content: prompt }
+        ]
+      })
+    });
+  }
+  finally { clearTimeout(timer); }
+  if (!r.ok) throw new Error(`llm(review) ${r.status} ${await r.text()}`);
+  const j = await r.json();
+  return (j.choices?.[0]?.message?.content ?? '').trim();
+}
+
 // ---------------------------------------------------------------- 动作
 async function sendGroup(gid, text) {
+
   const r = await fetch(`${NAPCAT}/send_group_msg`, {
     method: 'POST',
     // 没上限的话，NapCat 一挂这条 fetch 就一直挂着，整轮 wake() 卡死在里面
@@ -513,6 +631,7 @@ async function runOnce({ dry = false } = {}) {
     const items = recent(gid);
     const fresh = items.filter(x => x.ts > (state.lastCheck ?? 0));
     if (fresh.length === 0) continue;
+    const perms = loadPerms()[gid] ?? {};   // 本群的放开档（见 permissions.json）
 
     // 2026-10-23 16:0x 主人点破的机制：「人家群里都没有说这个话题了，你不会每隔一段时间就扫一遍，
     //   然后发现人家提到你了，你就再说一遍，但是不记得自己说过了一遍」。
@@ -551,8 +670,10 @@ async function runOnce({ dry = false } = {}) {
       }
     }
 
-    // 有人 @ 她：那条已经由 agent 会话处理，这里不重复接话。
-    // 但要把「这场话」记下来 —— @ 之后紧接着的几句，还算是跟她在说，她接得上。
+    // 有人 @ 她：默认那条由 agent 会话处理，这里不重复接话 ——
+    // 但**本群若开了 at 权限**（permissions.json），本机也接，前提是主会话还没回。
+    // 「主会话回过了」怎么认：插件把主会话发进群的话也写进 raw.jsonl，窗口里带 self 的就是回过。
+    let atDirect = false;
     const mentions = fresh.filter(x => x.addressed);
     if (mentions.length > 0) {
       state.lastMention = state.lastMention ?? {};
@@ -563,8 +684,13 @@ async function runOnce({ dry = false } = {}) {
         state.threadWith[gid] = [...new Set(mentions.map(x => x.qq))];
       }
       saveState(state);
-      log(`[${gid}] 有 @，交给主会话回（本机不抢）；之后 ${THREAD_MS / 60000} 分钟内这场话还接得上`);
-      continue;
+      const repliedByMain = items.some(x => x.self && x.ts > at);
+      if (!perms.at || repliedByMain) {
+        log(`[${gid}] 有 @，交给主会话回（${perms.at ? '主会话已经回过了' : '本群没开 at 权限'}）；之后 ${THREAD_MS / 60000} 分钟内这场话还接得上`);
+        continue;
+      }
+      atDirect = true;
+      log(`[${gid}] 有 @，本群开了 at 权限、主会话还没回 → 本机接`);
     }
 
     // 硬门槛：没人在 THREAD_MS 内点过她 ⇒ 不准开口（仍可以让模型记 NOTE）
@@ -572,12 +698,36 @@ async function runOnce({ dry = false } = {}) {
     const inThread = mentionAt > 0 && Date.now() - mentionAt <= THREAD_MS;
     const withWhom = state.threadWith?.[gid] ?? [];
 
+    // 2026-10-26 10:30 主人要的那道**二次判断**：
+    //   这一轮如果出现了「提到我名字 / 代称」的消息（且不是真 @，真 @ 上面已经交给主会话了），
+    //   就不直接走 decide() —— 先拿**那条的上下文**问一遍 reviewNamed「这条要不要我回」。
+    //   它说 SKIP 就到此为止；它说 REPLY 就照常往下走（所有老闸：replyGate / 去重 / 分条 都还在）。
+    //   没有名字命中的轮次 → 完全不变，照旧 decide()。
+    const namedTrigger = atDirect ? null : [...fresh].reverse().find(x => x.named && !x.self);
     let out;
-    try { out = await decide(gid, items, { inThread, withWhom }); }
-    catch (e) { log(`[${gid}] decide 失败: ${e.message}`); continue; }
+    try {
+      if (namedTrigger) {
+        log(`[${gid}] 名字/代称命中 → 二次判断（触发 ${namedTrigger.nick}: ${namedTrigger.text.slice(0, 40)}）`);
+        out = await reviewNamed(gid, items, namedTrigger);
+      } else {
+        out = await decide(gid, items, { inThread, withWhom, perms, atDirect });
+      }
+    }
+    catch (e) { log(`[${gid}] ${namedTrigger ? 'review' : 'decide'} 失败: ${e.message}`); continue; }
     if (!out) continue;
     // 模型到底吐了什么 —— 排查「为什么它不开口」时先看这一行（WATCH_DEBUG=1 才打）
     if (process.env.WATCH_DEBUG) log(`[${gid}] raw: ${out.replace(/\n/g, ' ⏎ ').slice(0, 300)}`);
+
+    // 二次判断的「不回」：记一句为什么，然后收 —— 不进发送链路
+    const skip = /^SKIP\s*[:：]\s*([\s\S]*)$/i.exec(out);
+    if (skip) {
+      const why = skip[1].replace(/\s+/g, ' ').trim().slice(0, 160);
+      state.reviews = state.reviews ?? {};
+      state.reviews[gid] = [...(state.reviews[gid] ?? []), { at: Date.now(), why }].slice(-30);
+      saveState(state);
+      log(`[${gid}] 二次判断：不回（${why || '没给理由'}）· 触发: ${namedTrigger.nick}: ${namedTrigger.text.slice(0, 40)}`);
+      continue;
+    }
 
     const line = parseDirective(out);
     if (line === '') continue;
@@ -773,5 +923,5 @@ if (isMain) {
   process.on('SIGINT', () => { clearInterval(timer); process.exit(0); });
 }
 
-export { replyGate, parseDirective };
+export { replyGate, parseDirective, contextAround, reviewNamed };
 

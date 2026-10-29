@@ -1302,6 +1302,27 @@ function Initialize-Panel {
       else { $script:pvoiceLbl.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 136) }
     })
 
+  # 打电话（2026-10-26）：跟热键 Ctrl+Alt+K、右键菜单同一个入口。
+  # Show-CallWindow 定义在 pet-wf.ps1（本文件是它 dot-source 进来的，同一个作用域）。
+  $callLbl = New-Object System.Windows.Forms.Label
+  $callLbl.Text = '话'
+  $callLbl.AutoSize = $false
+  $callLbl.Size = New-Object System.Drawing.Size(28, 28)
+  $callLbl.TextAlign = 'MiddleCenter'
+  $callLbl.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+  $callLbl.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 136)
+  $callLbl.BackColor = [System.Drawing.Color]::Transparent
+  $callLbl.Location = New-Object System.Drawing.Point(($script:pW - 114), 14)
+  $callLbl.Anchor = 'Top,Right'
+  $callLbl.Cursor = 'Hand'
+  [void]$head.Controls.Add($callLbl)
+  $script:pcallLbl = $callLbl
+  $callLbl.Add_Click({
+      if (Get-Command Show-CallWindow -ErrorAction SilentlyContinue) { Show-CallWindow }
+    })
+  $callLbl.Add_MouseEnter({ $script:pcallLbl.ForeColor = [System.Drawing.Color]::White })
+  $callLbl.Add_MouseLeave({ $script:pcallLbl.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 136) })
+
   # 拖窗口：无边框只能自己拖，抓顶部空白处
   $script:pdrag = $false
   $script:pdx = 0

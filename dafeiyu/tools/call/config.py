@@ -134,6 +134,14 @@ CALL_FIELDS = [
      "hint": "秒。0.90 比较自然；太小会抢话，太大要等"},
     {"key": "max_reply_chars", "label": "一句最多几个字", "kind": "int", "min": 10, "max": 80,
      "hint": "电话里长了没人听完"},
+    # ★ 2026-10-26 22:5x —— 「第二套方案」的接线口：走 QQ，而不是走喇叭。
+    #   开 = 听默认喇叭的**环回**（QQ 那头说什么），说进 **VB-Cable**（QQ 的麦克风听这个）。
+    #   前提：QQ 的麦克风设成 `CABLE Output (VB-Audio Virtual Cable)`，喇叭保持默认设备。
+    #   两条腿都实测过（`C:\dsh-temp\qq-route-test.py`：A 0.15 的 1kHz 从 CABLE 原样录回，
+    #   B 0.03 的 1kHz 从默认喇叭环回也录到了）。
+    {"key": "qq_mode", "label": "走 QQ 通话（虚拟声卡）", "kind": "choice", "options": [
+        ["true", "开：听喇叭环回、说进 CABLE"], ["false", "关：麦克风 + 喇叭（本机通电话）"]],
+     "hint": "开了之后通话窗不再用你的麦克风，改用 QQ 那套设备"},
 ]
 # 「通话时让壁纸退场」要 res.py（资源管家）在才有意义。
 if _HAS_RES:
@@ -161,7 +169,9 @@ DEFAULTS = {
     #   实测卡的是**画面输出这条管线**：wallpaper64 的 videodecode 81.8% + videoprocessing 52.1%、
     #   dwm 3d 60.7%，而 5080 是 0%/4.3W。它不是我们的进程，但通话时让它让位、挂断还回去，
     #   才是「把资源放到合理的位置」而不是「关掉」。
-    "call": {"silence_end": 0.90, "max_reply_chars": 25, "yield_wallpaper": True},
+    "call": {"silence_end": 0.90, "max_reply_chars": 25, "yield_wallpaper": True,
+             # 走 QQ 的虚拟声卡那条路（听喇叭环回 / 说进 VB-Cable）。默认关：本机打电话更简单。
+             "qq_mode": False},
 }
 
 

@@ -41,6 +41,25 @@ function Trace-Paint($tag, $err) {
     } catch { }
 }
 
+# ---------------------------------------------------------------- 给 python 的小纸条
+# 闭麦 / 静音 / 挂断都走同一条路：**整份重写** state\call\petcall.cmd。
+# python 每 150ms 读一次，读到什么就是「现在要什么」——所以读到一半不要紧（下一轮再读）。
+# ⚠ 但**绝不能追加**：追加会把上一次的 'out off' 一直留在文件里，于是永远静音。
+function Send-Cmd {
+    param([switch]$Hangup)
+    try {
+        if (-not (Test-Path $stateDir)) { return }
+        if ($Hangup) {
+            Set-Content -Path $cmd -Value 'hangup' -Encoding UTF8 -NoNewline
+            return
+        }
+        $micLine = if ($script:micOff) { 'mic off' } else { 'mic on' }
+        $outLine = if ($script:spkOff) { 'out off' } else { 'out on' }
+        Set-Content -Path $cmd -Value ($micLine + "`r`n" + $outLine) -Encoding UTF8
+        $script:cmdAt = Get-Date
+    } catch { }
+}
+
 # ---------------------------------------------------------------- 起 / 收 通话进程
 $script:child = $null
 
@@ -64,7 +83,7 @@ function Start-Call {
 function Stop-Call {
     # 先礼后兵：写 hangup 让它自己收尾（会把流水落盘）
     try {
-        if (Test-Path $stateDir) { Set-Content -Path $cmd -Value 'hangup' -Encoding UTF8 -NoNewline }
+        if (Test-Path $stateDir) { Send-Cmd -Hangup }
     } catch { }
     for ($i = 0; $i -lt 25; $i++) {
         if (-not $script:child -or $script:child.HasExited) { break }
@@ -205,7 +224,15 @@ $PAL = @{
     starting  = @{ text = '正在接通…'; c = [System.Drawing.Color]::FromArgb(122, 136, 156) }
     failed    = @{ text = '没接通'; c = [System.Drawing.Color]::FromArgb(226, 110, 110) }
 }
-$script:vis = @{ state = 'starting'; level = 0.0; seconds = 0; heard = ''; reply = ''; alive = $true; ready = $false }
+$script:vis = @{ state = 'starting'; level = 0.0; seconds = 0; heard = ''; reply = ''; alive = $true; ready = $false; mode = 'local' }
+# ★ 2026-10-26 22:2x 他要两个「暂时停一下」的键：
+#   · 闭麦 = 不听（python 那边直接把麦克风的帧丢掉，VAD 不再攒句）
+#   · 静音 = 她不出声（正在播的立刻掐掉，之后她那句只留在屏幕上）
+#   两个都是开关，状态由 python 回读（petcall.json 的 mic / out），界面只是画出来。
+$script:micOff = $false
+$script:spkOff = $false
+$script:hovSw = @{}                       # 两个小键各自的悬停
+$script:cmdAt = [datetime]::MinValue      # 上次按下去的时间（挡住旧 JSON 把按钮闪回去）
 $script:tick = 0
 $script:closing = $false
 
@@ -363,6 +390,7 @@ function Build-Gfx {
     $script:oFont.bubble = New-Object System.Drawing.Font('Microsoft YaHei UI', 9.5)
     $script:oFont.hint   = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
     $script:oFont.btn    = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5, [System.Drawing.FontStyle]::Bold)
+    $script:oFont.sw     = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
 
     # ---- 三块固定矩形（每帧不再 New-Object）
     $script:rfGlyph  = New-Object System.Drawing.RectangleF(0, [single]($CY - 28), [single]$STAGE_W, 56)
@@ -386,6 +414,15 @@ function Build-Gfx {
     $script:oBrush.btnTxt   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 244, 244))
     $script:oBrush.btnDead  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(34, 42, 56))
     $script:oBrush.hl       = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(58, 255, 255, 255))
+
+    # ---- 闭麦 / 静音那两个小键：「已经停了」用亮色填满，「照常在跑」是暗底 + 灰字。
+    #   两个颜色分开是故意的 —— 一眼要看出停的是哪一头（听的那头 / 说的那头）。
+    $script:oBrush.swBg    = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(20, 26, 36))
+    $script:oBrush.swBgHov = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(31, 39, 53))
+    $script:oBrush.swMicOn = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(96, 156, 226))
+    $script:oBrush.swSpkOn = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(214, 158, 78))
+    $script:oBrush.swTxt   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 164, 184))
+    $script:oBrush.swTxtOn = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(12, 18, 28))
 
     # ---- 笔
     $script:oPen.lvlDim = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(48, 96, 140), [single]3.0)
@@ -595,17 +632,20 @@ $trans.Add_Paint({
         }
 
         if (-not $heard -and -not $reply) {
-            $g.DrawString('说话就行，她能听见', $script:oFont.hint, $script:oBrush.hint,
+            # 走 QQ 那条路时这句得换 —— 不然写着「她能听见」，其实她听的是电话那头
+            $hint = if ("$($script:vis.mode)" -eq 'qq') { 'QQ 通话中 · 她听电话那头' } else { '说话就行，她能听见' }
+            $g.DrawString($hint, $script:oFont.hint, $script:oBrush.hint,
                 (New-Object System.Drawing.RectangleF(0, 54, [single]$TRANS_W, 24)), $script:oFmt.center)
         }
     } catch { Trace-Paint 'trans' $_.Exception }
 })
 
 # ---- 压断键（自绘：渐变 + 圆角 + 悬停变亮）
-$BTW = 168; $BTH = 44
+#   底下一行三个键：[闭麦] [静音] [挂 断] —— 左边 12、右边 12，中间留 8 / 24
+$BTW = 132; $BTH = 44
 $btn = New-Object System.Windows.Forms.Panel
 $btn.Size = New-Object System.Drawing.Size($BTW, $BTH)
-$btn.Location = New-Object System.Drawing.Point([int](($WINW - $BTW) / 2), ($WINH - 74))
+$btn.Location = New-Object System.Drawing.Point(($WINW - $BTW - 12), ($WINH - 74))
 $btn.BackColor = [System.Drawing.Color]::FromArgb(24, 16, 20)
 $btn.Cursor = 'Hand'
 Set-DoubleBuffered $btn
@@ -641,6 +681,58 @@ $btn.Add_Paint({
 })
 $btn.Add_MouseEnter({ $script:hover = $true; $btn.Invalidate() })
 $btn.Add_MouseLeave({ $script:hover = $false; $btn.Invalidate() })
+
+# ---- 两个「暂时停一下」的小键（闭麦 / 静音）
+#   自绘的理由跟挂断键一样：系统 Button 自带边框和焦点虚线，摆在这一排里就花了。
+#   每个键把「哪个开关、写什么字、一次造好的矩形」塞进 Tag —— 每帧一个新对象都不造。
+$SWW = 80; $SWH = 44; $SWY = $WINH - 74
+function New-Switch {
+    param([string]$key, [string]$text, [int]$x)
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Size      = New-Object System.Drawing.Size($SWW, $SWH)
+    $p.Location  = New-Object System.Drawing.Point($x, $SWY)
+    $p.BackColor = [System.Drawing.Color]::FromArgb(18, 22, 30)
+    $p.Cursor    = 'Hand'
+    Set-DoubleBuffered $p
+    $p.Region = New-Object System.Drawing.Region (New-RoundPath 0 0 $SWW $SWH 22)
+    $p.Tag = @{
+        key  = $key
+        text = $text
+        rect = New-Object System.Drawing.RectangleF(0, 0, [single]$SWW, [single]$SWH)
+    }
+    $p.Add_Paint({
+        param($s, $e)
+        try {
+            $g = $e.Graphics
+            $g.SmoothingMode = 'AntiAlias'
+            $g.TextRenderingHint = 'ClearTypeGridFit'
+            $k = "$($s.Tag.key)"
+            $on = if ($k -eq 'mic') { [bool]$script:micOff } else { [bool]$script:spkOff }
+            $hov = [bool]$script:hovSw[$k]
+            $fill =
+                if ($on) { if ($k -eq 'mic') { $script:oBrush.swMicOn } else { $script:oBrush.swSpkOn } }
+                elseif ($hov) { $script:oBrush.swBgHov }
+                else { $script:oBrush.swBg }
+            $g.FillRectangle($fill, 0, 0, $SWW, $SWH)
+            $txtBrush = if ($on) { $script:oBrush.swTxtOn } else { $script:oBrush.swTxt }
+            $g.DrawString("$($s.Tag.text)", $script:oFont.sw, $txtBrush, $s.Tag.rect, $script:oFmt.center)
+        } catch { Trace-Paint 'sw' $_.Exception }
+    })
+    $p.Add_MouseEnter({ param($s, $e) $script:hovSw["$($s.Tag.key)"] = $true;  $s.Invalidate() })
+    $p.Add_MouseLeave({ param($s, $e) $script:hovSw["$($s.Tag.key)"] = $false; $s.Invalidate() })
+    $p.Add_Click({
+        param($s, $e)
+        if ("$($s.Tag.key)" -eq 'mic') { $script:micOff = -not $script:micOff }
+        else                           { $script:spkOff = -not $script:spkOff }
+        Send-Cmd                  # 立刻告诉 python；按钮同时也立刻变，不等那 120ms 回读
+        $script:sigT = ''
+        $s.Invalidate()
+    })
+    $f.Controls.Add($p)
+    return $p
+}
+$btnMic = New-Switch 'mic' '闭麦' 12
+$btnSpk = New-Switch 'spk' '静音' 100
 
 # ---------------------------------------------------------------- 拖动
 $script:drag = $false; $script:dx = 0; $script:dy = 0
@@ -701,8 +793,18 @@ $timer.add_Tick({
         $script:vis.reply   = "$($st.reply)"
         $script:vis.alive   = [bool]$st.alive
         $script:vis.ready   = [bool]$st.ready
+        $pmode = $st.PSObject.Properties['mode']
+        if ($pmode) { $script:vis.mode = "$($pmode.Value)" }
         if (-not $st.ready -and $st.state -ne 'failed') { $script:vis.state = 'starting' }
         if ($st.state -eq 'failed') { $script:vis.reply = "$($st.heard)" }
+        # 闭麦 / 静音以 python 为准（它是真正执行的那一头）。但刚按下去的头 800ms 不认 ——
+        # 那一刻文件里还是上一次的值，照着它画会把按钮闪回去。
+        if (((Get-Date) - $script:cmdAt).TotalMilliseconds -gt 800) {
+            $pmv = $st.PSObject.Properties['mic']
+            if ($pmv) { $script:micOff = [bool]$pmv.Value }
+            $pov = $st.PSObject.Properties['out']
+            if ($pov) { $script:spkOff = [bool]$pov.Value }
+        }
     }
 
     if ($script:vis.alive -eq $false -and -not $script:closing) {
@@ -714,11 +816,13 @@ $timer.add_Tick({
     $v = $script:vis
     $stx = "$($v.state)"
 
-    $sigT = "$stx|$($v.heard)|$($v.reply)"
+    $sigT = "$stx|$($v.heard)|$($v.reply)|$($script:micOff)|$($script:spkOff)"
     if ($sigT -ne $script:sigT) {
         $script:sigT = $sigT
         $trans.Invalidate()
         $btn.Invalidate()
+        $btnMic.Invalidate()
+        $btnSpk.Invalidate()
     }
 
     $sigS = "$stx|$([int]$v.seconds)"

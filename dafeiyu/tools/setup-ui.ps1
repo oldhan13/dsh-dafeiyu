@@ -823,6 +823,7 @@ $EXT_MODULES = @(
     [ordered]@{ id = 'comfy'; title = '生图'; h = 124; desc = '她能用这块显卡画图，说一句就出图，十几秒一张。'; need = '需要：约 24 GB 磁盘、8 GB 以上显存；装完常驻 8188' }
     [ordered]@{ id = 'voice'; title = '语音 · 念一句'; h = 124; desc = '让她把一句话念出来 —— 跟电话里是同一个声音（不是另配一套）。'; need = '需要：跟「语音通话」共用一份设置，音色去那里挑；只有 cloud / openai 才要 key' }
     [ordered]@{ id = 'call'; title = '语音通话 · 真的能聊'; h = 152; desc = '戴上耳机跟她说话：她听得见、答得出，声音从喇叭出来。桌宠和网页两个入口。'; need = '需要：Python 3.10+（装一次）。三步：① 装好它 ② 挑声音（能试听）③ 开通话窗' }
+    [ordered]@{ id = 'sing'; title = '唱歌 · 把别人的唱换成她的嗓子'; h = 124; desc = '丢一段清唱进去，只换音色 —— 旋律和换气都留在原唱上，所以听着像真人在唱。'; need = '需要：约 1.2 GB 权重 + 一张能跑 torch 的显卡；不用训练' }
     [ordered]@{ id = 'qq'; title = 'QQ 通道'; h = 124; desc = '手机上也能找她 —— 小号挂在 NapCat 上，QQ 里说话她听得见。'; need = '需要：NapCat + 一个小号（主界面卡片 ② 填）' }
 )
 
@@ -923,6 +924,40 @@ function Get-ExtStates {
         asrUp     = (Test-LocalPort $asrPort)
         sovPort   = $sovPort
         asrPort   = $asrPort
+    }
+
+    # 唱歌（2026-10-28 加的）：跟通话一样，只读本地事实 —— 文件在不在，绝不在界面里起 python。
+    #   设置是 state\call\sing.json；成品路径记在 state\call\sing-last.txt（sing.py 不写这个，
+    #   由界面这边在跑完之后自己记，免得 sing.py 为了界面多长一条依赖）。
+    $sgRoot = ''; $sgPy = ''; $sgRef = ''; $sgSteps = 30; $sgSemi = 0
+    $singCfg = Join-Path $CALL_STATE 'sing.json'
+    if (Test-Path $singCfg) {
+        try {
+            $sj = Get-Content $singCfg -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($sj.seedvc_root) { $sgRoot = [string]$sj.seedvc_root }
+            if ($sj.python) { $sgPy = [string]$sj.python }
+            if ($sj.reference) { $sgRef = [string]$sj.reference }
+            if ($null -ne $sj.steps) { $sgSteps = [int]$sj.steps }
+            if ($null -ne $sj.semitones) { $sgSemi = [int]$sj.semitones }
+        } catch { }
+    }
+    $sgHasModel = $false
+    if ($sgRoot) {
+        $sgHasModel = Test-Path (Join-Path $sgRoot 'checkpoints\DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2.pth')
+    }
+    $sgLast = ''
+    $sgLastFile = Join-Path $CALL_STATE 'sing-last.txt'
+    if (Test-Path $sgLastFile) { try { $sgLast = (Get-Content $sgLastFile -Raw -Encoding UTF8).Trim() } catch { } }
+    $st.sing = [ordered]@{
+        model  = $sgHasModel
+        python = [bool]($sgPy -and (Test-Path $sgPy))
+        ref    = [bool]($sgRef -and (Test-Path $sgRef))
+        root   = $sgRoot
+        pyPath = $sgPy
+        refPath = $sgRef
+        steps  = $sgSteps
+        semi   = $sgSemi
+        last   = $sgLast
     }
     return $st
 }
@@ -1099,6 +1134,19 @@ function Show-Extensions {
         elseif ($c.check) { $colCall = '#b91c1c'; $badCall = '缺东西' }
         elseif ($c.py) { $colCall = '#6b7280'; $badCall = '没验过' }
         Set-Stat 'call' $txtCall $badCall $colCall
+
+        # 唱歌 · 换音色（2026-10-28 他要的：把唱歌并进「配置的拓展」）
+        $sg = $s.sing
+        $lastLeaf = '没唱过'
+        if ($sg.last) { $lastLeaf = Split-Path $sg.last -Leaf }
+        $txtSg = ('权重 ' + (& $mk $sg.model) + ' · Python ' + (& $mk $sg.python) +
+            ' · 参考音色 ' + (& $mk $sg.ref) + ' · 上次 ' + $lastLeaf)
+        $okSg = [bool]($sg.model -and $sg.python -and $sg.ref)
+        $colSg = '#6b7280'
+        $badSg = '没配'
+        if ($okSg) { $colSg = '#15803d'; $badSg = '能唱' }
+        elseif ($sg.model -or $sg.python -or $sg.ref) { $colSg = '#b91c1c'; $badSg = '缺一项' }
+        Set-Stat 'sing' $txtSg $badSg $colSg
 
         # 语音（念一句）—— ★ 2026-10-26 改：不再自己另算一套，
         #   跟「语音通话」**共用同一份设置**（音色、依赖都看 state\call\config.json）。
@@ -1284,6 +1332,23 @@ function Show-Extensions {
                     })
                 $b4.Add_Click({ if (Test-Path $CALL_DIR) { Start-Process $CALL_DIR } else { ELog ('没有这个目录：' + $CALL_DIR) } })
             }
+            'sing' {
+                $b1 = New-Button $pnl '设置…' 14 86 110 -Primary
+                $b2 = New-Button $pnl '唱一段试试' 132 86 110
+                $b3 = New-Button $pnl '打开上次的成品' 250 86 130
+                $b4 = New-Button $pnl '自检' 388 86 80
+                New-Label $pnl '第一次用点「设置…」：填 Seed-VC 目录和参考音色，自检过了就能唱。' 14 124 700 20 $fSub $MUTED | Out-Null
+                $b1.Add_Click({ Show-SingSettings; Update-ExtAll })
+                $b2.Add_Click({ Start-SingPick })
+                $b3.Add_Click({
+                        $lp = Join-Path $CALL_STATE 'sing-last.txt'
+                        if (-not (Test-Path $lp)) { ELog '还没唱过 —— 点「唱一段试试」。' ; return }
+                        $p = (Get-Content $lp -Raw -Encoding UTF8).Trim()
+                        if ($p -and (Test-Path $p)) { try { Start-Process $p } catch { } ; ELog ('打开：' + $p) }
+                        else { ELog ('上次那个文件不在了：' + $p) }
+                    })
+                $b4.Add_Click({ Show-SingSettings -CheckOnly; Update-ExtAll })
+            }
             'qq' {
                 $b1 = New-Button $pnl '打开 NapCat 目录' 14 86 140
                 $b2 = New-Button $pnl '打开身份配置' 162 86 120
@@ -1336,6 +1401,198 @@ function Show-Extensions {
 #   ③ **中文不过命令行**：这台机器 ACP=936，命令行里的中文会被搞坏。
 #      要说的话先写 UTF-8 临时文件，脚本用 `--text-file` / `--json-out` 读；回来也走文件。
 # ================================================================
+# ---- 唱歌（2026-10-28 他要的：「把唱歌功能整合一下」并加一项 GUI）----
+# 真源是 tools\call\sing.py（同一份也发在仓库 oldhan13/xibu-call 上）。
+#   界面这边只做三件事：读设置、存设置、开一个控制台去跑它。
+#   ★ 不在界面里跑长任务 —— 一次转换要 40~90 秒，模态窗会像死了。
+
+function Get-SingPython {
+    $cfgj = Join-Path $CALL_STATE 'sing.json'
+    if (Test-Path $cfgj) {
+        try {
+            $sj = Get-Content $cfgj -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($sj.python) { return [string]$sj.python }
+        } catch { }
+    }
+    return ''
+}
+
+# 跑 sing.py 用哪个 python：先看唱歌自己的设置，再看通话那个，最后 py 启动器。
+function Get-SingRunner {
+    $p = Get-SingPython
+    if ($p -and (Test-Path $p)) { return $p }
+    $cp = Get-CallPython
+    if ($cp -and $cp.exe) { return $cp.exe }
+    return 'python'
+}
+
+function Get-SingScript { return (Join-Path $CALL_DIR 'sing.py') }
+
+# 「唱一段试试」：挑一个源音频 → 开个控制台跑 sing.py → 成了就记下成品路径并打开。
+function Start-SingPick {
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = '挑一段唱（清唱最好；有伴奏也能试，只是会带上伴奏）'
+    $dlg.Filter = '音频 (*.wav;*.mp3;*.flac;*.m4a)|*.wav;*.mp3;*.flac;*.m4a|所有文件 (*.*)|*.*'
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $src = $dlg.FileName
+    $runner = Get-SingRunner
+    $script = Get-SingScript
+    $outDir = Join-Path $CALL_STATE 'out'
+    New-Item -ItemType Directory -Force $outDir | Out-Null
+    $stem = [IO.Path]::GetFileNameWithoutExtension($src)
+    $out = Join-Path $outDir ($stem + '-sung-' + (Get-Date).ToString('HHmm') + '.mp3')
+    $lastFile = Join-Path $CALL_STATE 'sing-last.txt'
+    $inner = "& '$runner' '$script' --source '$src' --out '$out' --json; " +
+             "if (`$LASTEXITCODE -eq 0) { Set-Content -LiteralPath '$lastFile' -Value '$out' -Encoding UTF8; " +
+             "Write-Host ('唱好了：' + '$out') -ForegroundColor Green; Start-Process '$out' } " +
+             "else { Write-Host '这次没成 —— 上面那几行就是原因' -ForegroundColor Yellow }"
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $inner)
+        ELog ('正在唱：' + (Split-Path $src -Leaf) + ' → 新开那个窗口里能看到进度')
+    } catch { ELog ('起不来：' + $_.Exception.Message) }
+}
+
+function Show-SingSettings {
+    param([switch]$CheckOnly)
+
+    $runner = Get-SingRunner
+    $script = Get-SingScript
+
+    # 现在的值
+    $curRoot = ''; $curPy = ''; $curRef = ''; $curSteps = 30; $curSemi = 0
+    $cfgj = Join-Path $CALL_STATE 'sing.json'
+    if (Test-Path $cfgj) {
+        try {
+            $sj = Get-Content $cfgj -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($sj.seedvc_root) { $curRoot = [string]$sj.seedvc_root }
+            if ($sj.python) { $curPy = [string]$sj.python }
+            if ($sj.reference) { $curRef = [string]$sj.reference }
+            if ($null -ne $sj.steps) { $curSteps = [int]$sj.steps }
+            if ($null -ne $sj.semitones) { $curSemi = [int]$sj.semitones }
+        } catch { }
+    }
+
+    $sf = New-Object System.Windows.Forms.Form
+    $sf.Text = '大肥鱼 · 唱歌'
+    $sf.Size = New-Object System.Drawing.Size(824, 620)
+    $sf.StartPosition = 'CenterScreen'
+    $sf.BackColor = $BG
+    $sf.FormBorderStyle = 'FixedSingle'
+    $sf.MaximizeBox = $false
+    $sf.Font = $fBody
+
+    New-Label $sf '唱歌 · 换音色' 22 12 300 32 $fTitle $INK | Out-Null
+    New-Label $sf '旋律和换气都留在原唱上，只换嗓子 —— 所以听着像真人在唱，不是 TTS 在压嗓。' 22 46 760 20 $fSub $MUTED | Out-Null
+
+    function SgBox([int]$y, [string]$label, [string]$value, [switch]$Browse, [string]$filter) {
+        New-Label $sf $label 22 ($y - 20) 760 18 $fSub $MUTED | Out-Null
+        $t = New-Object System.Windows.Forms.TextBox
+        $t.Location = New-Object System.Drawing.Point(22, $y)
+        $t.Size = New-Object System.Drawing.Size($(if ($Browse) { 660 } else { 760 }), 26)
+        $t.Font = $fMono
+        $t.Text = $value
+        $sf.Controls.Add($t)
+        if ($Browse) {
+            $b = New-Button $sf '浏览…' 690 $y 92
+            $b.Add_Click({
+                    $d = New-Object System.Windows.Forms.OpenFileDialog
+                    if ($filter) { $d.Filter = $filter }
+                    if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $t.Text = $d.FileName }
+                }.GetNewClosure())
+        }
+        return $t
+    }
+
+    # ★ 目录要的是文件夹，不是文件 —— 单独一个按钮，别跟 SgBox 的浏览混。
+    New-Label $sf 'Seed-VC 的目录（git clone 下来的那份，里面有 inference.py）' 22 76 700 18 $fSub $MUTED | Out-Null
+    $txRoot = New-Object System.Windows.Forms.TextBox
+    $txRoot.Location = New-Object System.Drawing.Point(22, 96)
+    $txRoot.Size = New-Object System.Drawing.Size(660, 26)
+    $txRoot.Font = $fMono
+    $txRoot.Text = $curRoot
+    $sf.Controls.Add($txRoot)
+    $bRoot = New-Button $sf '浏览…' 690 96 92
+    $bRoot.Add_Click({
+            $d = New-Object System.Windows.Forms.FolderBrowserDialog
+            if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txRoot.Text = $d.SelectedPath }
+        })
+
+    $txPy = SgBox 156 'Python（装了 torch 的那个；别用正在跑 TTS 的环境）' $curPy -Browse -filter 'python.exe|python.exe|所有文件 (*.*)|*.*'
+    $txRef = SgBox 216 '参考音色（你的干净人声，10~25 秒最好）' $curRef -Browse -filter '音频 (*.wav;*.mp3;*.flac)|*.wav;*.mp3;*.flac|所有文件 (*.*)|*.*'
+
+    New-Label $sf '扩散步数（30 = 默认；12~16 更快、差一点点）' 22 256 360 18 $fSub $MUTED | Out-Null
+    $txSteps = New-Object System.Windows.Forms.TextBox
+    $txSteps.Location = New-Object System.Drawing.Point(22, 276)
+    $txSteps.Size = New-Object System.Drawing.Size(80, 26)
+    $txSteps.Font = $fMono
+    $txSteps.Text = [string]$curSteps
+    $sf.Controls.Add($txSteps)
+
+    New-Label $sf '移调（半音，0 = 不动；+2 就是整段升两个半音）' 130 256 360 18 $fSub $MUTED | Out-Null
+    $txSemi = New-Object System.Windows.Forms.TextBox
+    $txSemi.Location = New-Object System.Drawing.Point(130, 276)
+    $txSemi.Size = New-Object System.Drawing.Size(80, 26)
+    $txSemi.Font = $fMono
+    $txSemi.Text = [string]$curSemi
+    $sf.Controls.Add($txSemi)
+
+    $slog = New-Object System.Windows.Forms.TextBox
+    $slog.Location = New-Object System.Drawing.Point(22, 372)
+    $slog.Size = New-Object System.Drawing.Size(760, 170)
+    $slog.Multiline = $true
+    $slog.ScrollBars = 'Vertical'
+    $slog.ReadOnly = $true
+    $slog.BackColor = [System.Drawing.Color]::White
+    $slog.Font = $fMono
+    $sf.Controls.Add($slog)
+
+    function SLog([string]$s) {
+        if (-not $s) { return }
+        $slog.AppendText($s + "`r`n")
+        $slog.SelectionStart = $slog.TextLength
+        $slog.ScrollToCaret()
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    $bSave = New-Button $sf '保存' 22 322 100 -Primary
+    $bSave.Add_Click({
+            try {
+                $args2 = @(
+                    "seedvc_root=$($txRoot.Text.Trim())",
+                    "python=$($txPy.Text.Trim())",
+                    "reference=$($txRef.Text.Trim())",
+                    "steps=$($txSteps.Text.Trim())",
+                    "semitones=$($txSemi.Text.Trim())"
+                )
+                $o = & $runner $script --set @args2 2>&1
+                if ($LASTEXITCODE -eq 0) { SLog ('存好了：' + ($o -join ' ')) } else { SLog ('没存上：' + ($o -join ' ')) }
+            } catch { SLog ('没存上：' + $_.Exception.Message) }
+        })
+
+    $bCheck = New-Button $sf '自检' 130 322 100
+    $bCheck.Add_Click({
+            SLog '—— 自检（权重 / 显卡 / 参考音色）'
+            try {
+                $o = & $runner $script --check 2>&1
+                SLog ($o -join "`r`n")
+            } catch { SLog ('起不来：' + $_.Exception.Message) }
+        })
+
+    $bSing = New-Button $sf '唱一段试试' 238 322 120
+    $bSing.Add_Click({ Start-SingPick })
+
+    $bClose = New-Button $sf '关上' 366 322 80
+    $bClose.Add_Click({ $sf.Close() })
+
+    $sf.Add_Shown({
+            if ($CheckOnly) { $bCheck.PerformClick() ; return }
+            SLog '第一次用：① 填 Seed-VC 目录 ② 填装了 torch 的 python ③ 填参考音色 → 点「自检」'
+            SLog '自检里 problems 是空的就能唱。权重没下齐时，它会把下载地址一起打出来（用 curl -L 下到 <Seed-VC>\checkpoints）。'
+        })
+
+    [void]$sf.ShowDialog()
+}
+
 function Get-CallSnapshot {
     $cp = Get-CallPython
     if (-not $cp) { return $null }

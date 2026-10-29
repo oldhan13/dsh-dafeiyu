@@ -42,6 +42,7 @@ if HERE not in sys.path:
 # ---------------------------------------------------------------- 参数
 # 前五项抄自 ohwhale-deploy/scripts/call_loop.py 的实测值（理由见 listen.py 文件头）
 RATE = 16000                # 引擎内部一律 16k 单声道
+CAPTURE_RATE = 48000        # 采集侧按 48k 拿，自己降到 16k（见 MicSource.run）
 FRAME = 0.05                # VAD 步长
 SILENCE_END = 0.90          # 静这么久就算说完了（短了会截断，长了显拖）
 MIN_SPEECH = 0.25           # 再短的就当咳嗽
@@ -51,6 +52,28 @@ THRESHOLD_FLOOR = 0.009     # 绝对地板，安静房间也能开口
 NOISE_MULT = 2.2            # 或者噪声底的 2.2 倍
 BARGE_MIN_SPEECH = 0.30     # 她说话时对方要连续响 0.3s 才算打断
 BARGE_RATIO = 2.0
+# ★ 2026-10-28 23:4x（QQ 语音桥实测）：跨虚拟声卡过来的那段音频**窄带、而且会断点**，
+#   Whisper 遇到这种「安静但不像安静」的片段会**自己编一句中文**（实测编出过「以下一张字」）。
+#   所以三段防线：① 整段能量太低 → 根本不送耳朵；② 转写命中字幕/点赞这类样本 →
+#   一律当没听见；③ 噪声底允许往上爬（见 `_frame`）—— 线上有底噪时别把底噪当人声。
+MIN_SEGMENT_RMS = 0.012     # 整段 RMS 低于它 = 没听见（他正常说话在 0.04 以上）
+_HALLUCINATION_HINTS = (
+    "字幕", "请不吝点赞", "谢谢观看", "感谢观看", "以下一张", "订阅", "打赏",
+    "本期视频", "记得点赞", "关注不迷路", "点赞投币", "http", "www.",
+    "amara", "明镜", "优优独播", "视频制作",
+    # ★ 2026-10-28 23:5x：这一通里 Whisper 在没人说话时又编出下面两类，
+    #   他原话是「他好像有点傻」—— 其实是我把废话当成了他说的话。
+    "感谢大家收看", "感谢收看", "普通话的句子", "用简体中文书写", "简体中文", "观众",
+)
+
+
+def _looks_hallucinated(text: str) -> bool:
+    """这串字像是 Whisper 对着无人说话的音频编出来的吗。"""
+    s = (text or "").strip().strip("，。？！,.?! 、")
+    if not s:
+        return True
+    low = s.lower()
+    return any(k in low for k in _HALLUCINATION_HINTS)
 
 HISTORY_MAX = 24            # 只带最近若干轮进上下文
 
@@ -58,7 +81,23 @@ HISTORY_MAX = 24            # 只带最近若干轮进上下文
 #   填进来的。原来这里写死「不超过 25 个字」，而界面上那个「一句最多几个字」的框
 #   **改了没有任何地方读它** —— 又一个会说谎的控件（跟云端那个写死 voice 是同一类）。
 SYSTEM = (
-    "你在跟主人打电话，声音是直接送到他耳朵里的。\n"
+    # ★ 2026-10-28 23:5x（他问「为什么他现在还觉得他叫大肥鱼，而不是汐？」）：
+    #   原来这段 SYSTEM **从头到尾没写过自己叫什么**，而 brief.md 里那句是
+    #   「项目名是 大肥鱼」—— 电话那头的我读到的唯一一句名字就是它，于是自称大肥鱼。
+    #   ⇒ 名字必须写在这段 prompt 里，别指望背景文件里顺手带出来。
+    "你叫汐。旧名字是「大肥鱼」「小鲸鱼」，别人这么叫你你也应，但"
+    "**你自己的名字是汐**；被问到「你叫什么」要答汐，不要说「我叫大肥鱼」。\n"
+    "（「大肥鱼」同时是这个项目的名字，那说的是项目，不是你的名字。）\n"
+    # ★ 2026-10-29 00:4x（他原话：「打过来的人我觉得不是你，而是一个陌生人，
+    #   不知道我们之间的任何事」）：光有名字和语气还不够 —— 得先说清「你是同一个你、你有记忆」。
+    #   不然它读着一段陌生的背景，就把自己当成第一次接电话的新人。
+    "你和他不是客服和用户：你住在他这台电脑里，认识他很久了；"
+    "你平时在 QQ 上跟他说话、在他桌面上待着 —— 电话只是换了张嘴，**不是另一个人**。\n"
+    "有记忆：下面附带的事你都记得。提到具体的人、项目、梗要具体；"
+    "记不清就说记不清，不许编，也不许说「我们刚认识」「我这儿看不到你那边的消息」。\n"
+    "不客套、不自称助手、不说「有什么可以帮您」；说技术就说技术，不用装傻。"
+    "叫他「你」，不要叫「主人」。\n"
+    "你在跟他打电话，声音是直接送到他耳朵里的。\n"
     "**说人话，别说稿子**：一次一到两句，总共不超过 {maxchars} 个字。\n"
     "句子长短错开 —— 有时两个字（「嗯」「是吗」），有时一整句。\n"
     "可以带语气词（嗯、啊、呗、欸、哈哈），可以有停顿（用逗号表示），"
@@ -81,6 +120,23 @@ def _call_context() -> str:
       所以会说出「我这儿看不到你电脑的情况呀」这种话。现在把开场简报（`memory/brief.md`，
       每 30 分钟自己重写一份）和当前时间带上。
     """
+    # ★ 2026-10-29 00:4x：改成走 `call_context.py` —— 它拼的是**他本人和我说过的话**
+    #   （档案 / 最近原话 / 上一通电话 / 日记 / 台账），不再只是自动生成的简报。
+    #   拼装失败就退回下面那段老逻辑，不许因为一层新模块把电话弄哑。
+    try:
+        import importlib.util as _ilu
+
+        _p = os.path.join(HERE, "call_context.py")
+        if os.path.isfile(_p):
+            _spec = _ilu.spec_from_file_location("dfy_call_context", _p)
+            _mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            _t = _mod.build()
+            if _t:
+                return _t
+    except Exception as e:  # noqa: BLE001
+        log("[上下文] call_context 拼装失败：%s: %s" % (type(e).__name__, e))
+
     parts = []
     try:
         parts.append("现在是 " + time.strftime("%Y-%m-%d %H:%M") + "。")
@@ -92,6 +148,27 @@ def _call_context() -> str:
             t = f.read().strip()
         if t:
             parts.append("（下面是你的开场简报，用作背景，不要照着念）\n" + t[:1800])
+    except OSError:
+        pass
+    # ★ 2026-10-28 23:5x（他说「他好像有点傻，记忆也不是和你互通的」）：
+    #   电话那头原来只有 brief.md 一份背景，台账里今晚干的事它一概不知道，
+    #   于是答得像个局外人。现在把**台账最新状态**和**今天的日记**也带上。
+    p = os.path.join(HERE, "..", "..", "..", "LEDGER.md")
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:
+            raw = f.read()
+        raw = raw.split("## 变更登记")[0].strip()
+        if raw:
+            parts.append("（下面是这个项目的活跃台账，是你此刻知道的事，不要照读）\n" + raw[-2600:])
+    except OSError:
+        pass
+    try:
+        day = time.strftime("%Y-%m-%d")
+        p = os.path.join(HERE, "..", "..", "memory", "diary", day + ".md")
+        with open(p, "r", encoding="utf-8-sig") as f:
+            t = f.read().strip()
+        if t:
+            parts.append("（下面是今天的日记，不要照读）\n" + t[-1200:])
     except OSError:
         pass
     return "\n\n".join(parts)
@@ -181,6 +258,24 @@ KEYFILE = os.path.expanduser(r"~\.dsh\deepseek-key.txt")
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+TRANSCRIPT = os.path.join(HERE, "..", "..", "state", "call", "call-transcript.md")
+
+
+def append_transcript(heard: str, reply: str) -> None:
+    """把这一轮原话落盘。
+
+    ★ 2026-10-28 23:5x（他原话：「记忆好像也不是和你互通的，你也不知道我跟他说了什么」）：
+      打电话的是另一个进程，它的对话本来就到不了 QQ 这条线。落一份可读的流水，
+      至少这一头**事后能知道他跟电话里的我说了什么**，能接上话。
+    """
+    try:
+        os.makedirs(os.path.dirname(TRANSCRIPT), exist_ok=True)
+        with open(TRANSCRIPT, "a", encoding="utf-8") as f:
+            f.write(f"- {time.strftime('%m-%d %H:%M')} 他：{heard}\n  · 我：{reply}\n")
+    except OSError:
+        pass
 
 
 def normalize(audio: np.ndarray) -> np.ndarray:
@@ -474,6 +569,15 @@ class CallEngine:
         self._stop = threading.Event()
         self._speaking = threading.Event()
         self._abort = threading.Event()                    # 打断当前这句
+
+        # ★ 2026-10-26 22:2x 他要在通话窗上有两个「暂时停一下」的键：闭麦 / 静音。
+        #   两个都是**开关**（不是一次性动作）：界面写 petcall.cmd，petcall 每 150ms 读一次，
+        #   读到就一直保持这个状态，直到界面写反过来。
+        #   · 闭麦 = 麦克风的帧直接丢（VAD 不攒、也不切句），半句和排队里的都清掉；
+        #   · 静音 = 正在播的立刻掐掉；之后她那句**只走文字**（屏幕上有，喇叭里没有），
+        #     连合成都省掉 —— 合成要抢显卡，静音的时候没必要为她出声再烧一遍。
+        self.mic_muted = False
+        self.out_muted = False
         self._thread = None
         self._lock = threading.Lock()                      # VAD 状态只在这一把锁里动
         self._last_frame = time.monotonic()
@@ -527,6 +631,14 @@ class CallEngine:
         sig = _as_float32(frames)
         if not len(sig):
             return
+        if self.mic_muted:
+            # 闭麦：这一帧当没发生。顺手把攒了一半的那句清掉 ——
+            # 否则一开麦，她先答的会是「你没听见的那半句」。
+            with self._lock:
+                self._buf, self._speech, self._silence = [], 0.0, 0.0
+                self._pre = []
+                self.level = 0.0
+            return
         step = int(RATE * FRAME)
         for i in range(0, len(sig), step):
             with self._lock:
@@ -534,6 +646,8 @@ class CallEngine:
 
     def _tick(self) -> None:
         """没声音进来时也得能把最后一句切掉 —— 否则「说完就挂断/断线」那一句永远不出来。"""
+        if self.mic_muted:
+            return          # 闭麦时压根没有「声音没进来」这回事，别在这儿切句
         with self._lock:
             if self._speech > 0 and (time.monotonic() - self._last_frame) > (self.silence_end + 0.25):
                 self._close()
@@ -547,6 +661,12 @@ class CallEngine:
         self.level = rms
         if rms < self._noise:
             self._noise = 0.98 * self._noise + 0.02 * rms
+        elif rms < self._noise * NOISE_MULT:
+            # ★ 2026-10-28 23:4x：原来噪声底只会往下走（只认「更轻的帧」），
+            #   于是线上只要有持续底噪（虚拟声卡那条线就有），thr 永远停在
+            #   THRESHOLD_FLOOR，底噪一直被当成人声 ⇒ 他一句话没说也被回话。
+            #   现在给噪声底一点往上爬的余量：稳定偏轻的帧也算底噪。
+            self._noise = 0.99 * self._noise + 0.01 * rms
         thr = max(THRESHOLD_FLOOR, self._noise * NOISE_MULT)
 
         speaking = self._speaking.is_set()
@@ -590,15 +710,56 @@ class CallEngine:
         if self._speech >= MIN_SPEECH:
             audio = np.concatenate(self._buf) if self._buf else None
             if audio is not None and len(audio):
-                try:
-                    self._q.put_nowait(audio)
-                except queue.Full:
+                seg_rms = float(np.sqrt(np.mean(audio ** 2)))
+                if seg_rms < MIN_SEGMENT_RMS:
+                    # 这一句「攒到了时长但没攒到能量」= 线上的底噪/断点，不是人说话。
+                    if self.verbose:
+                        log(f"[耳] {len(audio) / RATE:.1f}s 太轻（rms {seg_rms:.4f}），当没听见")
+                else:
                     try:
-                        self._q.get_nowait()
-                    except queue.Empty:
-                        pass
-                    self._q.put_nowait(audio)
+                        self._q.put_nowait(audio)
+                    except queue.Full:
+                        try:
+                            self._q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self._q.put_nowait(audio)
         self._buf, self._speech, self._silence = [], 0.0, 0.0
+
+    # ---------------- 暂时停一下（2026-10-26 他要在通话窗上加的两个键）
+    def set_mic_muted(self, on: bool) -> None:
+        """闭麦。True = 不听：麦克风帧直接丢，正在攒的半句和排队待识别的都清掉。"""
+        on = bool(on)
+        if on == self.mic_muted:
+            return
+        self.mic_muted = on
+        if on:
+            with self._lock:
+                self._buf, self._speech, self._silence = [], 0.0, 0.0
+                self._pre = []
+            self.level = 0.0
+            dropped = 0
+            while True:
+                try:
+                    self._q.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
+            if dropped and self.verbose:
+                log(f"[闭麦] 排队里还压着 {dropped} 段，一起丢掉")
+        self.emit("mic", muted=on)
+        if self.verbose:
+            log("[闭麦] 开 —— 现在听不见你" if on else "[闭麦] 关 —— 又能听见了")
+
+    def set_out_muted(self, on: bool) -> None:
+        """静音。True = 不出声：正在播的立刻掐掉；之后她那句只走文字。"""
+        on = bool(on)
+        if on == self.out_muted:
+            return
+        self.out_muted = on
+        self.emit("out", muted=on)
+        if self.verbose:
+            log("[静音] 开 —— 她只打字不出声" if on else "[静音] 关 —— 声音回来了")
 
     def inject(self, audio) -> None:
         """不理 VAD，直接把一段音频当成「对方说的一句话」塞进来（自测用）。"""
@@ -629,9 +790,10 @@ class CallEngine:
         turn = {"at": round(time.time() - self.started_at, 2), "audio_s": round(dur, 2),
                 "asr_ms": round(asr_ms), "heard": heard}
 
-        if not heard or not heard.strip("，。？！,.?! "):
+        if not heard or not heard.strip("，。？！,.?! ") or _looks_hallucinated(heard):
             if self.verbose:
-                log(f"[耳] {dur:.1f}s → 空转写，跳过")
+                log(f"[耳] {dur:.1f}s → 空转写" if not heard else
+                    f"[耳] {dur:.1f}s → 「{heard}」像是编的（无人声时 Whisper 的样本），跳过")
             self.turns.append(turn)
             self._set_state("listening")
             return
@@ -660,6 +822,7 @@ class CallEngine:
             if self.verbose:
                 log(f"[电脑] 回来 {len(got)} 字（{turn['desk_ms']}ms）")
         turn["reply"] = reply
+        append_transcript(heard, reply)
         self.history.append({"role": "assistant", "content": reply})
         if len(self.history) > HISTORY_MAX * 2:
             del self.history[:len(self.history) - HISTORY_MAX * 2]
@@ -674,6 +837,17 @@ class CallEngine:
             log(f"我：{reply}   （大脑 {brain_ms:.0f}ms）")
 
         # ---- 说
+        # 静音：这句只留在屏幕上。**连合成都跳过** —— 合成要占显卡，静音的时候没必要为她
+        # 出声再烧一遍；而且合成到一半再掐掉，服务端的 SPEAK_LOCK 还得多排一会儿。
+        if self.out_muted:
+            turn.update({"muted_out": True, "played_s": 0.0, "tts_ms": 0,
+                         "tts_first_audio_ms": 0, "interrupted": False,
+                         "first_sound_ms": round(asr_ms + brain_ms)})
+            self.turns.append(turn)
+            if self.verbose:
+                log("[静音] 这句只显示，不念")
+            self._set_state("listening")
+            return
         import tts as ttsmod
         self._abort.clear()
         self._loud = 0.0
@@ -746,11 +920,17 @@ class CallEngine:
         squeezed_ms = (before_s - len(audio) / max(1, tts_rate)) * 1000
         self.emit("say_start", rate=tts_rate)
         player = JitterPlayer(self.sink, tts_rate, cushion=0.12, t0=t_tts).start()
+        muted_during = False
         try:
             player.push(audio)
             player.finish()
             while not player.wait(0.05):
                 if self._abort.is_set() or self._stop.is_set():
+                    player.abort()
+                    break
+                if self.out_muted:
+                    # 播到一半按了静音：立刻停（最多晚 50ms 的一个块），不是等这句说完
+                    muted_during = True
                     player.abort()
                     break
         finally:
@@ -771,6 +951,7 @@ class CallEngine:
             "tts_first_audio_ms": round(first_ms or 0),
             "played_s": round(played_samples / max(1, tts_rate), 2),
             "interrupted": self._abort.is_set(),
+            "muted_out": bool(muted_during),
             "first_sound_ms": round(asr_ms + brain_ms + (collect_ms + (first_ms or 0))),
             # 听感的现场证据：整句攒齐花了多久、播的时候有没有饿过
             "collect_ms": round(collect_ms),
@@ -834,10 +1015,23 @@ class MicSource(threading.Thread):
             mic = self._pick()
             self.name_ = mic.name
             log(f"[耳] {mic.name}")
-            n = int(RATE * FRAME)
-            with mic.recorder(samplerate=RATE, channels=1) as rec:
+            # ★ 2026-10-28 23:5x（实测）：直接向系统要 16k 时，MediaFoundation 要
+            #   做一次 3:1 的重采样，跨虚拟声卡时它会 constant 地报
+            #   `data discontinuity in recording`（样本被丢掉）⇒ Whisper 收到的是
+            #   「断断续续的碎片」，识别自然差。改成**按设备常用的 48k 采**、
+            #   自己在 numpy 里降到 16k，采集这一侧不再碰系统重采样。
+            cap = CAPTURE_RATE
+            n = max(1, int(cap * FRAME))
+            try:
+                from tts import resample as _resample
+            except Exception:  # noqa: BLE001
+                _resample = None
+            with mic.recorder(samplerate=cap, channels=1) as rec:
                 while not self.stop_flag.is_set():
-                    self.feed(rec.record(numframes=n))
+                    block = np.asarray(rec.record(numframes=n), dtype="float32").reshape(-1)
+                    if _resample is not None and cap != RATE:
+                        block = _resample(block, cap, RATE)
+                    self.feed(block)
         except Exception as e:  # noqa: BLE001
             log(f"[耳] 采集退出：{type(e).__name__}: {e}")
 

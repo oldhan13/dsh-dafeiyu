@@ -47,6 +47,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
 def _find_root() -> str:
     """GPT-SoVITS 的根目录在哪儿？
 

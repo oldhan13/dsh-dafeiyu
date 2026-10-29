@@ -267,9 +267,13 @@ using System;
 using System.Windows.Forms;
 public class DfyHotKeyWindow : NativeWindow {
   public event EventHandler Pressed;
+  public int LastId;
   public void Attach(IntPtr h) { this.AssignHandle(h); }
   protected override void WndProc(ref Message m) {
-    if (m.Msg == 0x0312) { var p = this.Pressed; if (p != null) { p(this, EventArgs.Empty); } return; }
+    if (m.Msg == 0x0312) {
+      this.LastId = m.WParam.ToInt32();
+      var p = this.Pressed; if (p != null) { p(this, EventArgs.Empty); } return;
+    }
     base.WndProc(ref m);
   }
 }
@@ -280,6 +284,28 @@ function Switch-Panel {
   if (Test-PanelOpen) { Hide-Panel; return }
   if (-not $form.Visible) { $form.Show() }
   Open-Chat
+}
+
+# ---- 通话窗（2026-10-26）：热键叫出来，就是「桌宠上的那个通话界面」 ----
+function Test-CallRunning {
+  try {
+    $j = Join-Path $PSScriptRoot '..\state\call\petcall.json'
+    if (-not (Test-Path $j)) { return $false }
+    $st = Get-Content $j -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $st.alive) { return $false }
+    # python 每 100ms 写一次；5 秒没动就算死了
+    return (((Get-Date).ToUniversalTime().ToUnixTimeSeconds()) - [int64][math]::Floor([double]$st.at)) -lt 5
+  } catch { return $false }
+}
+
+function Show-CallWindow {
+  $script:lastTouch = Get-Date
+  if (Test-CallRunning) { Trace 'call: already running'; return }
+  $p = Join-Path $PSScriptRoot 'call.ps1'
+  if (-not (Test-Path $p)) { Trace 'call: call.ps1 missing'; return }
+  Start-Process powershell.exe -WindowStyle Hidden `
+    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $p)
+  Trace 'call: window launched'
 }
 
 # 点气泡 = 「这句我想接」。把她刚说的那句接进面板，别让它 25 秒后自己消失。
@@ -481,6 +507,7 @@ $form.Add_MouseUp({
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $mChat = $menu.Items.Add('说话')
+$mCall = $menu.Items.Add('打电话')
 $mShot = $menu.Items.Add('看一眼屏幕')
 $mHome = $menu.Items.Add('她的主页')
 $mCfg = $menu.Items.Add('打开配置')
@@ -488,6 +515,7 @@ $mCfg = $menu.Items.Add('打开配置')
 $mHide = $menu.Items.Add('躲到托盘')
 $mExit = $menu.Items.Add('退出')
 $mChat.Add_Click({ Open-Chat })
+$mCall.Add_Click({ Show-CallWindow })
 $mShot.Add_Click({ Take-Shot })
 $mHome.Add_Click({ Open-Home })
 $mCfg.Add_Click({ Open-Setup })
@@ -511,6 +539,7 @@ $ni.Visible = $true
 $tm = New-Object System.Windows.Forms.ContextMenuStrip
 $tShow = $tm.Items.Add('叫出来')
 $tChat = $tm.Items.Add('说话')
+$tCall = $tm.Items.Add('打电话')
 $tShot = $tm.Items.Add('看一眼屏幕')
 $tHome = $tm.Items.Add('她的主页')
 $tCfg = $tm.Items.Add('打开配置')
@@ -519,6 +548,7 @@ $tExit = $tm.Items.Add('退出')
 $ni.ContextMenuStrip = $tm
 $tShow.Add_Click({ $form.Show(); $form.Activate() })
 $tChat.Add_Click({ Open-Chat })
+$tCall.Add_Click({ Show-CallWindow })
 $tShot.Add_Click({ Take-Shot })
 $tHome.Add_Click({ Open-Home })
 $tCfg.Add_Click({ Open-Setup })
@@ -667,7 +697,10 @@ $form.Add_Shown({
     try {
       $script:hot = New-Object DfyHotKeyWindow
       $script:hot.Attach($form.Handle)
-      $script:hot.add_Pressed({ Trace 'hotkey pressed'; Switch-Panel })
+      $script:hot.add_Pressed({
+        if ($script:hot.LastId -eq 0xB002) { Trace 'hotkey pressed (call)'; Show-CallWindow }
+        else { Trace 'hotkey pressed'; Switch-Panel }
+      })
       # 候选表：Ctrl+Alt+F 实测被输入法占着（registered=False），所以挨个试，第一个成功的就是它。
       $cands = @(
         @{ mod = 3; vk = 0x46; name = 'Ctrl+Alt+F' },
@@ -685,13 +718,31 @@ $form.Add_Shown({
       }
       if ($script:hotName) { Trace ('hotkey ' + $script:hotName + ' registered') }
       else { Trace 'hotkey: 一个都没注册上（都被别的程序占了）' }
+
+      # 第二个热键：叫出通话窗（Ctrl+Alt+K，被占就换）
+      $candsCall = @(
+        @{ mod = 3; vk = 0x4B; name = 'Ctrl+Alt+K' },
+        @{ mod = 3; vk = 0x4C; name = 'Ctrl+Alt+L' },
+        @{ mod = 3; vk = 0x55; name = 'Ctrl+Alt+U' },
+        @{ mod = 6; vk = 0x4B; name = 'Ctrl+Shift+K' }
+      )
+      $script:callHotName = ''
+      foreach ($c in $candsCall) {
+        if ([W.FHot]::RegisterHotKey($form.Handle, 0xB002, [int]$c.mod, [int]$c.vk)) {
+          $script:callHotName = [string]$c.name
+          break
+        }
+      }
+      if ($script:callHotName) { Trace ('call hotkey ' + $script:callHotName + ' registered') }
+      else { Trace 'call hotkey: 没注册上（用 call.cmd 开吧）' }
     } catch { Trace ('hotkey failed: ' + $_.Exception.Message) }
-    $hint = if ($script:hotName) { '我在。双击我，或者 ' + $script:hotName + '。' } else { '我在。双击我。' }
+    $hint = if ($script:hotName) { '我在。双击我或 ' + $script:hotName + '。打电话：' + $(if ($script:callHotName) { $script:callHotName } else { 'call.cmd' }) } else { '我在。双击我。' }
     Say-Bubble $hint
   })
 $form.Add_FormClosing({
     Trace ('form closing: ' + $_.CloseReason)
     try { [void][W.FHot]::UnregisterHotKey($form.Handle, 0xB001) } catch { }
+    try { [void][W.FHot]::UnregisterHotKey($form.Handle, 0xB002) } catch { }
   })
 
 # 兜底：UI 线程里任何未捕获异常都只记一行日志，不让整个窗口进程跟着死。
