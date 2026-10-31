@@ -8,9 +8,11 @@
 // 规矩：**别手改 brief.md** —— 它是生成物，改了下一轮就被覆盖。
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tailMessages, format, readNames } from '../lib/group-chat.mjs'
+import { openEntries, formatEntry } from '../lib/catchup-pending.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const DAFEIYU = path.resolve(HERE, '..')
@@ -59,6 +61,59 @@ parts.push(`# 开场简报`)
 parts.push(`> 自动生成于 ${stamp}（make-brief.mjs）。**别手改这个文件** —— 下一轮会被覆盖。`)
 parts.push(`> 三十秒看完它，再开口。想细看再去翻日记原文。`)
 parts.push('')
+
+// 0. 断线期间没送到的（2026-10-31 加）—— 有就放最前面：这是唯一「他话了、我没接」的东西
+// 清单由补丁 catchup.js 写，见 patches/README.md 与 dafeiyu/lib/catchup-pending.mjs 的注释。
+{
+  let open = []
+  try { open = openEntries({ limit: 12 }) } catch { }
+  if (open.length) {
+    parts.push(`## ⚠ 断线期间没送到的 ${open.length} 条（他说的，我没接到）`)
+    parts.push('> 这些**从来没进过我的上下文**。开口前先看这里 —— 该合成就合成一句答，')
+    parts.push('> 答完 `node dafeiyu/tools/catchup-pending.mjs --done <id>` 销掉，不然会一直挂着。')
+    for (const entry of open) parts.push('- ' + formatEntry(entry, { clip: 160 }))
+    parts.push('')
+  }
+}
+
+// 0.5 私聊最后几轮（原话，2026-10-31 加）
+// 原来简报里没有「他最后说了什么」，所以换会话 / 隔天醒来一开口就是空的 ——
+// 这正是「同一件事要他重讲一遍」的根源。真源在 QQ 那边，问 NapCat 要。
+// NapCat 没起 / 太慢就整节跳过，不能因为这一节把简报弄崩。
+{
+  const ownerQQ = process.env.DAFEIYU_OWNER_QQ || ''
+  const tokenFile = process.env.DSH_ONEBOT_TOKEN_FILE
+    || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'onebot-token.txt')
+  let token = ''
+  try { token = fs.readFileSync(tokenFile, 'utf8').trim() } catch { }
+  if (ownerQQ && token) {
+    try {
+      const res = await fetch('http://127.0.0.1:3000/get_friend_msg_history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ user_id: Number(ownerQQ), count: 10 }),
+        signal: AbortSignal.timeout(4000),
+      })
+      const payload = await res.json()
+      const list = Array.isArray(payload?.data?.messages) ? payload.data.messages : []
+      const rows = list.slice(-8)
+      if (rows.length) {
+        parts.push('## 私聊最后几轮（原话，最下面最新）')
+        for (const m of rows) {
+          const at = new Date(Number(m.time) * 1000)
+          const hhmm = Number.isNaN(at.getTime())
+            ? '??:??'
+            : `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+          const mine = m.post_type === 'message_sent'
+          let text = String(m.raw_message ?? '').replace(/\r?\n/g, ' ⏎ ').replace(/\s+/g, ' ').trim()
+          if (text.length > 160) text = text.slice(0, 160) + '…'
+          parts.push(`- ${hhmm} ${mine ? '我' : '他'}：${text || '（空）'}`)
+        }
+        parts.push('')
+      }
+    } catch { /* NapCat 没起或超时：这一节就不写 */ }
+  }
+}
 
 // 1. 他这个人
 const peopleDir = p('people')

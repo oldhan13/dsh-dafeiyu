@@ -1,7 +1,8 @@
-# patches —— 打在 `dsh-onebot-qq` 上的四处本地改动
+# patches —— 打在 `dsh-onebot-qq` 上的本地改动
 
-大肥鱼有四件事，上游插件不做，所以这里放四个补丁，**装的时候自动打上**（`install.ps1` 会调 `apply-patches.mjs`）。
+大肥鱼有七件事，上游插件不做或做错，所以这里放补丁，**装的时候自动打上**（`install.ps1` 会调 `apply-patches.mjs`）。
 它们是**整段锚点替换**，不是 diff：找不到锚点就报错退出，宁可不打，也不硬改。
+（`catchup-module` 例外：它是**新增一个文件**，把 `patches/catchup.js` 整份复制进插件目录 —— 那个模块是我们自己写的。）
 
 | 补丁 | 改哪个文件 | 做了什么 |
 | --- | --- | --- |
@@ -9,6 +10,12 @@
 | `split-private-replies` | `outbound.js` | 私聊里一段多行回复，按行拆成 2–8 条发（间隔 320ms）。每行超过 160 字、或超过 8 行，就整段发，不刷屏 |
 | `mirror-group-send` | `outbound.js` | 插件发出去的**群消息也补记一行**到 `dafeiyu/group/raw.jsonl`（字段与 `group/watch.mjs` 的 `sendGroup()` 完全对齐）。没有它，群里两条嘴互相看不见：watch 只知道**自己**发的，主会话经插件发进群的话它不知道，于是可能把同一件事再答一遍 |
 | `emoji-reaction` | `tools.js` | 把 `set_msg_emoji_like`（**贴在消息底部的小 emoji**，不额外发一条）加进 `NAPCAT_API_WHITELIST`。不加只能绕开插件直连 NapCat 的 HTTP，端口和 token 就得签到别处去 |
+| `catchup-module` | **新增** `catchup.js` | 断线补收模块（整份复制 `patches/catchup.js`）。上游 0.9.3 的包里没有这个文件 |
+| `catchup-wiring` | `index.js` | 把 catchup 接上：建实例 → **正常入站也推水位** → `start()` / `stop()`。少了这一步，模块躺在磁盘上但没有任何调用点，注释承诺的「重载那几十秒的私聊会被补回来」从来没发生过 |
+| `catchup-reminder` | `prompt.js` | 每轮在系统提示末尾提一句「有 N 条断线期间没送到的」。**这一句是整条链路的开关** —— 清单落在 `~/.dsh/` 里，没有它补收做完了也没人看得见 |
+
+后三个是同一件事，为什么拆成三条登记：改的是三条不同的路（新增文件 / 接线 / 提示），
+哪一条没打上，症状完全不同。设计、根因与边界见 [`docs/CATCHUP.md`](../docs/CATCHUP.md)。
 
 ## `emoji-reaction` 怎么用
 
