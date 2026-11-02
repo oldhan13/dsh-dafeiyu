@@ -1,4 +1,4 @@
-# 大肥鱼 · dsh-dafeiyu
+﻿# 大肥鱼 · dsh-dafeiyu
 
 > 一条鱼住在你屏幕的右下角。
 >
@@ -436,7 +436,7 @@ python dafeiyu\tools\call\sing_svs.py --check          # 只检查 OpenUtau / �
 ```
 
 - 要什么：**OpenUtau**（便携版解压即可）+ 一个 DiffSinger 声库 + vocoder 模型；可选 Seed-VC（换她的音色）。
-- 参数与界面：部署界面 →「拓展模块…」→ **唱歌** →「② 让她自己唱」；存进 `config.json` 的 `svs` 段。
+- 参数与界面：部署界面 →「拓展模块…」→ **唱歌** 卡片 →「合成歌声…」（跟「设置…」那个换音色的窗口是分开的两个）；存进 `config.json` 的 `svs` 段。
 - **完整原理与踩过的坑：[docs/SVS.md](docs/SVS.md)**（为什么不能自己跑 onnx、时间原点 92.9ms 怎么来的、
   颤音/滑音/换气各自怎么做、验收为什么看拼音而不是字面）。
 

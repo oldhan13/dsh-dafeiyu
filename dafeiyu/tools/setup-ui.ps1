@@ -1446,6 +1446,9 @@ function Show-Extensions {
                         else { ELog ('上次那个文件不在了：' + $p) }
                     })
                 $b4.Add_Click({ Show-SingSettings -CheckOnly; Update-ExtAll })
+                # ★ 2026-11-03：换音色 和 合成歌声 分成两块，各开各的窗口
+                $b5 = New-Button $pnl '合成歌声…' 476 86 130
+                $b5.Add_Click({ Show-SvsSettings; Update-ExtAll })
             }
             'qq' {
                 $b1 = New-Button $pnl '打开 NapCat 目录' 14 86 140
@@ -1572,8 +1575,7 @@ function Show-SingSettings {
 
     $sf = New-Object System.Windows.Forms.Form
     $sf.Text = '大肥鱼 · 唱歌'
-    $sf.Size = New-Object System.Drawing.Size(824, 900)
-    $sf.AutoScroll = $true
+    $sf.Size = New-Object System.Drawing.Size(824, 620)
     $sf.StartPosition = 'CenterScreen'
     $sf.BackColor = $BG
     $sf.FormBorderStyle = 'FixedSingle'
@@ -1683,27 +1685,48 @@ function Show-SingSettings {
     $bClose = New-Button $sf '关上' 366 322 80
     $bClose.Add_Click({ $sf.Close() })
 
-    # ---------------- ② 让她自己唱（词 → 歌） ----------------
-    # ★ 2026-11-03 加的：上面那套是「拿别人唱过的，只换嗓子」；这里是**真的让她唱** ——
-    #   给她词，她自己排旋律、自己换气、自己走滑音。渲染交给 OpenUtau 的 DiffSinger 声库
-    #   （`sing_svs.py`），参数表来自 config.py 的 svs_fields —— 界面不自己写死参数。
-    New-Label $sf '② 让她自己唱（只给词，不用原唱）' 22 556 700 28 $fTitle $INK | Out-Null
-    New-Label $sf '词用标点分句：句号处换气，逗号处只顿一下。第一次会慢（每句都要开一次 OpenUtau）。' 22 584 760 18 $fSub $MUTED | Out-Null
+    $sf.Add_Shown({
+            if ($CheckOnly) { $bCheck.PerformClick() ; return }
+            SLog '第一次用：① 填 Seed-VC 目录 ② 填装了 torch 的 python ③ 填参考音色 → 点「自检」'
+            SLog '自检里 problems 是空的就能唱。权重没下齐时，它会把下载地址一起打出来（用 curl -L 下到 <Seed-VC>\checkpoints）。'
+        })
+
+    [void]$sf.ShowDialog()
+}
+
+# ---- 合成歌声（2026-11-03 他要的：跟「换音色」分开成单独一块）----
+#   只给词：她自己排旋律、自己换气、自己走滑音。渲染交给 OpenUtau 的 DiffSinger 声库；
+#   参数表来自 config.py 的 svs 段 —— 界面不写死任何参数名。
+function Show-SvsSettings {
+    $sf = New-Object System.Windows.Forms.Form
+    $sf.Text = '大肥鱼 · 合成歌声'
+    $sf.Size = New-Object System.Drawing.Size(824, 736)
+    $sf.StartPosition = 'CenterScreen'
+    $sf.BackColor = $BG
+    $sf.FormBorderStyle = 'FixedSingle'
+    $sf.MaximizeBox = $false
+    $sf.Font = $fBody
+
+    New-Label $sf '合成歌声 · 只给词，她自己唱' 22 12 460 32 $fTitle $INK | Out-Null
+    New-Label $sf '词用标点分句：句号处会换气，逗号处只顿一下。每句都要开一次 OpenUtau，所以慢。' 22 46 760 20 $fSub $MUTED | Out-Null
+
+    New-Label $sf '词（写几行都行）' 22 74 400 18 $fSub $MUTED | Out-Null
     $txLyric = New-Object System.Windows.Forms.TextBox
-    $txLyric.Location = New-Object System.Drawing.Point(22, 600)
-    $txLyric.Size = New-Object System.Drawing.Size(760, 42)
+    $txLyric.Location = New-Object System.Drawing.Point(22, 96)
+    $txLyric.Size = New-Object System.Drawing.Size(760, 104)
     $txLyric.Multiline = $true
     $txLyric.ScrollBars = 'Vertical'
     $txLyric.Font = $fBody
-    $txLyric.Text = '睡吧，今天的风不用管。天亮了又亮，也没关系。'
+    $txLyric.Text = '睡吧，今天的风不用管。天亮了又亮，也没关系。你躺着，我就在这儿。'
     $sf.Controls.Add($txLyric)
 
     $pSvs = New-Object System.Windows.Forms.Panel
-    $pSvs.Location = New-Object System.Drawing.Point(22, 648)
+    $pSvs.Location = New-Object System.Drawing.Point(22, 212)
     $pSvs.Size = New-Object System.Drawing.Size(760, 212)
     $sf.Controls.Add($pSvs)
     $script:sgStore = @{}
     $script:sgOpts = @{}
+    $runner = Get-SingRunner
     $snapSvs = $null
     try {
         $cfgPy0 = Join-Path $CALL_DIR 'config.py'
@@ -1722,70 +1745,87 @@ function Show-SingSettings {
         New-Label $pSvs '读不到 config.py 的字段表（这台机器上没有？）' 0 0 700 20 $fSub $MUTED | Out-Null
     }
 
-    $bGo = New-Button $sf '唱一段' 22 872 130 -Primary
-    $bSaveSvs = New-Button $sf '保存参数' 160 872 110
-    $bSvsCheck = New-Button $sf '检查环境' 278 872 110
-    $lblGo = New-Label $sf '' 400 878 380 20 $fSub $MUTED
+    $svLog = New-Object System.Windows.Forms.TextBox
+    $svLog.Location = New-Object System.Drawing.Point(22, 470)
+    $svLog.Size = New-Object System.Drawing.Size(760, 190)
+    $svLog.Multiline = $true
+    $svLog.ScrollBars = 'Vertical'
+    $svLog.ReadOnly = $true
+    $svLog.BackColor = [System.Drawing.Color]::White
+    $svLog.Font = $fMono
+    $sf.Controls.Add($svLog)
 
-    $bSaveSvs.Add_Click({
+    function SVLog([string]$t) {
+        if (-not $t) { return }
+        $svLog.AppendText($t + "`r`n")
+        $svLog.SelectionStart = $svLog.TextLength
+        $svLog.ScrollToCaret()
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    $bGo = New-Button $sf '唱一段' 22 432 130 -Primary
+    $bSave = New-Button $sf '保存参数' 160 432 110
+    $bCheck = New-Button $sf '检查环境' 278 432 110
+    $bClose = New-Button $sf '关上' 396 432 80
+    $lblGo = New-Label $sf '' 490 438 300 20 $fSub $MUTED
+
+    $bSave.Add_Click({
             $cfgPy = Join-Path $CALL_DIR 'config.py'
-            if (-not (Test-Path $cfgPy)) { SLog '找不到 config.py'; return }
+            if (-not (Test-Path $cfgPy)) { SVLog '找不到 config.py'; return }
             $pairs = @()
             foreach ($k in @($script:sgStore.Keys)) {
                 $v = Get-SchemaValue $script:sgStore[$k] $k $script:sgOpts
                 if ($null -ne $v) { $pairs += ($k + '=' + $v) }
             }
-            if (-not $pairs.Count) { SLog '没有可存的参数'; return }
+            if (-not $pairs.Count) { SVLog '没有可存的参数'; return }
             try {
                 $o = & $runner $cfgPy --set @pairs 2>&1
-                if ($LASTEXITCODE -eq 0) { SLog '存好了：唱的参数'; $lblGo.Text = '参数已保存'; $lblGo.ForeColor = $OKC }
-                else { SLog ('没存上：' + ($o -join ' ')) }
-            } catch { SLog ('没存上：' + $_.Exception.Message) }
+                if ($LASTEXITCODE -eq 0) { SVLog '存好了：唱的参数'; $lblGo.Text = '参数已保存'; $lblGo.ForeColor = $OKC }
+                else { SVLog ('没存上：' + ($o -join ' ')) }
+            } catch { SVLog ('没存上：' + $_.Exception.Message) }
         })
 
-    $bSvsCheck.Add_Click({
+    $bCheck.Add_Click({
             $svsPy = Join-Path $CALL_DIR 'sing_svs.py'
-            if (-not (Test-Path $svsPy)) { SLog '这台机器上没有 sing_svs.py'; return }
-            SLog '—— 检查：OpenUtau / 声库 / 参考音色 / 换气模板'
-            try { $o = & $runner $svsPy --check 2>&1; SLog ($o -join "`r`n") } catch { SLog ('起不来：' + $_.Exception.Message) }
+            if (-not (Test-Path $svsPy)) { SVLog '这台机器上没有 sing_svs.py'; return }
+            SVLog '—— 检查：OpenUtau / 声库 / 参考音色 / 换气模板'
+            try { $o = & $runner $svsPy --check 2>&1; SVLog ($o -join "`r`n") } catch { SVLog ('起不来：' + $_.Exception.Message) }
         })
 
     $bGo.Add_Click({
             $txt = $txLyric.Text.Trim()
-            if (-not $txt) { SLog '先写两句词。'; return }
+            if (-not $txt) { SVLog '先写两句词。'; return }
             $svsPy = Join-Path $CALL_DIR 'sing_svs.py'
-            if (-not (Test-Path $svsPy)) { SLog '这台机器上没有 sing_svs.py'; return }
+            if (-not (Test-Path $svsPy)) { SVLog '这台机器上没有 sing_svs.py'; return }
             # ★ 中文不过命令行（ACP=936 会搞坏）—— 词写进文件，脚本自己读
             $tf = Join-Path $env:TEMP ('dfy-lyric-' + [guid]::NewGuid().ToString('N') + '.txt')
             [System.IO.File]::WriteAllText($tf, $txt, (New-Object System.Text.UTF8Encoding($false)))
             $outDir = Join-Path $CALL_STATE 'out'
             New-Item -ItemType Directory -Force $outDir | Out-Null
             $outF = Join-Path $outDir ('sing-svs-' + (Get-Date).ToString('HHmmss') + '.mp3')
-            $lblGo.Text = '在唱…（每句都要开一次 OpenUtau）'
+            $lblGo.Text = '在唱…'
             $lblGo.ForeColor = $MUTED
-            SLog ('—— 唱：' + $txt)
+            SVLog ('—— 唱：' + $txt)
             try {
                 $argv = @($svsPy, '--lyrics-file', $tf, '--out', $outF)
-                $rc = Invoke-Stream $runner $argv ${function:SLog} 30
+                $rc = Invoke-Stream $runner $argv ${function:SVLog} 30
                 Remove-Item $tf -Force -ErrorAction SilentlyContinue
                 if ($rc -eq 0 -and (Test-Path $outF)) {
                     $lblGo.Text = '唱好了：' + (Split-Path $outF -Leaf)
                     $lblGo.ForeColor = $OKC
-                    SLog ('唱好了：' + $outF)
+                    SVLog ('唱好了：' + $outF)
+                    # 不带 BOM：这行是给「打开上次的成品」读路径用的，带 BOM 会 Test-Path 失败
+                    [System.IO.File]::WriteAllText((Join-Path $CALL_STATE 'sing-last.txt'), $outF, (New-Object System.Text.UTF8Encoding($false)))
                     try { Start-Process $outF } catch { }
                 } else {
                     $lblGo.Text = '这次没成（退出码 ' + $rc + '）'
                     $lblGo.ForeColor = $BADC
                 }
-            } catch { SLog ('起不来：' + $_.Exception.Message) }
+            } catch { SVLog ('起不来：' + $_.Exception.Message) }
         })
 
-    $sf.Add_Shown({
-            if ($CheckOnly) { $bCheck.PerformClick() ; return }
-            SLog '第一次用：① 填 Seed-VC 目录 ② 填装了 torch 的 python ③ 填参考音色 → 点「自检」'
-            SLog '自检里 problems 是空的就能唱。权重没下齐时，它会把下载地址一起打出来（用 curl -L 下到 <Seed-VC>\checkpoints）。'
-        })
-
+    $bClose.Add_Click({ $sf.Close() })
+    $sf.Add_Shown({ SVLog '第一次用先点「检查环境」：它会告诉你 OpenUtau 目录、声库、参考音色认不认得。' })
     [void]$sf.ShowDialog()
 }
 
