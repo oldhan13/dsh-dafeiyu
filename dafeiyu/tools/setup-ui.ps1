@@ -1031,6 +1031,104 @@ function Play-CallWav([string]$jsonFile) {
     return $true
 }
 
+# ★ 2026-11-03：把「按 config.py 的字段表画控件」提到脚本作用域 ——
+#   通话设置窗口和唱歌窗口都要用同一份逻辑（字段表本身仍然只来自 config.py）。
+function Add-SchemaFields($parent, $fields, $cfg, [string]$prefix, [int]$top, $store, $opts) {
+        $cx = 0
+        foreach ($f in $fields) {
+            $k = [string]$f.key
+            $key = $prefix + '.' + $k
+            $w = 244
+            if ($f.w) { $w = [int]$f.w }
+            New-Label $parent ([string]$f.label) $cx $top $w 18 $fSub $MUTED | Out-Null
+            $cur = $null
+            if ($cfg) {
+                if ($cfg.PSObject.Properties.Name -contains $k) { $cur = $cfg.$k }
+            }
+            $kind = 'text'
+            if ($f.kind) { $kind = [string]$f.kind }
+            $ctl = $null
+            if ($kind -eq 'num' -or $kind -eq 'int') {
+                $n = New-Object System.Windows.Forms.NumericUpDown
+                $n.Location = New-Object System.Drawing.Point($cx, ($top + 18))
+                $n.Size = New-Object System.Drawing.Size($w, 26)
+                $n.Font = $fBody
+                # ★ 范围先给宽的：NumericUpDown 默认上限是 100，塞 9880 会抛「值超出范围」
+                if ($kind -eq 'int') {
+                    $n.DecimalPlaces = 0
+                    $n.Increment = [decimal]1
+                    $n.Minimum = [decimal]0
+                    $n.Maximum = [decimal]999999
+                } else {
+                    $n.DecimalPlaces = 2
+                    $n.Increment = [decimal]0.05
+                    $n.Minimum = [decimal]0
+                    $n.Maximum = [decimal]1000
+                    if ($f.step) { try { $n.Increment = [decimal][double]$f.step } catch { } }
+                }
+                $lo = [double]$n.Minimum
+                $hi = [double]$n.Maximum
+                if ($f.min) { try { $n.Minimum = [decimal][double]$f.min; $lo = [double]$f.min } catch { } }
+                if ($f.max) { try { $n.Maximum = [decimal][double]$f.max; $hi = [double]$f.max } catch { } }
+                $v = 0.0
+                if ($null -ne $cur) { try { $v = [double]$cur } catch { } }
+                if ($v -lt $lo) { $v = $lo }
+                if ($v -gt $hi) { $v = $hi }
+                try { $n.Value = [decimal]$v } catch { }
+                $parent.Controls.Add($n)
+                $ctl = $n
+            } elseif ($kind -eq 'choice') {
+                $cbo = New-Object System.Windows.Forms.ComboBox
+                $cbo.Location = New-Object System.Drawing.Point($cx, ($top + 18))
+                $cbo.Size = New-Object System.Drawing.Size($w, 26)
+                $cbo.Font = $fBody
+                $cbo.DropDownStyle = 'DropDownList'
+                $vals = @()
+                foreach ($o in $f.options) {
+                    [void]$cbo.Items.Add([string]$o[1])
+                    $vals += [string]$o[0]
+                }
+                $curS = ''
+                if ($null -ne $cur) { $curS = [string]$cur }
+                $idx = 0
+                for ($i = 0; $i -lt $vals.Count; $i++) { if ($vals[$i] -eq $curS) { $idx = $i } }
+                $cbo.SelectedIndex = $idx
+                $opts[$key] = $vals
+                $parent.Controls.Add($cbo)
+                $ctl = $cbo
+            } else {
+                $tb = New-Object System.Windows.Forms.TextBox
+                $tb.Location = New-Object System.Drawing.Point($cx, ($top + 18))
+                $tb.Size = New-Object System.Drawing.Size($w, 26)
+                $tb.Font = $fBody
+                if ($null -ne $cur) { $tb.Text = [string]$cur }
+                $parent.Controls.Add($tb)
+                $ctl = $tb
+            }
+            $store[$key] = $ctl
+            if ($f.hint) { New-Label $parent ([string]$f.hint) $cx ($top + 46) $w 30 $fSub $MUTED | Out-Null }
+            $cx += $w + 8
+        }
+    }
+
+    # 读某个控件现在是啥值（存的时候用它拼 `k=v`）
+    function Get-SchemaValue($ctl, $key, $opts) {
+        if ($null -eq $ctl) { return $null }
+        if ($ctl -is [System.Windows.Forms.NumericUpDown]) {
+            $d = [double]$ctl.Value
+            if ($ctl.DecimalPlaces -eq 0) { return ([long]$d).ToString() }
+            # 固定两位：double 的默认 ToString 会把 1.00 压成 "1"，存回去 JSON 里就成了整数
+            return $d.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        if ($ctl -is [System.Windows.Forms.ComboBox]) {
+            $i = $ctl.SelectedIndex
+            if ($i -lt 0) { return '' }
+            if ($opts -and $opts.ContainsKey($key)) { return [string]($opts[$key][$i]) }
+            return [string]$ctl.Text
+        }
+        return [string]$ctl.Text
+    }
+
 function Show-Extensions {
     $x = New-Object System.Windows.Forms.Form
     $x.Text = '大肥鱼 · 拓展模块'
@@ -1474,7 +1572,8 @@ function Show-SingSettings {
 
     $sf = New-Object System.Windows.Forms.Form
     $sf.Text = '大肥鱼 · 唱歌'
-    $sf.Size = New-Object System.Drawing.Size(824, 620)
+    $sf.Size = New-Object System.Drawing.Size(824, 900)
+    $sf.AutoScroll = $true
     $sf.StartPosition = 'CenterScreen'
     $sf.BackColor = $BG
     $sf.FormBorderStyle = 'FixedSingle'
@@ -1584,6 +1683,103 @@ function Show-SingSettings {
     $bClose = New-Button $sf '关上' 366 322 80
     $bClose.Add_Click({ $sf.Close() })
 
+    # ---------------- ② 让她自己唱（词 → 歌） ----------------
+    # ★ 2026-11-03 加的：上面那套是「拿别人唱过的，只换嗓子」；这里是**真的让她唱** ——
+    #   给她词，她自己排旋律、自己换气、自己走滑音。渲染交给 OpenUtau 的 DiffSinger 声库
+    #   （`sing_svs.py`），参数表来自 config.py 的 svs_fields —— 界面不自己写死参数。
+    New-Label $sf '② 让她自己唱（只给词，不用原唱）' 22 556 700 28 $fTitle $INK | Out-Null
+    New-Label $sf '词用标点分句：句号处换气，逗号处只顿一下。第一次会慢（每句都要开一次 OpenUtau）。' 22 584 760 18 $fSub $MUTED | Out-Null
+    $txLyric = New-Object System.Windows.Forms.TextBox
+    $txLyric.Location = New-Object System.Drawing.Point(22, 600)
+    $txLyric.Size = New-Object System.Drawing.Size(760, 42)
+    $txLyric.Multiline = $true
+    $txLyric.ScrollBars = 'Vertical'
+    $txLyric.Font = $fBody
+    $txLyric.Text = '睡吧，今天的风不用管。天亮了又亮，也没关系。'
+    $sf.Controls.Add($txLyric)
+
+    $pSvs = New-Object System.Windows.Forms.Panel
+    $pSvs.Location = New-Object System.Drawing.Point(22, 648)
+    $pSvs.Size = New-Object System.Drawing.Size(760, 212)
+    $sf.Controls.Add($pSvs)
+    $script:sgStore = @{}
+    $script:sgOpts = @{}
+    $snapSvs = $null
+    try {
+        $cfgPy0 = Join-Path $CALL_DIR 'config.py'
+        if (Test-Path $cfgPy0) {
+            $oj = (& $runner $cfgPy0 --json 2>$null | Out-String).Trim()
+            if ($oj) { $snapSvs = $oj | ConvertFrom-Json }
+        }
+    } catch { }
+    if ($snapSvs -and $snapSvs.svs_fields) {
+        $fsv = @($snapSvs.svs_fields)
+        $curSvs = $snapSvs.config.svs
+        Add-SchemaFields $pSvs @($fsv[0..2]) $curSvs 'svs' 0 $script:sgStore $script:sgOpts
+        if ($fsv.Count -ge 7) { Add-SchemaFields $pSvs @($fsv[3..6]) $curSvs 'svs' 70 $script:sgStore $script:sgOpts }
+        if ($fsv.Count -ge 9) { Add-SchemaFields $pSvs @($fsv[7..8]) $curSvs 'svs' 140 $script:sgStore $script:sgOpts }
+    } else {
+        New-Label $pSvs '读不到 config.py 的字段表（这台机器上没有？）' 0 0 700 20 $fSub $MUTED | Out-Null
+    }
+
+    $bGo = New-Button $sf '唱一段' 22 872 130 -Primary
+    $bSaveSvs = New-Button $sf '保存参数' 160 872 110
+    $bSvsCheck = New-Button $sf '检查环境' 278 872 110
+    $lblGo = New-Label $sf '' 400 878 380 20 $fSub $MUTED
+
+    $bSaveSvs.Add_Click({
+            $cfgPy = Join-Path $CALL_DIR 'config.py'
+            if (-not (Test-Path $cfgPy)) { SLog '找不到 config.py'; return }
+            $pairs = @()
+            foreach ($k in @($script:sgStore.Keys)) {
+                $v = Get-SchemaValue $script:sgStore[$k] $k $script:sgOpts
+                if ($null -ne $v) { $pairs += ($k + '=' + $v) }
+            }
+            if (-not $pairs.Count) { SLog '没有可存的参数'; return }
+            try {
+                $o = & $runner $cfgPy --set @pairs 2>&1
+                if ($LASTEXITCODE -eq 0) { SLog '存好了：唱的参数'; $lblGo.Text = '参数已保存'; $lblGo.ForeColor = $OKC }
+                else { SLog ('没存上：' + ($o -join ' ')) }
+            } catch { SLog ('没存上：' + $_.Exception.Message) }
+        })
+
+    $bSvsCheck.Add_Click({
+            $svsPy = Join-Path $CALL_DIR 'sing_svs.py'
+            if (-not (Test-Path $svsPy)) { SLog '这台机器上没有 sing_svs.py'; return }
+            SLog '—— 检查：OpenUtau / 声库 / 参考音色 / 换气模板'
+            try { $o = & $runner $svsPy --check 2>&1; SLog ($o -join "`r`n") } catch { SLog ('起不来：' + $_.Exception.Message) }
+        })
+
+    $bGo.Add_Click({
+            $txt = $txLyric.Text.Trim()
+            if (-not $txt) { SLog '先写两句词。'; return }
+            $svsPy = Join-Path $CALL_DIR 'sing_svs.py'
+            if (-not (Test-Path $svsPy)) { SLog '这台机器上没有 sing_svs.py'; return }
+            # ★ 中文不过命令行（ACP=936 会搞坏）—— 词写进文件，脚本自己读
+            $tf = Join-Path $env:TEMP ('dfy-lyric-' + [guid]::NewGuid().ToString('N') + '.txt')
+            [System.IO.File]::WriteAllText($tf, $txt, (New-Object System.Text.UTF8Encoding($false)))
+            $outDir = Join-Path $CALL_STATE 'out'
+            New-Item -ItemType Directory -Force $outDir | Out-Null
+            $outF = Join-Path $outDir ('sing-svs-' + (Get-Date).ToString('HHmmss') + '.mp3')
+            $lblGo.Text = '在唱…（每句都要开一次 OpenUtau）'
+            $lblGo.ForeColor = $MUTED
+            SLog ('—— 唱：' + $txt)
+            try {
+                $argv = @($svsPy, '--lyrics-file', $tf, '--out', $outF)
+                $rc = Invoke-Stream $runner $argv ${function:SLog} 30
+                Remove-Item $tf -Force -ErrorAction SilentlyContinue
+                if ($rc -eq 0 -and (Test-Path $outF)) {
+                    $lblGo.Text = '唱好了：' + (Split-Path $outF -Leaf)
+                    $lblGo.ForeColor = $OKC
+                    SLog ('唱好了：' + $outF)
+                    try { Start-Process $outF } catch { }
+                } else {
+                    $lblGo.Text = '这次没成（退出码 ' + $rc + '）'
+                    $lblGo.ForeColor = $BADC
+                }
+            } catch { SLog ('起不来：' + $_.Exception.Message) }
+        })
+
     $sf.Add_Shown({
             if ($CheckOnly) { $bCheck.PerformClick() ; return }
             SLog '第一次用：① 填 Seed-VC 目录 ② 填装了 torch 的 python ③ 填参考音色 → 点「自检」'
@@ -1658,101 +1854,13 @@ function Show-CallSettings {
     # 把 config.py 吐出来的字段表画成控件。
     # ★ 列宽可以从字段表里给（`w`）：耳朵那四个参数（模型 / 算在哪 / 精度 / 端口）要挤进一行，
     #   不能都按 244 排 —— 第一版就是这么错的：第四列被面板裁掉，端口只露出半个。
+    # 画控件 / 读值都走脚本作用域那两份（字段表只来自 config.py，渲染逻辑也只留一份）
     function Add-CallFields($parent, $fields, $cfg, [string]$prefix, [int]$top, $store, $opts) {
-        $cx = 0
-        foreach ($f in $fields) {
-            $k = [string]$f.key
-            $key = $prefix + '.' + $k
-            $w = 244
-            if ($f.w) { $w = [int]$f.w }
-            New-Label $parent ([string]$f.label) $cx $top $w 18 $fSub $MUTED | Out-Null
-            $cur = $null
-            if ($cfg) {
-                if ($cfg.PSObject.Properties.Name -contains $k) { $cur = $cfg.$k }
-            }
-            $kind = 'text'
-            if ($f.kind) { $kind = [string]$f.kind }
-            $ctl = $null
-            if ($kind -eq 'num' -or $kind -eq 'int') {
-                $n = New-Object System.Windows.Forms.NumericUpDown
-                $n.Location = New-Object System.Drawing.Point($cx, ($top + 18))
-                $n.Size = New-Object System.Drawing.Size($w, 26)
-                $n.Font = $fBody
-                # ★ 范围先给宽的：NumericUpDown 默认上限是 100，塞 9880 会抛「值超出范围」，
-                #   被 catch 一吞就显示成 0 —— 存回去就是 port=0。第一版差点这么交出去。
-                if ($kind -eq 'int') {
-                    $n.DecimalPlaces = 0
-                    $n.Increment = [decimal]1
-                    $n.Minimum = [decimal]0
-                    $n.Maximum = [decimal]999999
-                } else {
-                    $n.DecimalPlaces = 2
-                    $n.Increment = [decimal]0.05
-                    $n.Minimum = [decimal]0
-                    $n.Maximum = [decimal]1000
-                    if ($f.step) { try { $n.Increment = [decimal][double]$f.step } catch { } }
-                }
-                $lo = [double]$n.Minimum
-                $hi = [double]$n.Maximum
-                if ($f.min) { try { $n.Minimum = [decimal][double]$f.min; $lo = [double]$f.min } catch { } }
-                if ($f.max) { try { $n.Maximum = [decimal][double]$f.max; $hi = [double]$f.max } catch { } }
-                $v = 0.0
-                if ($null -ne $cur) { try { $v = [double]$cur } catch { } }
-                if ($v -lt $lo) { $v = $lo }
-                if ($v -gt $hi) { $v = $hi }
-                try { $n.Value = [decimal]$v } catch { }
-                $parent.Controls.Add($n)
-                $ctl = $n
-            } elseif ($kind -eq 'choice') {
-                $cbo = New-Object System.Windows.Forms.ComboBox
-                $cbo.Location = New-Object System.Drawing.Point($cx, ($top + 18))
-                $cbo.Size = New-Object System.Drawing.Size($w, 26)
-                $cbo.Font = $fBody
-                $cbo.DropDownStyle = 'DropDownList'
-                $vals = @()
-                foreach ($o in $f.options) {
-                    [void]$cbo.Items.Add([string]$o[1])
-                    $vals += [string]$o[0]
-                }
-                $curS = ''
-                if ($null -ne $cur) { $curS = [string]$cur }
-                $idx = 0
-                for ($i = 0; $i -lt $vals.Count; $i++) { if ($vals[$i] -eq $curS) { $idx = $i } }
-                $cbo.SelectedIndex = $idx
-                $opts[$key] = $vals
-                $parent.Controls.Add($cbo)
-                $ctl = $cbo
-            } else {
-                $tb = New-Object System.Windows.Forms.TextBox
-                $tb.Location = New-Object System.Drawing.Point($cx, ($top + 18))
-                $tb.Size = New-Object System.Drawing.Size($w, 26)
-                $tb.Font = $fBody
-                if ($null -ne $cur) { $tb.Text = [string]$cur }
-                $parent.Controls.Add($tb)
-                $ctl = $tb
-            }
-            $store[$key] = $ctl
-            if ($f.hint) { New-Label $parent ([string]$f.hint) $cx ($top + 46) $w 30 $fSub $MUTED | Out-Null }
-            $cx += $w + 8
-        }
+        Add-SchemaFields $parent $fields $cfg $prefix $top $store $opts
     }
 
-    # 读某个控件现在是啥值（存的时候用它拼 `k=v`）
     function Get-CSValue($ctl, $key, $opts) {
-        if ($null -eq $ctl) { return $null }
-        if ($ctl -is [System.Windows.Forms.NumericUpDown]) {
-            $d = [double]$ctl.Value
-            if ($ctl.DecimalPlaces -eq 0) { return ([long]$d).ToString() }
-            # 固定两位：double 的默认 ToString 会把 1.00 压成 "1"，存回去 JSON 里就成了整数
-            return $d.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)
-        }
-        if ($ctl -is [System.Windows.Forms.ComboBox]) {
-            $i = $ctl.SelectedIndex
-            if ($i -lt 0) { return '' }
-            if ($opts -and $opts.ContainsKey($key)) { return [string]($opts[$key][$i]) }
-            return [string]$ctl.Text
-        }
-        return [string]$ctl.Text
+        return (Get-SchemaValue $ctl $key $opts)
     }
 
     # ---------------- ① 依赖 ----------------

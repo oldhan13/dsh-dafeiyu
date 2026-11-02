@@ -423,6 +423,23 @@ python dafeiyu\tools\call\sing.py --src 你的清唱.wav --song 要唱的那首.
 - 走过的两个坑（都写进注释了，别重踩）：`hf_utils` 要**本地优先**（不然每次都去拉权重），
   `torchaudio.save` 在这套环境里写出来的 wav 是坏的 ⇒ 改走 `soundfile`。
 
+### 自己唱（SVS：只给词，不用原唱）
+
+上面那个是「拿别人唱过的换嗓子」，受制于原唱。**`dafeiyu\tools\call\sing_svs.py` 是她自己唱** ——
+给一段词，她自己排旋律、自己换气、自己走滑音，渲染交给 OpenUtau 的 DiffSinger 声库
+（`Qixuan` 这类 for OpenUtau 打包的声库），想更像她再过一遍 Seed-VC。
+
+```powershell
+python dafeiyu\tools\call\sing_svs.py --lyrics "睡吧，今天的风不用管。天亮了又亮，也没关系。"
+python dafeiyu\tools\call\sing_svs.py --lyrics-file 词.txt --out 成品.mp3 --voice her
+python dafeiyu\tools\call\sing_svs.py --check          # 只检查 OpenUtau / 声库 / 参考音色
+```
+
+- 要什么：**OpenUtau**（便携版解压即可）+ 一个 DiffSinger 声库 + vocoder 模型；可选 Seed-VC（换她的音色）。
+- 参数与界面：部署界面 →「拓展模块…」→ **唱歌** →「② 让她自己唱」；存进 `config.json` 的 `svs` 段。
+- **完整原理与踩过的坑：[docs/SVS.md](docs/SVS.md)**（为什么不能自己跑 onnx、时间原点 92.9ms 怎么来的、
+  颤音/滑音/换气各自怎么做、验收为什么看拼音而不是字面）。
+
 ## 可选：拓展模块
 
 上面那些是本体。另外这几样要么吃显存、要么要账号、要么要额外的额度 —— 所以不进主流程，单独一页：
@@ -434,7 +451,7 @@ python dafeiyu\tools\call\sing.py --src 你的清唱.wav --song 要唱的那首.
 | **刷 B 站** | 独立 venv + 扫码登录 | 每天谷时自己刷一轮：搜、读字幕、写日报；「现在跑一轮」可以随时手动 |
 | **语音 · 念一句** | 跟「语音通话」共用一份设置 | 把一句话念出来（跟电话里是同一个声音）；不装通话也能用 |
 | **语音通话** | Python 3.10+（装一次；界面里点「一键装好」） | 戴上耳机就能跟她说话：她听得见、答得出，桌宠和网页两个入口 |
-| **唱歌** | Seed-VC + 一段清唱样板（约 4G 显存） | 给她一段你/她自己的清唱，她把另一首歌的调子搬过去唱出来，成品落 `dafeiyu\state\call\` |
+| **唱歌** | Seed-VC + 一段清唱样板（约 4G 显存）；想让她自己唱还要 OpenUtau + 一个 DiffSinger 声库 | 给她一段你/她自己的清唱，她把另一首歌的调子搬过去唱出来；或者只给词，她自己唱（[docs/SVS.md](docs/SVS.md)） |
 | **QQ 通道** | NapCat + 一个小号 | 她在你手机里也在，私聊群聊语音文件都通 |
 
 每张卡上都写着「需要什么」「本机现在是什么状态」。状态只看本地事实 —— 文件在不在、8188 端口通不通 ——

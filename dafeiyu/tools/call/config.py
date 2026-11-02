@@ -150,6 +150,35 @@ if _HAS_RES:
             ["true", "让（挂断自动还回来）"], ["false", "不让"]],
          "hint": "通话卡多半是核显的画面管线被壁纸压满，不是算力"})
 
+# ---------------------------------------------------------------- 唱一段（SVS）
+# ★ 2026-11-03 装的：给她一个能唱的本事。词 + 旋律 → OpenUtau 的 DiffSinger 声库渲出人声
+#   →（可选）Seed-VC 换成她的音色 → 加换气/气声/混响。
+#   参数只涨这四个「像不像人」的：速度、颤音、滑音比例、换气/混响。
+_HAS_SVS = os.path.exists(os.path.join(HERE, "sing_svs.py"))
+
+SVS_FIELDS = [
+    {"key": "openutau_dir", "label": "OpenUtau 目录", "kind": "text", "w": 300,
+     "hint": "解压 OpenUtau 的文件夹（里面要有 OpenUtau.exe）"},
+    {"key": "singer", "label": "声库", "kind": "text", "w": 160,
+     "hint": "留空 = 用 Singers 里第一个有 dsconfig.yaml 的"},
+    {"key": "tempo", "label": "速度", "kind": "num", "min": 60, "max": 160, "step": 1, "w": 110,
+     "hint": "每分钟拍数。90 是慢歌"},
+    {"key": "vibrato", "label": "颤音长度", "kind": "num", "min": 0, "max": 100, "step": 5, "w": 110,
+     "hint": "长音结尾抖多长（音符的百分比）。0 = 完全不颤"},
+    {"key": "glide", "label": "滑音比例", "kind": "num", "min": 0, "max": 100, "step": 5, "w": 110,
+     "hint": "音与音之间「滑过去」的比例；0 = 全都直接换"},
+    {"key": "breath", "label": "换气音量", "kind": "num", "min": 0, "max": 0.5, "step": 0.02, "w": 110,
+     "hint": "句号处吸气的响度（相对人声）。0 = 不换气"},
+    {"key": "reverb", "label": "混响", "kind": "num", "min": 0, "max": 0.6, "step": 0.02, "w": 110,
+     "hint": "一点点空间感；太大了会糊"},
+    {"key": "verify", "label": "唱完自查", "kind": "choice", "w": 240, "options": [
+        ["true", "唱一遍（多几秒，用本机耳朵把字认回来）"], ["false", "不查"]],
+     "hint": "自查走不带提示的识别，只看字认不认得出"},
+    {"key": "voice", "label": "用谁的音色", "kind": "choice", "w": 240, "options": [
+        ["her", "她的音色（过 Seed-VC，慢一点）"], ["singer", "声库原声（快，字更清楚）"]],
+     "hint": "原声是声库自己的嗓子；她的音色要多走一步转换"},
+]
+
 DEFAULTS = {
     "tts": {
         "backend": "piper",
@@ -172,6 +201,9 @@ DEFAULTS = {
     "call": {"silence_end": 0.90, "max_reply_chars": 25, "yield_wallpaper": True,
              # 走 QQ 的虚拟声卡那条路（听喇叭环回 / 说进 VB-Cable）。默认关：本机打电话更简单。
              "qq_mode": False},
+    # 唱一段。openutau_dir 留空 = 自动找（环境变量 DSH_OPENUTAU → 常见位置）。
+    "svs": {"openutau_dir": "", "singer": "", "tempo": 90, "vibrato": 42, "glide": 100,
+            "breath": 0.14, "reverb": 0.16, "verify": True, "voice": "her"},
 }
 
 
@@ -334,6 +366,7 @@ def snapshot() -> dict:
         "asr_models": ASR_MODELS,
         "asr_fields": ASR_FIELDS,
         "call_fields": CALL_FIELDS,
+        "svs_fields": SVS_FIELDS,
         "paths": {"config": CONFIG, "state": STATE_DIR, "here": HERE},
         # 能力自述：界面靠这几个布尔决定要不要画「重启耳朵」「让壁纸退场」这类按钮
         "caps": {
@@ -342,6 +375,7 @@ def snapshot() -> dict:
             "res": os.path.exists(os.path.join(HERE, "res.py")),
             "voice_test": os.path.exists(os.path.join(HERE, "voice-test.py")),
             "bootstrap": os.path.exists(os.path.join(HERE, "bootstrap.py")),
+            "svs": _HAS_SVS,
         },
     }
 
